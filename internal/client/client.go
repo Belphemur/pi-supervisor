@@ -413,6 +413,7 @@ type controlReader struct {
 	path    string
 	fh      *os.File
 	pos     int64
+	partial string // trailing bytes of a line that was not fully written yet
 	ticker  *time.Ticker
 	diagf   func(string, ...any)
 	started bool
@@ -458,7 +459,23 @@ func (c *controlReader) pump(send func(any) error, st *stream, diagOut io.Writer
 	n, err := c.fh.ReadAt(buf, c.pos)
 	if n > 0 {
 		c.pos += int64(n)
-		for ln := range strings.SplitSeq(string(buf[:n]), "\n") {
+		// A frame is only valid once its newline has landed: a steer that
+		// straddles a 64KB read boundary would otherwise be reported as a
+		// bad frame AND lose the rest. Keep the tail until the rest arrives.
+		data := c.partial + string(buf[:n])
+		whole := ""
+		if i := strings.LastIndexByte(data, '\n'); i >= 0 {
+			whole, c.partial = data[:i], data[i+1:]
+		} else {
+			// No newline yet: a frame larger than the read buffer can never
+			// complete, so drop the runaway instead of growing forever.
+			if len(data) > 1<<20 {
+				c.partial = ""
+			} else {
+				c.partial = data
+			}
+		}
+		for ln := range strings.SplitSeq(whole, "\n") {
 			ln = strings.TrimSpace(ln)
 			if ln == "" {
 				continue
@@ -484,7 +501,7 @@ func (c *controlReader) pump(send func(any) error, st *stream, diagOut io.Writer
 	if err != nil && !os.IsNotExist(err) && c.started {
 		// File rotated/truncated underneath us: restart from the beginning.
 		if fi, serr := os.Stat(c.path); serr == nil && fi.Size() < c.pos {
-			c.pos = 0
+			c.pos, c.partial = 0, ""
 		}
 	}
 	if ready, frames := st.releaseDrain(); ready {

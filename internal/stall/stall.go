@@ -51,10 +51,18 @@ func New(path string, idle time.Duration) *Detector {
 // idle window since. On a stall it disarms ciMode so a later stall (agent
 // resumed, parked again) can fire independently. Missing/rotated files are
 // tolerated (treated as "no new content").
+//
+// A transcript that SHRINKS (rotation, or a pi run that restarts the file) is
+// re-based to the new end: without this the offset would stay past EOF and
+// the detector would be blind for the rest of the round.
 func (d *Detector) Poll() (stalled bool, marker string) {
 	fi, err := os.Stat(d.path)
 	if err != nil {
 		return false, ""
+	}
+	if fi.Size() < d.offset {
+		// Rotated/truncated: restart from the new end, disarmed.
+		d.offset, d.size, d.ciMode, d.marker = fi.Size(), fi.Size(), false, ""
 	}
 	if fi.Size() > d.size {
 		d.lastGrowth = time.Now()

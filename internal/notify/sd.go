@@ -45,13 +45,17 @@ func Beat(stop <-chan struct{}, countFn func() int) {
 	usec := os.Getenv("WATCHDOG_USEC")
 	interval := 30 * time.Second
 	if usec != "" {
+		// us/2 can round down to zero (WATCHDOG_USEC=1), and a non-positive
+		// NewTicker interval panics — clamp to the 30s default.
 		if us, err := strconv.Atoi(usec); err == nil && us > 0 {
-			interval = time.Duration(us/2) * time.Microsecond
+			if half := time.Duration(us/2) * time.Microsecond; half > 0 {
+				interval = half
+			}
 		}
 	}
 	// Always report status, even when systemd didn't arm a watchdog, so
 	// `systemctl status` stays live in the non-notify case too.
-	if os.Getenv("WATCHDOG_USEC") == "" {
+	if usec == "" {
 		interval = 15 * time.Second
 	}
 	t := time.NewTicker(interval)

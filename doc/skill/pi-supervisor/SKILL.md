@@ -126,6 +126,10 @@ Behavior:
 - **Exit codes:** 0 = event delivered (or run already over), 1 = connection
   lost (daemon restarted — check `systemctl --user status pi-supervisor`,
   then re-arm), 2 = usage error (unknown job).
+- **Transcript tail.** Every exit message first prints the last complete lines
+  of the session JSONL (`session_path`, 2 lines, 300 chars each) plus where the
+  rest lives. A live transcript is being appended to while it is read, so only
+  newline-terminated lines are shown — a torn trailing write is never printed.
 - Do NOT arm a watch in a foreground tool call — the 600s cap kills it mid-wait.
   Background+notify is the pattern; a foreground call is only for probing.
 - Every event is also appended to `~/.pi/supervisor/events/<job>.jsonl`

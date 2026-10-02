@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"pi-supervisor/internal/events"
 )
@@ -67,6 +68,10 @@ func Serve(sockPath string, h Handler, stop chan struct{}) {
 			case <-stop:
 				return
 			default:
+				// A transient accept failure (EMFILE, ECONNABORTED) must not
+				// turn the accept loop into a hot spin: back off briefly and
+				// keep serving.
+				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 		}

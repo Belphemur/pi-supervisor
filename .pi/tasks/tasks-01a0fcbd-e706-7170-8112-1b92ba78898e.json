@@ -1,0 +1,65 @@
+{
+  "nextId": 6,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "TASK 1 — Orientation + coverage audit",
+      "description": "Run suite, per-package coverage, identify least-tested paths, record audit in report early.",
+      "status": "completed",
+      "activeForm": "Auditing coverage",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1790946794823,
+      "updatedAt": 1790946915571
+    },
+    {
+      "id": "2",
+      "subject": "TASK 2 — Code review pass across all packages",
+      "description": "Read every package for defects: error handling, races, off-by-ones, lock ordering, resource leaks, protocol edges. Fix clear-cut ones; list judgment calls.",
+      "status": "in_progress",
+      "activeForm": "Reviewing code",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1790946794827,
+      "updatedAt": 1790946921714
+    },
+    {
+      "id": "3",
+      "subject": "TASK 3 — Test-coverage expansion",
+      "description": "Add tests for control dispatch, serveWatch, watchCtl footers, notify.Beat, stall boundaries, job helpers, supervisor stop/finish/never-fork. Target >=70% per package.",
+      "status": "pending",
+      "activeForm": "Expanding tests",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1790946794831,
+      "updatedAt": 1790946794831
+    },
+    {
+      "id": "4",
+      "subject": "TASK 4 — Green gate",
+      "description": "go vet clean, go test -race clean, gofmt -l empty.",
+      "status": "pending",
+      "activeForm": "Running green gate",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1790946794834,
+      "updatedAt": 1790946794834
+    },
+    {
+      "id": "5",
+      "subject": "TASK 5 — Final report /tmp/supervisor-review_final_report.md",
+      "description": "Findings, coverage before/after, test counts, SHAs, behavior changes, recommendations. End with SUPERVISOR_REVIEW_DONE.",
+      "status": "pending",
+      "activeForm": "Writing final report",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1790946794838,
+      "updatedAt": 1790946794838
+    }
+  ]
+}

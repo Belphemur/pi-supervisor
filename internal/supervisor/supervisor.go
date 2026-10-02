@@ -277,9 +277,12 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		maxRounds := r.job.MaxRounds
 		r.mu.Unlock()
 		if round > maxRounds {
+			r.mu.Lock()
+			name := r.job.Name
+			r.mu.Unlock()
 			r.finish("fatal", "round cap reached without marker")
-			s.logf(r.job.Name, "FATAL: round cap %d reached without marker", maxRounds)
-			s.emit(r.job.Name, "fatal", round, 0, 0, "", "round cap %d reached without marker", maxRounds)
+			s.logf(name, "FATAL: round cap %d reached without marker", maxRounds)
+			s.emit(name, "fatal", round, 0, 0, "", "round cap %d reached without marker", maxRounds)
 			return
 		}
 		r.mu.Lock()
@@ -385,8 +388,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			}
 			r.mu.Lock()
 			r.job.SessionPath = p
+			adopted := r.job
 			r.mu.Unlock()
-			_ = job.Save(r.job)
+			_ = job.Save(adopted)
 			s.logf(name, "round %d: captured session path %s", round, p)
 		}
 
@@ -404,7 +408,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		default:
 			sleep = 30 * time.Second
 		}
+		r.mu.Lock()
 		scale := r.job.BackoffScale
+		r.mu.Unlock()
 		if scale <= 0 {
 			scale = 1.0
 		}

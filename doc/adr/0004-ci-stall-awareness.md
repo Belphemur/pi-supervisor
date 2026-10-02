@@ -57,6 +57,10 @@ act at the cap.**
 - **Scope:** the watcher runs only in rounds where the session path is
   already captured (round 2+); round 1 has no transcript to tail yet and
   keeps the plain timeout behavior.
+- **Rotation:** if the transcript shrinks (pi restarts/rotates the file), the
+  detector re-bases to the new end and disarms. Without this the read offset
+  would sit past EOF and the detector would be blind for the rest of the
+  round — the exact failure the watcher exists to prevent.
 - **Config:** `ci_stall_cap` (0 → 3) and `ci_stall_idle_s` (0 → 300) on the
   job; tests use small values. Defaults are deliberately patient: three
   5-minute parks ≈ 15 minutes of CI waiting before intervention, versus the

@@ -2,6 +2,7 @@
 package job
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -199,7 +200,8 @@ func Size(p string) int64 {
 // Tail returns the last n bytes of a file flattened to one line.
 func Tail(path string, n int) string {
 	data, err := os.ReadFile(path)
-	if err != nil || len(data) == 0 {
+	if err != nil || len(data) == 0 || n <= 0 {
+		// n <= 0 would slice data[len-n:] out of range.
 		return ""
 	}
 	if len(data) > n {
@@ -212,6 +214,11 @@ func Tail(path string, n int) string {
 // to maxChars (with a leading "…" marker when cut). It reads at most the last
 // 256KB, so a multi-GB session transcript costs the same as a small one.
 // Missing files return nil — callers treat that as "no transcript yet".
+//
+// A live transcript is being appended to while we read it, so only COMPLETE
+// lines are returned: the first line is dropped when the 256KB window starts
+// mid-line, and a trailing line without its newline is a torn write and is
+// dropped too.
 func TailLines(path string, n, maxChars int) []string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -225,8 +232,27 @@ func TailLines(path string, n, maxChars int) []string {
 	const window = 256 << 10
 	off := max(fi.Size()-int64(window), 0)
 	buf := make([]byte, fi.Size()-off)
-	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+	got, rerr := f.ReadAt(buf, off)
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
 		return nil
+	}
+	buf = buf[:got]
+	complete := off == 0 && (got == 0 || buf[got-1] == '\n')
+	if off > 0 {
+		// Window starts mid-line: that first line is a fragment, not a line.
+		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+			buf = buf[i+1:]
+		} else {
+			return nil
+		}
+	}
+	if !complete {
+		// Torn trailing write (or a truncated window): keep only whole lines.
+		if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+			buf = buf[:i+1]
+		} else {
+			return nil
+		}
 	}
 	lines := strings.Split(strings.TrimRight(string(buf), "\n"), "\n")
 	if len(lines) > n {

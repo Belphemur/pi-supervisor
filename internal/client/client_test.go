@@ -25,12 +25,12 @@ func fakePi(t *testing.T) string {
 func baseOpts(t *testing.T, prompt string) Options {
 	t.Helper()
 	return Options{
-		PiBin:     fakePi(t),
-		Prompt:    prompt,
-		Timeout:   10 * time.Second,
-		Out:       &strings.Builder{},
-		Diag:      &strings.Builder{},
-		Worktree:  t.TempDir(),
+		PiBin:       fakePi(t),
+		Prompt:      prompt,
+		Timeout:     10 * time.Second,
+		Out:         &strings.Builder{},
+		Diag:        &strings.Builder{},
+		Worktree:    t.TempDir(),
 		GracePeriod: 2 * time.Second,
 	}
 }
