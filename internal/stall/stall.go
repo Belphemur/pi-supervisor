@@ -25,6 +25,13 @@ var ciRe = regexp.MustCompile(`(?i)(` +
 	`|review loop` +
 	`)`)
 
+// prRe matches a GitHub pull-request URL in the transcript. Pinned to the
+// full pull path (`/pull/<number>`): a bare truncated `pull/` fragment (a
+// partially-flushed line, or the agent typing the URL in progress) must NOT
+// match, otherwise status would advertise a URL that 404s. Owner/repo are
+// any non-slash, non-space run; the number must be digits (ADR-0006).
+var prRe = regexp.MustCompile(`https://github\.com/[^/" ]+/[^/" ]+/pull/[0-9]+`)
+
 // Detector tails one session JSONL.
 type Detector struct {
 	path       string
@@ -34,6 +41,7 @@ type Detector struct {
 	lastGrowth time.Time     // when bytes were last seen
 	ciMode     bool          // armed by a CI/review marker in recent content
 	marker     string        // most recent matched text
+	prURL      string        // first PR URL seen since the detector was created
 }
 
 // New starts detection at the file's current end, so historical content (the
@@ -55,6 +63,11 @@ func New(path string, idle time.Duration) *Detector {
 // A transcript that SHRINKS (rotation, or a pi run that restarts the file) is
 // re-based to the new end: without this the offset would stay past EOF and
 // the detector would be blind for the rest of the round.
+//
+// Poll also records the FIRST pull-request URL it sees (PRURL); the first one
+// wins because it is the one the agent opened in this round. The scrape is
+// best-effort: an agent that opens a PR but never links it leaves PRURL empty
+// (ADR-0006).
 func (d *Detector) Poll() (stalled bool, marker string) {
 	fi, err := os.Stat(d.path)
 	if err != nil {
@@ -76,6 +89,11 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 			d.offset += int64(n)
 			_ = f.Close()
 			if rerr == nil || rerr == io.EOF {
+				if d.prURL == "" {
+					if m := prRe.Find(buf); m != nil {
+						d.prURL = string(m)
+					}
+				}
 				if m := ciRe.Find(buf); len(m) > 0 {
 					d.ciMode = true
 					d.marker = string(m)
@@ -89,3 +107,7 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 	}
 	return false, ""
 }
+
+// PRURL is the first pull-request URL seen in the transcript since New, or ""
+// if the agent has not linked one (ADR-0006).
+func (d *Detector) PRURL() string { return d.prURL }

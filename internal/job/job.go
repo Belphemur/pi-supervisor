@@ -134,27 +134,34 @@ type State struct {
 	LastDiag     string `json:"last_diag"`
 	StartedAt    string `json:"started_at"`
 	CIStalls     int    `json:"ci_stalls"` // parks on the CI/review loop, cumulative
+	// PRURL is the first GitHub pull-request URL scraped from this round's
+	// transcript (ADR-0006). Best-effort: "" when the agent never linked a
+	// PR, even if it opened one.
+	PRURL string `json:"pr_url,omitempty"`
 }
 
 // Status is the live snapshot served over the socket / written to disk.
 type Status struct {
-	Name          string  `json:"name"`
-	State         string  `json:"state"`
-	Round         int     `json:"round"`
-	MaxRounds     int     `json:"max_rounds"`
-	SessionPath   string  `json:"session_path"`
-	SessionBytes  int64   `json:"session_bytes"`
-	SessionAgeS   float64 `json:"session_age_s"`
-	ClientPID     int     `json:"client_pid"`
-	LastRC        int     `json:"last_rc"`
-	LastDurS      int64   `json:"last_duration_s"`
-	LastRunlogB   int64   `json:"last_runlog_bytes"`
-	InstantExits  int     `json:"instant_exits"`
-	CIStalls      int     `json:"ci_stalls"`
-	LastDiag      string  `json:"last_diag"`
-	MarkerFound   bool    `json:"marker_found"`
-	FinalReportOK bool    `json:"final_report_exists"`
-	LastUpdate    string  `json:"last_update"`
+	Name         string  `json:"name"`
+	State        string  `json:"state"`
+	Round        int     `json:"round"`
+	MaxRounds    int     `json:"max_rounds"`
+	SessionPath  string  `json:"session_path"`
+	SessionBytes int64   `json:"session_bytes"`
+	SessionAgeS  float64 `json:"session_age_s"`
+	ClientPID    int     `json:"client_pid"`
+	LastRC       int     `json:"last_rc"`
+	LastDurS     int64   `json:"last_duration_s"`
+	LastRunlogB  int64   `json:"last_runlog_bytes"`
+	InstantExits int     `json:"instant_exits"`
+	CIStalls     int     `json:"ci_stalls"`
+	// PRURL is the pull-request URL found in the last round's transcript
+	// (ADR-0006); "" when none was linked.
+	PRURL         string `json:"pr_url,omitempty"`
+	LastDiag      string `json:"last_diag"`
+	MarkerFound   bool   `json:"marker_found"`
+	FinalReportOK bool   `json:"final_report_exists"`
+	LastUpdate    string `json:"last_update"`
 }
 
 // Load parses a job JSON file, applying defaults.

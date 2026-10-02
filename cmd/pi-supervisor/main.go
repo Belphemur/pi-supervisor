@@ -179,6 +179,25 @@ func ctl(args []string) {
 	}
 	out, _ := json.MarshalIndent(resp.Data, "", "  ")
 	fmt.Println(string(out))
+	if line := prStatusLine(resp.Data); line != "" {
+		fmt.Println(line)
+	}
+}
+
+// prStatusLine renders the trailing `pr <url>` field of a single-job status,
+// or "" when no PR was linked (ADR-0006). The JSON already carries pr_url;
+// this is the human/grep-friendly one-liner. A list status decodes as []any
+// and yields "".
+func prStatusLine(data any) string {
+	m, ok := data.(map[string]any)
+	if !ok {
+		return ""
+	}
+	url, _ := m["pr_url"].(string)
+	if url == "" {
+		return ""
+	}
+	return "pr " + url
 }
 
 // printSteer renders a steer report: where the frame was sent, then what pi
@@ -257,6 +276,9 @@ func watchFooter(ev map[string]any) {
 	}
 
 	fmt.Println("—")
+	if pr, _ := ev["pr_url"].(string); pr != "" {
+		fmt.Printf("pull request: %s\n", pr)
+	}
 	switch kind {
 	case "round_done":
 		rcmsg := "rc=0"

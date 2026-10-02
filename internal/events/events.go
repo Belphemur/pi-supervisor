@@ -37,6 +37,11 @@ type Event struct {
 	// SessionPath is the live pi session transcript (JSONL); the watch client
 	// prints its last lines and points at the full file.
 	SessionPath string `json:"session_path,omitempty"`
+	// PRURL is the pull-request URL scraped from the transcript (ADR-0006).
+	// Best-effort / eventually consistent: "" is normal and does not mean no
+	// PR was opened, only that the agent did not link one before the round
+	// ended.
+	PRURL string `json:"pr_url,omitempty"`
 }
 
 // Terminal reports whether the event ends the watch (and the job's run).

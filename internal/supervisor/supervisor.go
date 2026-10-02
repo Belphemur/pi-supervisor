@@ -134,7 +134,8 @@ func (r *runner) snapshot() job.Status {
 		ClientPID: r.pid, LastRC: r.state.LastRC, LastDurS: r.state.LastDurS,
 		LastRunlogB: r.runlogB, InstantExits: r.state.InstantExits,
 		CIStalls: r.state.CIStalls,
-		LastDiag: r.state.LastDiag, LastUpdate: time.Now().Format(time.RFC3339),
+		LastDiag: r.state.LastDiag, PRURL: r.state.PRURL,
+		LastUpdate: time.Now().Format(time.RFC3339),
 	}
 	if r.job.FinalReport != "" {
 		st.FinalReportOK = job.Exists(r.job.FinalReport)
@@ -522,7 +523,12 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		r.state.LastDiag = job.Tail(job.Runlog(name), 240)
 		r.mu.Unlock()
 
-		s.emit(name, "round_done", round, rc, dur, r.stateSnapshot().LastDiag, "")
+		snap := r.stateSnapshot()
+		roundText := snap.LastDiag
+		if snap.PRURL != "" {
+			roundText += " | pr " + snap.PRURL
+		}
+		s.emit(name, "round_done", round, rc, dur, roundText, "")
 		if instant {
 			s.emit(name, "instant_exit", round, rc, dur, "", "instant exit strike %d/3 (rc=%d, %ds)", strikes, rc, dur)
 		}
@@ -809,6 +815,14 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 	}
 	t := time.NewTicker(tick)
 	defer t.Stop()
+	// Final scan on every exit path: the last lines of a round's transcript
+	// (where the agent links its PR) are written as the client exits, so the
+	// regular tick can miss them. Without this the PR URL would only surface
+	// on the round AFTER the one that opened it.
+	defer func() {
+		d.Poll() // final verdict is irrelevant; only the PR scrape matters
+		s.recordPR(r, d.PRURL())
+	}()
 	for {
 		select {
 		case <-watchStop:
@@ -817,6 +831,7 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 			return
 		case <-t.C:
 			stalled, marker := d.Poll()
+			s.recordPR(r, d.PRURL())
 			if !stalled {
 				continue
 			}
@@ -865,6 +880,26 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 	}
 }
 
+// recordPR stores the first pull-request URL seen in the round's transcript
+// on the runner (ADR-0006). Best-effort and eventually consistent: an empty
+// url means "not linked", never "no PR exists". Lock order stays s.mu -> r.mu:
+// this is called from the watcher goroutine with neither held.
+func (s *Supervisor) recordPR(r *runner, url string) {
+	if url == "" {
+		return
+	}
+	r.mu.Lock()
+	fresh := r.state.PRURL != url
+	if fresh {
+		r.state.PRURL = url
+	}
+	name := r.job.Name
+	r.mu.Unlock()
+	if fresh {
+		s.logf(name, "pull request: %s", url)
+	}
+}
+
 // interruptWith delivers an instant abort+fresh-prompt pair to a live round's
 // control file — the same wire format pi_control.py --interrupt writes and
 // the client's abort-drain handshake consumes.
@@ -898,18 +933,19 @@ func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text
 	if len(args) > 0 {
 		info = fmt.Sprintf(format, args...)
 	}
-	var wt, sess string
+	var wt, sess, pr string
 	s.mu.Lock()
 	if r, ok := s.jobs[jobName]; ok {
 		r.mu.Lock()
 		wt = r.job.Worktree
 		sess = r.job.SessionPath
+		pr = r.state.PRURL
 		r.mu.Unlock()
 	}
 	s.mu.Unlock()
 	events.Emit(events.Event{
 		Job: jobName, Event: event, Round: round, RC: rc, DurS: durS,
-		Text: text, Info: info, Worktree: wt, SessionPath: sess,
+		Text: text, Info: info, Worktree: wt, SessionPath: sess, PRURL: pr,
 	})
 }
 
@@ -937,6 +973,7 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 				r.mu.Lock()
 				ev.Worktree = r.job.Worktree
 				ev.SessionPath = r.job.SessionPath
+				ev.PRURL = r.state.PRURL
 				r.mu.Unlock()
 				return nil, func() {}, &ev
 			}
