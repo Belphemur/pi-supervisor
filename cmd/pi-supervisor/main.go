@@ -87,7 +87,19 @@ func ctl(args []string) {
 		if len(args) < 3 {
 			fatalf("steer requires <job> <text...>")
 		}
-		req.Cmd, req.Job, req.Text = "steer", args[1], strings.Join(args[2:], " ")
+		req.Cmd, req.Job = "steer", args[1]
+		var text []string
+		for _, a := range args[2:] {
+			if a == "-n" || a == "--no-wait" {
+				req.NoWait = true
+				continue
+			}
+			text = append(text, a)
+		}
+		if len(text) == 0 {
+			fatalf("steer requires <job> <text...>")
+		}
+		req.Text = strings.Join(text, " ")
 	case "logs":
 		if len(args) < 2 {
 			fatalf("logs requires a job name")
@@ -133,8 +145,16 @@ func ctl(args []string) {
 		fatalf("bad response: %s", string(respData))
 	}
 	if !resp.OK {
+		if req.Cmd == "steer" {
+			// The report is the answer even when the steer failed.
+			printSteer(resp)
+		}
 		fmt.Fprintln(os.Stderr, "error:", resp.Error)
 		os.Exit(1)
+	}
+	if req.Cmd == "steer" {
+		printSteer(resp)
+		return
 	}
 	// A JSON array decodes into []any, not []string: print a string array
 	// (logs) line by line, anything else as indented JSON.
@@ -159,6 +179,55 @@ func ctl(args []string) {
 	}
 	out, _ := json.MarshalIndent(resp.Data, "", "  ")
 	fmt.Println(string(out))
+}
+
+// printSteer renders a steer report: where the frame was sent, then what pi
+// actually did with it (ADR-0005). The outcome line is the whole point —
+// never print a bare success for a frame nobody acknowledged.
+func printSteer(resp control.Response) {
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		fmt.Printf("steer: %v (no report)\n", err)
+		return
+	}
+	var r job.SteerReport
+	if err := json.Unmarshal(raw, &r); err != nil {
+		fmt.Printf("steer: %s (no report)\n", string(raw))
+		return
+	}
+	live := "no live round"
+	if r.LiveRound {
+		live = "live round"
+	}
+	outcome := r.Outcome
+	if outcome == "" {
+		outcome = "not sent"
+	}
+	fmt.Printf("steer  job=%s round=%d (%s, pi pid %d)\n", r.Job, r.Round, live, r.ClientPID)
+	fmt.Printf("       session  %s\n", orDash(r.SessionPath))
+	fmt.Printf("       ctrl     %s\n", orDash(r.CtrlPath))
+	if r.FrameID != "" {
+		fmt.Printf("       frame    %s\n", r.FrameID)
+	}
+	fmt.Printf("       ack      %s\n", orDash(r.AckPath))
+	line := "       outcome " + outcome
+	if r.DelayMS > 0 {
+		line += fmt.Sprintf(" after %dms", r.DelayMS)
+	}
+	if r.Outcome != "" {
+		line += fmt.Sprintf("  (waited %dms)", r.WaitedMS)
+	}
+	fmt.Println(line)
+	if r.Detail != "" {
+		fmt.Printf("       %s\n", r.Detail)
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // watchFooter prints what an LLM should do next with this event, targeted at

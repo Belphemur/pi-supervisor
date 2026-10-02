@@ -16,7 +16,16 @@ func newReaderAt(t *testing.T, path string) *controlReader {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return newControlReader(path, func(string, ...any) {})
+	return newControlReader(path, "", func(string, ...any) {}, 0)
+}
+
+// newReaderWithAck is newReaderAt plus the ack log (ADR-0005).
+func newReaderWithAck(t *testing.T, path, ackPath string) *controlReader {
+	t.Helper()
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return newControlReader(path, ackPath, func(string, ...any) {}, 0)
 }
 
 func appendTo(t *testing.T, path, s string) {
@@ -130,7 +139,7 @@ func TestControlReaderHandlesTruncation(t *testing.T) {
 // A reader opened on a not-yet-existing control file stays inert instead of
 // failing the round.
 func TestControlReaderMissingFile(t *testing.T) {
-	c := newControlReader(filepath.Join(t.TempDir(), "absent.ctrl"), func(string, ...any) {})
+	c := newControlReader(filepath.Join(t.TempDir(), "absent.ctrl"), "", func(string, ...any) {}, 0)
 	if c.fh != nil {
 		t.Fatal("expected no open handle")
 	}
@@ -139,7 +148,7 @@ func TestControlReaderMissingFile(t *testing.T) {
 		t.Fatal("expected a poll ticker even without a file")
 	}
 	// A nil path disables polling entirely (blocks forever in select).
-	if nc := newControlReader("", func(string, ...any) {}); nc.tick() != nil {
+	if nc := newControlReader("", "", func(string, ...any) {}, 0); nc.tick() != nil {
 		t.Fatal("empty control path must yield a nil tick channel")
 	}
 }

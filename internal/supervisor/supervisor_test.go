@@ -315,26 +315,6 @@ func TestStopLeavesResumableState(t *testing.T) {
 	}
 }
 
-// Steering appends to the ctrl file the client polls.
-func TestSteerWritesControlFile(t *testing.T) {
-	testEnv(t)
-	writeJob(t, job.Job{
-		Name: "steerable", Brief: "/tmp/x.md", Worktree: t.TempDir(),
-		SessionName: "steerable", MaxRounds: 1, TimeoutS: 20, PiBin: "true",
-	})
-	s := newTestSupervisor(t)
-	if err := s.Steer("steerable", `{"type":"prompt","message":"POLICY CHANGE"}`); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(job.Ctrl("steerable"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "POLICY CHANGE") {
-		t.Fatalf("ctrl file = %q, want the steer frame", string(data))
-	}
-}
-
 // Atomic state writes must never leave a partial file behind.
 func TestStateWriteIsAtomic(t *testing.T) {
 	testEnv(t)

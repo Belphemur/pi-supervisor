@@ -20,6 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"pi-supervisor/internal/job"
 )
 
 // Options configures one RPC round.
@@ -39,8 +41,16 @@ type Options struct {
 	// Prompt is the full message body for this round.
 	Prompt string
 	// ControlPath, when set, is polled for new JSONL frames to forward to
-	// pi's stdin (steering). Read from the current end at start.
+	// pi's stdin (steering). The whole file is read from the start: the
+	// supervisor truncates it at every round start, so its entire contents
+	// belong to this round (a steer written between the truncate and the
+	// spawn must not be lost).
 	ControlPath string
+	// AckPath, when set, receives one job.AckRecord per control frame this
+	// client acts on (ADR-0005) so `steer` can report a real outcome.
+	AckPath string
+	// PollInterval overrides the control-file poll period; 0 = PollInterval.
+	PollInterval time.Duration
 	// Timeout is the round deadline; on expiry an abort frame is sent and
 	// the client gives the turn GracePeriod to end before reporting rc 1.
 	Timeout time.Duration
@@ -70,8 +80,9 @@ type Result struct {
 	PID int
 }
 
-// pollInterval is how often the control file is checked for new frames.
-const pollInterval = 5 * time.Second
+// PollInterval is how often the control file is checked for new frames.
+// `steer`'s ack wait is bounded by it (plus a margin), so it is exported.
+const PollInterval = 5 * time.Second
 
 // Run executes one RPC round to completion.
 //
@@ -177,7 +188,7 @@ func Run(o Options) Result {
 		st.read(stdout)
 	}()
 
-	ctl := newControlReader(o.ControlPath, st.diagf)
+	ctl := newControlReader(o.ControlPath, o.AckPath, st.diagf, o.PollInterval)
 	deadline := time.Now().Add(o.Timeout)
 
 	for {
@@ -415,12 +426,17 @@ func (s *stream) hold(frame any) {
 // controlReader tails the steer file and turns new lines into RPC frames.
 type controlReader struct {
 	path    string
+	ack     *acker
 	fh      *os.File
 	pos     int64
 	partial string // trailing bytes of a line that was not fully written yet
 	ticker  *time.Ticker
 	diagf   func(string, ...any)
 	started bool
+	// heldAt records when each frame was queued behind an abort drain, in
+	// the same order the frames were held, so the release loop can report
+	// how long a steer waited (ADR-0005).
+	heldAt []time.Time
 }
 
 // tick returns a channel that fires every pollInterval. A nil channel (no
@@ -432,25 +448,27 @@ func (c *controlReader) tick() <-chan time.Time {
 	return c.ticker.C
 }
 
-func newControlReader(path string, diagf func(string, ...any)) *controlReader {
-	c := &controlReader{path: path, diagf: diagf}
+func newControlReader(path, ackPath string, diagf func(string, ...any), interval time.Duration) *controlReader {
+	c := &controlReader{path: path, diagf: diagf, ack: &acker{path: ackPath}}
+	if interval <= 0 {
+		interval = PollInterval
+	}
 	if path == "" {
 		return c
 	}
-	// Open read-only and start at the current end: anything already in the
-	// file belongs to the previous round (the supervisor truncates it).
+	// Open read-only and start at the beginning: the supervisor truncates
+	// the ctrl file at every round start, so everything in it is a steer
+	// meant for THIS round. Starting at the end (as an earlier version did)
+	// silently dropped a frame written between the truncate and the spawn.
 	fh, err := os.Open(path)
 	if err != nil {
 		// No file yet is fine — steer() creates it on demand.
-		c.ticker = time.NewTicker(pollInterval)
+		c.ticker = time.NewTicker(interval)
 		return c
-	}
-	if fi, err := fh.Stat(); err == nil {
-		c.pos = fi.Size()
 	}
 	c.fh = fh
 	c.started = true
-	c.ticker = time.NewTicker(pollInterval)
+	c.ticker = time.NewTicker(interval)
 	return c
 }
 
@@ -484,22 +502,7 @@ func (c *controlReader) pump(send func(any) error, st *stream, diagOut io.Writer
 			if ln == "" {
 				continue
 			}
-			var frame map[string]any
-			if jerr := json.Unmarshal([]byte(ln), &frame); jerr != nil {
-				_, _ = fmt.Fprintf(diagOut, "[control] bad frame skipped: %v\n", jerr)
-				continue
-			}
-			_, held := st.forwardable(frameType(frame))
-			if held {
-				st.hold(frame)
-				_, _ = fmt.Fprintf(diagOut, "[control] held until abort settles: %s\n", frameType(frame))
-				continue
-			}
-			if err := send(frame); err != nil {
-				fmt.Fprintf(diagOut, "[control] send failed: %v\n", err)
-				continue
-			}
-			fmt.Fprintf(diagOut, "[control] forwarded: %s\n", frameType(frame))
+			c.deliver(ln, send, st, diagOut)
 		}
 	}
 	if err != nil && !os.IsNotExist(err) && c.started {
@@ -510,13 +513,111 @@ func (c *controlReader) pump(send func(any) error, st *stream, diagOut io.Writer
 	}
 	if ready, frames := st.releaseDrain(); ready {
 		for _, f := range frames {
+			at := c.popHeldAt()
 			if err := send(f); err != nil {
 				fmt.Fprintf(diagOut, "[control] send failed: %v\n", err)
+				c.ack.record(frameID(f), job.AckSendFail, frameType(f), err.Error(), 0)
 				continue
 			}
 			fmt.Fprintf(diagOut, "[control] delivered after abort: %s\n", frameType(f))
+			delay := time.Duration(0)
+			if !at.IsZero() {
+				delay = time.Since(at)
+			}
+			c.ack.record(frameID(f), job.AckForwarded, frameType(f),
+				"queued behind an abort; delivered once the drain settled", delay)
 		}
 	}
+}
+
+// deliver forwards one control-file line to pi and records what happened
+// (ADR-0005) so `steer` can report the real outcome instead of assuming.
+func (c *controlReader) deliver(ln string, send func(any) error, st *stream, diagOut io.Writer) {
+	var frame map[string]any
+	if jerr := json.Unmarshal([]byte(ln), &frame); jerr != nil {
+		_, _ = fmt.Fprintf(diagOut, "[control] bad frame skipped: %v\n", jerr)
+		// No id to match on: the line never parsed. Record the raw prefix so
+		// the operator can tell which steer was dropped.
+		c.ack.record("", job.AckBadFrame, "?", truncForAck(ln), 0)
+		return
+	}
+	if _, held := st.forwardable(frameType(frame)); held {
+		st.hold(frame)
+		_, _ = fmt.Fprintf(diagOut, "[control] held until abort settles: %s\n", frameType(frame))
+		c.heldAt = append(c.heldAt, time.Now())
+		c.ack.record(frameID(frame), job.AckHeld, frameType(frame), "queued behind an in-flight abort", 0)
+		return
+	}
+	if err := send(frame); err != nil {
+		fmt.Fprintf(diagOut, "[control] send failed: %v\n", err)
+		c.ack.record(frameID(frame), job.AckSendFail, frameType(frame), err.Error(), 0)
+		return
+	}
+	fmt.Fprintf(diagOut, "[control] forwarded: %s\n", frameType(frame))
+	c.ack.record(frameID(frame), job.AckForwarded, frameType(frame), "", 0)
+}
+
+// popHeldAt returns (and forgets) the enqueue time of the oldest held frame.
+func (c *controlReader) popHeldAt() time.Time {
+	if len(c.heldAt) == 0 {
+		return time.Time{}
+	}
+	at := c.heldAt[0]
+	c.heldAt = c.heldAt[1:]
+	return at
+}
+
+func truncForAck(s string) string {
+	const maxLen = 120
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// acker appends AckRecords to the per-job ack log. Opened lazily so a round
+// that is never steered leaves no file behind, and written with one syscall
+// per record so a record is durable the moment `steer` reads it.
+type acker struct {
+	path string
+	f    *os.File
+}
+
+func (a *acker) record(id, outcome, typ, detail string, delay time.Duration) {
+	if a == nil || a.path == "" {
+		return
+	}
+	if a.f == nil {
+		f, err := os.OpenFile(a.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			a.path = "" // unopenable: stop retrying on every frame
+			return
+		}
+		a.f = f
+	}
+	line, err := json.Marshal(job.AckRecord{
+		ID:      id,
+		Outcome: outcome,
+		Type:    typ,
+		Detail:  detail,
+		DelayMS: delay.Milliseconds(),
+		AtMS:    time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return
+	}
+	_, _ = a.f.Write(append(line, '\n'))
+}
+
+// frameID returns a frame's id, or "" when it has none. Steer always injects
+// one so its ack record can be matched back to it.
+func frameID(f any) string {
+	if m, ok := f.(map[string]any); ok {
+		if id, ok := m["id"].(string); ok {
+			return id
+		}
+	}
+	return ""
 }
 
 func frameType(f any) string {

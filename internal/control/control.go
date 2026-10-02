@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"pi-supervisor/internal/events"
+	"pi-supervisor/internal/job"
 )
 
 // Handler is the server-side interface the socket serves; the supervisor
@@ -20,7 +21,7 @@ type Handler interface {
 	StatusAll() any
 	Start(name string) error
 	Stop(name string) error
-	Steer(name, text string) error
+	Steer(name, text string, noWait bool) (job.SteerReport, error)
 	Logs(name string, n int) ([]string, error)
 	Reload() error
 }
@@ -39,6 +40,9 @@ type Request struct {
 	Job  string `json:"job,omitempty"`  // target job ("" = all, for status)
 	Text string `json:"text,omitempty"` // steer payload
 	N    int    `json:"n,omitempty"`    // logs line count
+	// NoWait asks steer to return as soon as the frame is on disk instead of
+	// waiting for the client's ack (the report still says "written").
+	NoWait bool `json:"no_wait,omitempty"`
 }
 
 // Response is the single reply.
@@ -176,10 +180,13 @@ func dispatch(h Handler, raw []byte) Response {
 		}
 		return Response{OK: true}
 	case "steer":
-		if err := h.Steer(req.Job, req.Text); err != nil {
-			return Response{OK: false, Error: err.Error()}
+		// The report travels even on failure: "no live round" and "cannot
+		// write" are exactly the facts the operator needs to see.
+		rep, err := h.Steer(req.Job, req.Text, req.NoWait)
+		if err != nil {
+			return Response{OK: false, Error: err.Error(), Data: rep}
 		}
-		return Response{OK: true}
+		return Response{OK: true, Data: rep}
 	case "logs":
 		data, err := h.Logs(req.Job, req.N)
 		if err != nil {

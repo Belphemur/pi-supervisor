@@ -65,6 +65,58 @@ func Paths(name string) (ctrl, runlog, orchlog, status string) {
 func Runlog(name string) string { _, runlog, _, _ := Paths(name); return runlog }
 func Ctrl(name string) string   { ctrl, _, _, _ := Paths(name); return ctrl }
 
+// Ack is the per-job steer acknowledgement log (ADR-0005): the client
+// appends one AckRecord per control frame it acts on, and `steer` reads its
+// own frame's record back so the CLI can report a real delivery outcome.
+// The file is truncated together with the ctrl file at every round start.
+func Ack(name string) string { return "/tmp/pi_" + name + "_ack.jsonl" }
+
+// Steer ack outcomes. Only AckForwarded/AckSendFail/AckBadFrame are terminal:
+// a held frame gets an AckHeld record first and a terminal record later,
+// when the abort drain releases it.
+const (
+	AckForwarded   = "forwarded"   // the frame reached pi's stdin
+	AckHeld        = "held"        // queued behind an in-flight abort drain
+	AckSendFail    = "send failed" // pi's stdin rejected the frame
+	AckBadFrame    = "bad frame"   // the control line was not a JSON object
+	AckWritten     = "written"     // --no-wait: on disk, not confirmed
+	AckNoRound     = "no live round"
+	AckUnconfirmed = "not confirmed"
+)
+
+// AckRecord is one line of the ack log (see Ack).
+type AckRecord struct {
+	ID      string `json:"id"`
+	Outcome string `json:"outcome"`
+	Type    string `json:"type,omitempty"`
+	Detail  string `json:"detail,omitempty"`
+	DelayMS int64  `json:"delay_ms,omitempty"`
+	AtMS    int64  `json:"at_ms"`
+}
+
+// Terminal reports whether the record ends the steer's wait. Held is not
+// terminal: the same frame is acked again once it is actually delivered.
+func (a AckRecord) Terminal() bool { return a.Outcome != AckHeld }
+
+// SteerReport is what `pi-supervisor steer` prints: where the frame went and
+// what pi did with it.
+type SteerReport struct {
+	Job         string `json:"job"`
+	FrameID     string `json:"frame_id"`
+	Round       int    `json:"round"`
+	JobState    string `json:"job_state"`
+	SessionPath string `json:"session_path"`
+	CtrlPath    string `json:"ctrl_path"`
+	AckPath     string `json:"ack_path"`
+	LiveRound   bool   `json:"live_round"`
+	ClientPID   int    `json:"client_pid,omitempty"`
+	Outcome     string `json:"outcome"`
+	Detail      string `json:"detail,omitempty"`
+	DelayMS     int64  `json:"delay_ms,omitempty"`
+	WaitedMS    int64  `json:"waited_ms"`
+	Confirmed   bool   `json:"confirmed"`
+}
+
 // MungedSessionsDir is pi's cwd-keyed session directory for a worktree.
 func MungedSessionsDir(worktree string) string {
 	m := strings.TrimPrefix(worktree, "/")

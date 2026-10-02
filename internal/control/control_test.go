@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"pi-supervisor/internal/job"
+
 	"pi-supervisor/internal/events"
 )
 
@@ -61,8 +63,11 @@ func (f *fakeHandler) StatusAll() any {
 
 func (f *fakeHandler) Start(name string) error { return f.record("start:" + name) }
 func (f *fakeHandler) Stop(name string) error  { return f.record("stop:" + name) }
-func (f *fakeHandler) Steer(name, text string) error {
-	return f.record("steer:" + name + ":" + text)
+func (f *fakeHandler) Steer(name, text string, noWait bool) (job.SteerReport, error) {
+	if err := f.record(fmt.Sprintf("steer:%s:%s:%t", name, text, noWait)); err != nil {
+		return job.SteerReport{Job: name}, err
+	}
+	return job.SteerReport{Job: name, FrameID: "steer-1", Outcome: job.AckForwarded, Confirmed: true}, nil
 }
 
 func (f *fakeHandler) Logs(name string, n int) ([]string, error) {
@@ -134,6 +139,32 @@ func ask(t *testing.T, sock, raw string) Response {
 	return resp
 }
 
+// A steer always answers with its report, success or failure: "no live
+// round" and "cannot write" are exactly the facts the operator needs.
+func TestSteerAlwaysReturnsItsReport(t *testing.T) {
+	h := newFakeHandler()
+	sock, stop := startServer(t, h)
+	defer close(stop)
+
+	resp := ask(t, sock, `{"cmd":"steer","job":"a","text":"go left"}`)
+	if !resp.OK {
+		t.Fatalf("steer = %+v", resp)
+	}
+	rep, ok := resp.Data.(map[string]any)
+	if !ok || rep["frame_id"] != "steer-1" || rep["outcome"] != job.AckForwarded {
+		t.Fatalf("steer data = %#v", resp.Data)
+	}
+
+	h.failOn["steer:b:go:false"] = errors.New("boom")
+	resp = ask(t, sock, `{"cmd":"steer","job":"b","text":"go"}`)
+	if resp.OK || resp.Error != "boom" {
+		t.Fatalf("failing steer = %+v", resp)
+	}
+	if _, ok := resp.Data.(map[string]any); !ok {
+		t.Fatalf("failed steer dropped its report: %#v", resp.Data)
+	}
+}
+
 // Every dispatch branch: routing, the OK shape, and the error passthrough.
 func TestDispatchRoutesEveryCommand(t *testing.T) {
 	h := &watchHandler{fakeHandler: newFakeHandler()}
@@ -174,7 +205,7 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 	// The handler actually saw each routed call. The three malformed/unknown
 	// requests are rejected by dispatch itself and never reach the handler.
 	want := []string{
-		"statusall", "status:a", "start:a", "stop:a", "steer:a:go left",
+		"statusall", "status:a", "start:a", "stop:a", "steer:a:go left:false",
 		"logs:a:2", "logs:a:0", "reload",
 	}
 	got := h.seen()
@@ -196,7 +227,7 @@ func TestDispatchPropagatesHandlerErrors(t *testing.T) {
 	h.failOn["start:a"] = boom
 	h.failOn["status:a"] = boom
 	h.failOn["stop:a"] = boom
-	h.failOn["steer:a:x"] = boom
+	h.failOn["steer:a:x:false"] = boom
 	h.failOn["logs:a:3"] = boom
 	h.failOn["reload"] = boom
 	sock, stop := startServer(t, h)

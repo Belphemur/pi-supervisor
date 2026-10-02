@@ -5,12 +5,15 @@ package supervisor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,16 +28,27 @@ type Handler interface {
 	Status(job string) (any, error)
 	Start(name string) error
 	Stop(name string) error
-	Steer(name, text string) error
+	Steer(name, text string, noWait bool) (job.SteerReport, error)
 	Logs(name string, n int) ([]string, error)
 	Reload() error
 }
+
+// controlPollInterval is how often the client polls the ctrl file. Tests
+// shrink it so a steer is delivered (and acked) in milliseconds; production
+// uses the client's default.
+var controlPollInterval = client.PollInterval
+
+// steerWaitMargin is added to the poll interval to bound the ack wait: a
+// frame is picked up within one poll, then acked in the same pass.
+const steerWaitMargin = 2 * time.Second
 
 type Supervisor struct {
 	mu   sync.Mutex
 	jobs map[string]*runner
 	stop chan struct{}
 	wg   sync.WaitGroup
+	// steerWait overrides the ack-wait budget; 0 = poll interval + margin.
+	steerWait time.Duration
 }
 
 type runner struct {
@@ -243,20 +257,189 @@ func (s *Supervisor) Stop(name string) error {
 	return nil
 }
 
-func (s *Supervisor) Steer(name, text string) error {
+// Steer sends one control frame to a live round and reports what pi did with
+// it (ADR-0005). Prose is wrapped in a prompt frame; a caller-supplied JSON
+// frame is passed through unchanged. The write is only a request: the real
+// outcome comes from the client's ack record for this frame id, and the wait
+// for it holds no supervisor lock so the round loop keeps running.
+func (s *Supervisor) Steer(name, text string, noWait bool) (job.SteerReport, error) {
 	s.mu.Lock()
-	_, ok := s.jobs[name]
+	r, ok := s.jobs[name]
 	s.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("unknown job %q", name)
+		return job.SteerReport{Job: name}, fmt.Errorf("unknown job %q", name)
 	}
-	f, err := os.OpenFile(job.Ctrl(name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	frame, id, err := steerFrame(text)
+	if err != nil {
+		return job.SteerReport{Job: name}, err
+	}
+
+	// Snapshot under r.mu, then let go: nothing below may hold s.mu or r.mu
+	// across a wait (lock order is s.mu -> r.mu, and the round loop needs
+	// r.mu to publish its own end).
+	r.mu.Lock()
+	rep := job.SteerReport{
+		Job:         name,
+		FrameID:     id,
+		Round:       r.state.Round,
+		JobState:    r.state.State,
+		SessionPath: r.job.SessionPath,
+		CtrlPath:    job.Ctrl(name),
+		AckPath:     job.Ack(name),
+		LiveRound:   r.active && r.pid > 0,
+		ClientPID:   r.pid,
+	}
+	r.mu.Unlock()
+
+	if !rep.LiveRound {
+		// Do not queue it: round() truncates the ctrl file at the start of
+		// every round, so a frame written now would be wiped unread.
+		rep.Outcome = job.AckNoRound
+		rep.Detail = fmt.Sprintf("job state %q, round %d: no round is reading %s, so nothing was written",
+			rep.JobState, rep.Round, rep.CtrlPath)
+		return rep, fmt.Errorf("%s", rep.Detail)
+	}
+
+	// Remember where the ack log ends so only records the client writes for
+	// THIS frame are considered (a restart reuses the same file).
+	off := job.Size(rep.AckPath)
+	if err := appendCtrl(rep.CtrlPath, frame); err != nil {
+		rep.Outcome = job.AckSendFail
+		rep.Detail = fmt.Sprintf("cannot write %s: %v", rep.CtrlPath, err)
+		return rep, fmt.Errorf("%s", rep.Detail)
+	}
+	if noWait {
+		rep.Outcome = job.AckWritten
+		rep.Detail = "--no-wait: on disk, not confirmed; check the run log for \"[control] forwarded\""
+		return rep, nil
+	}
+	s.waitAck(&rep, r, off)
+	if !rep.Confirmed {
+		return rep, fmt.Errorf("frame %s not confirmed: %s", rep.FrameID, rep.Outcome)
+	}
+	return rep, nil
+}
+
+// waitAck polls the ack log for this frame's terminal record. It never holds
+// a supervisor lock, and it reports the round as gone rather than success
+// when the round ends first.
+func (s *Supervisor) waitAck(rep *job.SteerReport, r *runner, off int64) {
+	wait := s.steerWait
+	if wait <= 0 {
+		wait = controlPollInterval + steerWaitMargin
+	}
+	start := time.Now()
+	held := false
+	for {
+		for _, rec := range acksSince(rep.AckPath, off) {
+			if rec.ID != rep.FrameID {
+				continue
+			}
+			if rec.Outcome == job.AckHeld {
+				// Accepted but not delivered yet: keep waiting for the
+				// terminal record that follows the abort drain.
+				held = true
+				continue
+			}
+			rep.Outcome, rep.Detail, rep.DelayMS, rep.Confirmed = rec.Outcome, rec.Detail, rec.DelayMS, true
+			rep.WaitedMS = time.Since(start).Milliseconds()
+			if held {
+				rep.Detail = strings.TrimSpace(rep.Detail + " (accepted while an abort drained, delivered after)")
+			}
+			return
+		}
+		if time.Since(start) >= wait {
+			break
+		}
+		// The ack log is truncated with the ctrl file at every round start:
+		// shrinking below our offset means this round ended.
+		if job.Size(rep.AckPath) < off {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	rep.WaitedMS = time.Since(start).Milliseconds()
+	rep.Outcome = job.AckUnconfirmed
+	if r.live() {
+		rep.Detail = fmt.Sprintf("no ack from pi within %s; the frame is on disk but unconfirmed", wait)
+	} else {
+		rep.Detail = fmt.Sprintf("round %d stopped reading %s before the frame was delivered; "+
+			"the next round truncates it, so re-send after it starts", rep.Round, rep.CtrlPath)
+	}
+}
+
+// acksSince decodes the ack records appended at or after offset.
+func acksSince(path string, off int64) []job.AckRecord {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, 0); err != nil {
+		return nil
+	}
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil
+	}
+	var out []job.AckRecord
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec job.AckRecord
+		if json.Unmarshal([]byte(line), &rec) == nil {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// appendCtrl adds one LF-terminated JSON frame to the steer file.
+func appendCtrl(path string, frame map[string]any) error {
+	line, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = f.WriteString(strings.TrimRight(text, "\n") + "\n")
+	_, err = f.Write(append(line, '\n'))
 	return err
+}
+
+var steerSeq atomic.Uint64
+
+// steerFrame turns operator text into one control frame. Prose becomes a
+// prompt frame (the client's contract is strict JSON-LF); a caller-supplied
+// JSON object with a "type" is passed through so operators can still send an
+// abort or any other frame type by hand. Every frame gets an id so its ack
+// record can be matched back.
+func steerFrame(text string) (map[string]any, string, error) {
+	body := strings.TrimSpace(text)
+	if body == "" {
+		return nil, "", errors.New("empty steer text")
+	}
+	var frame map[string]any
+	if strings.HasPrefix(body, "{") && json.Unmarshal([]byte(body), &frame) == nil {
+		if _, ok := frame["type"].(string); !ok {
+			frame = nil // JSON but not a frame: treat it as prose
+		}
+	} else {
+		frame = nil
+	}
+	if frame == nil {
+		frame = map[string]any{"type": "prompt", "message": body}
+	}
+	id, _ := frame["id"].(string)
+	if id == "" {
+		id = fmt.Sprintf("steer-%d-%d", time.Now().UnixNano(), steerSeq.Add(1))
+		frame["id"] = id
+	}
+	return frame, id, nil
 }
 
 func (s *Supervisor) Logs(name string, n int) ([]string, error) {
@@ -439,6 +622,13 @@ func (r *runner) stateSnapshot() job.State {
 	return r.state
 }
 
+// live reports whether a round is currently polling the control file.
+func (r *runner) live() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active && r.pid > 0
+}
+
 func (r *runner) finish(state, diag string) {
 	r.mu.Lock()
 	r.state.State, r.state.LastDiag, r.active = state, diag, false
@@ -458,7 +648,16 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 
 	_, runlog, _, _ := job.Paths(j.Name)
 	_ = os.Truncate(runlog, 0)
-	_ = os.WriteFile(job.Ctrl(j.Name), nil, 0o644) // fresh steer channel per round
+	// Fresh steer channel per round: the client reads the ctrl file from its
+	// start, so a leftover frame from the previous round would replay into
+	// this one. The ack log is truncated with it (ADR-0005).
+	if err := os.WriteFile(job.Ctrl(j.Name), nil, 0o644); err != nil {
+		s.logf(j.Name, "round %d: cannot reset steer channel %s: %v", round, job.Ctrl(j.Name), err)
+		return 1, 0, 0
+	}
+	if err := os.WriteFile(job.Ack(j.Name), nil, 0o644); err != nil {
+		s.logf(j.Name, "round %d: cannot reset ack log %s: %v", round, job.Ack(j.Name), err)
+	}
 
 	if resume {
 		s.logf(j.Name, "round %d: RESUME %s", round, j.SessionPath)
@@ -485,19 +684,21 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	}
 
 	opts := client.Options{
-		PiBin:       j.PiBin,
-		Session:     j.SessionPath,
-		Name:        j.SessionName,
-		Worktree:    j.Worktree,
-		Skills:      j.Skills,
-		Provider:    j.Provider,
-		Model:       j.Model,
-		Prompt:      prompt,
-		ControlPath: job.Ctrl(j.Name),
-		Timeout:     time.Duration(j.TimeoutS) * time.Second,
-		GracePeriod: 30 * time.Second,
-		Out:         out,
-		Diag:        out,
+		PiBin:        j.PiBin,
+		Session:      j.SessionPath,
+		Name:         j.SessionName,
+		Worktree:     j.Worktree,
+		Skills:       j.Skills,
+		Provider:     j.Provider,
+		Model:        j.Model,
+		Prompt:       prompt,
+		ControlPath:  job.Ctrl(j.Name),
+		AckPath:      job.Ack(j.Name),
+		PollInterval: controlPollInterval,
+		Timeout:      time.Duration(j.TimeoutS) * time.Second,
+		GracePeriod:  30 * time.Second,
+		Out:          out,
+		Diag:         out,
 		OnPID: func(pid int) {
 			r.mu.Lock()
 			r.pid = pid
