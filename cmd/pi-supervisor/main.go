@@ -139,16 +139,20 @@ func ctl(args []string) {
 	// A JSON array decodes into []any, not []string: print a string array
 	// (logs) line by line, anything else as indented JSON.
 	if arr, isArr := resp.Data.([]any); isArr && len(arr) > 0 {
-		allStrings := true
+		strs := make([]string, 0, len(arr))
 		for _, v := range arr {
-			if _, ok := v.(string); !ok {
-				allStrings = false
+			s, ok := v.(string)
+			if !ok {
+				strs = nil
 				break
 			}
+			strs = append(strs, s)
 		}
-		if allStrings {
-			for _, v := range arr {
-				fmt.Println(v.(string))
+		if strs != nil {
+			for _, s := range strs {
+				// ctl's own stdout: there is no upstream to report a write
+				// failure to, and the exit code stays 0 either way.
+				_, _ = fmt.Println(s)
 			}
 			return
 		}
