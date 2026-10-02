@@ -20,7 +20,7 @@ var ciRe = regexp.MustCompile(`(?i)(` +
 	`|gh pr (checks|reviews|status|view)` +
 	`|answer-code-review` +
 	`|re-?review\b` +
-	`|checks? (are |still )?(running|pending|queued|in progress)` +
+	`|checks? (are |is |still )+(running|pending|queued|in progress)` +
 	`|\bci\b[^\n]{0,40}\b(pending|running|queued|failed)\b` +
 	`|review loop` +
 	`)`)

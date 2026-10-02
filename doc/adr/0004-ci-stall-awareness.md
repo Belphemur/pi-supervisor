@@ -27,7 +27,8 @@ act at the cap.**
   older rounds — never arms it). It scans new raw lines for markers of the
   CI/review path: "waiting for/on CI|checks|review|workflow|tests",
   `gh pr checks|reviews|status`, `answer-code-review`, "re-review",
-  "checks running|pending|queued", "review loop". Raw-line regex over the
+  "checks running|pending|queued" (with any of are/is/still in between),
+  "review loop". Raw-line regex over the
   JSONL stream is deliberately chosen over structured parsing: the marker is
   prose the agent emits, and schema drift must not break detection.
 - **Stall = marker armed + transcript quiet.** A marker only *arms* the

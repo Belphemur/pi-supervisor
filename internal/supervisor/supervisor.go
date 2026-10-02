@@ -348,7 +348,11 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			s.logf(name, "round %d diagnostic: %s", round, r.stateSnapshot().LastDiag)
 		}
 
-		if job.Exists(j.FinalReport) && job.RunlogContains(job.Runlog(name), j.Marker) {
+		// The marker gate. An empty marker would make RunlogContains match
+		// ANY non-empty run log (strings.Contains(x, "") is true), so a job
+		// configured without a marker could be declared done by a stale final
+		// report. Refuse: no marker, no done.
+		if j.Marker != "" && job.Exists(j.FinalReport) && job.RunlogContains(job.Runlog(name), j.Marker) {
 			r.mu.Lock()
 			r.state.State, r.active = "done", false
 			r.mu.Unlock()
@@ -781,7 +785,9 @@ func (s *Supervisor) Monitor(stop chan struct{}) {
 	}
 }
 
-// Shutdown terminates all active round loops (SIGTERM to client groups).
+// Shutdown terminates all active round loops: it closes each runner's stop
+// channel (so the loop's stop path runs and no NEW round is spawned) and
+// SIGTERMs the live client groups, then waits for the loops to unwind.
 func (s *Supervisor) Shutdown() {
 	close(s.stop)
 	s.mu.Lock()
@@ -793,6 +799,12 @@ func (s *Supervisor) Shutdown() {
 	for _, r := range runners {
 		r.mu.Lock()
 		active, pid := r.active, r.pid
+		if active {
+			// Same guarded close as Stop(): a concurrent operator Stop() must
+			// not turn this into a double-close of the channel.
+			r.active = false
+			close(r.stopCh)
+		}
 		r.mu.Unlock()
 		if active && pid > 0 {
 			_ = syscall.Kill(-pid, syscall.SIGTERM)

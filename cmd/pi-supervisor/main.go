@@ -136,15 +136,25 @@ func ctl(args []string) {
 		fmt.Fprintln(os.Stderr, "error:", resp.Error)
 		os.Exit(1)
 	}
-	switch data := resp.Data.(type) {
-	case []string:
-		for _, l := range data {
-			fmt.Println(l)
+	// A JSON array decodes into []any, not []string: print a string array
+	// (logs) line by line, anything else as indented JSON.
+	if arr, isArr := resp.Data.([]any); isArr && len(arr) > 0 {
+		allStrings := true
+		for _, v := range arr {
+			if _, ok := v.(string); !ok {
+				allStrings = false
+				break
+			}
 		}
-	default:
-		out, _ := json.MarshalIndent(resp.Data, "", "  ")
-		fmt.Println(string(out))
+		if allStrings {
+			for _, v := range arr {
+				fmt.Println(v.(string))
+			}
+			return
+		}
 	}
+	out, _ := json.MarshalIndent(resp.Data, "", "  ")
+	fmt.Println(string(out))
 }
 
 // watchFooter prints what an LLM should do next with this event, targeted at
