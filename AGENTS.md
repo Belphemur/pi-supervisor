@@ -49,12 +49,16 @@ Unix socket.
    exit message must always say how to re-arm / get status (ADR-0003). The
    only delivery path to Hermes is the blocking `pi-supervisor watch` client
    armed as a background run — no cronjob, no polling, no chat addressing.
+7. **Shutdown stops the loops, not just the children.** `Supervisor.Shutdown`
+   closes each active runner's stop channel (under `r.mu`, so a concurrent
+   `Stop` cannot double-close) before signalling the client groups, so the
+   daemon never spawns a fresh pi on its way out.
 
 ## Build / test / install
 
 ```bash
 GOTOOLCHAIN=auto go build ./... && go vet ./...   # both must be clean
-GOTOOLCHAIN=auto go test ./... -race              # 19 tests; -race is not optional
+GOTOOLCHAIN=auto go test ./... -race              # 92 tests; -race is not optional
 GOTOOLCHAIN=auto go build -o pi-supervisor ./cmd/pi-supervisor
 ./install/install.sh                              # build + unit + skill symlink + enable
 systemctl --user status pi-supervisor             # active (running) = READY accepted

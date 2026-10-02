@@ -44,7 +44,7 @@ pi-supervisor start <name>       # round 1 LAUNCHes, later rounds RESUME
 # Operate
 pi-supervisor status             # all jobs: state, round, session size/age
 pi-supervisor status <name>      # one job
-pi-supervisor logs <name> 50     # tail the run log
+pi-supervisor logs <name> 50     # tail the run log (one line per log line)
 pi-supervisor steer <name> 'POLICY CHANGE FROM THE OWNER ...'
 pi-supervisor stop <name>        # SIGTERM the client group; session kept
 
