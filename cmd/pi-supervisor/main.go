@@ -147,9 +147,63 @@ func ctl(args []string) {
 	}
 }
 
+// watchFooter prints what an LLM should do next with this event, targeted at
+// the job's worktree (ADR-0003: the message instructs the next action).
+func watchFooter(ev map[string]any) {
+	name, _ := ev["job"].(string)
+	wt, _ := ev["worktree"].(string)
+	if wt == "" {
+		wt = "."
+	}
+	kind, _ := ev["event"].(string)
+	info, _ := ev["info"].(string)
+	rc, _ := ev["rc"].(float64)
+	round, _ := ev["round"].(float64)
+
+	fmt.Println("—")
+	switch kind {
+	case "round_done":
+		rcmsg := "rc=0"
+		if rc != 0 {
+			rcmsg = fmt.Sprintf("rc=%d", int(rc))
+		}
+		fmt.Printf("LLM next steps for %s (round %v, %s):\n", name, int(round), rcmsg)
+		fmt.Printf("  1. confirm only expected changes — `git -C %s diff --stat`\n", wt)
+		fmt.Printf("   2. scan the round log — `tail -n 40 /tmp/pi_%s_run.log`\n", name)
+		if rc != 0 {
+			fmt.Printf("   3. off-course or error — `pi-supervisor steer %s \"...\"` (end of turn) or\n", name)
+			fmt.Printf("      `pi-supervisor interrupt` to stop mid-turn. Then proceed\n")
+		}
+		fmt.Printf("  re-arm: pi-supervisor watch %s   (background+notify=true)\n", name)
+	case "instant_exit":
+		fmt.Printf("LLM: context-exhaustion strike (%s). Check provider errors in\n", info)
+		fmt.Printf("`/tmp/pi_%s_run.log`; `pi-supervisor steer %s \"...\"` or `--set-model`,\n", name, name)
+		fmt.Printf("or 3 strikes -> fatal. Re-arm: pi-supervisor watch %s\n", name)
+	case "backoff":
+		fmt.Printf("Idle — %s before the next round, no action needed.\n", info)
+		fmt.Printf("Re-arm: pi-supervisor watch %s   (background+notify=true)\n", name)
+	case "done":
+		fmt.Printf("THE RUN IS OVER — %s reached its marker.\n", name)
+		fmt.Printf("LLM: confirm deliverables — `git -C %s diff --stat` and the final report.\n", wt)
+		fmt.Println("No re-arm: the job will not emit further events.")
+	case "fatal":
+		fmt.Printf("RUN HALTED — %s is fatal: %s\n", name, info)
+		fmt.Printf("LLM: review `/tmp/pi_%s_run.log` + final report; resume later with\n", name)
+		fmt.Printf("`pi-supervisor start %s` after correcting, or kill if settled. No re-arm.\n", name)
+	case "stopped":
+		fmt.Printf("operator stop — %s paused at round %.0f.\n", name, round)
+		fmt.Printf("Re-arm: pi-supervisor start %s ; pi-supervisor watch %s\n", name, name)
+	case "job_started":
+		fmt.Printf("Job %s launched at %s.\n", name, wt)
+		fmt.Printf("Monitor: pi-supervisor watch %s   | status: pi-supervisor status %s\n", name, name)
+	default:
+		fmt.Printf("next: re-arm (background+notify): pi-supervisor watch %s | status: pi-supervisor status %s\n", name, name)
+	}
+}
+
 // watchCtl blocks on the control socket and prints events as they arrive.
-// Exit 0 on an event (with a footer saying what to run next), 1 when the
-// connection is lost (daemon restart — re-arm), 2 on usage errors.
+// Exit 0 on an event (with a footer of next steps), 1 when the connection is
+// lost (daemon restart — re-arm), 2 on usage errors.
 func watchCtl(req control.Request, terminal bool) {
 	c, err := net.Dial("unix", socketPath())
 	if err != nil {
@@ -187,21 +241,12 @@ func watchCtl(req control.Request, terminal bool) {
 		}
 		out, _ := json.Marshal(ev)
 		fmt.Println(string(out))
-		name, _ := ev["job"].(string)
 		kind, _ := ev["event"].(string)
-		info, _ := ev["info"].(string)
+		watchFooter(ev)
 		switch kind {
 		case "done", "fatal", "stopped":
-			fmt.Printf("THE RUN IS OVER — %s %s (%s)\n", name, kind, info)
-			fmt.Printf("status: pi-supervisor status %s\n", name)
-			if kind == "stopped" {
-				fmt.Printf("resume (if intended): pi-supervisor start %s\n", name)
-			} else {
-				fmt.Println("do not re-arm a watch — the job will not emit further events")
-			}
 			os.Exit(0)
 		default:
-			fmt.Printf("next: re-arm (background+notify): pi-supervisor watch %s | status: pi-supervisor status %s\n", name, name)
 			if !terminal {
 				os.Exit(0)
 			}

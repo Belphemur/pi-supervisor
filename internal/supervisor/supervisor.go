@@ -543,7 +543,8 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 }
 
 // emit records one lifecycle event (audit JSONL + live fan-out to watches).
-// info is printf-formatted for readable diagnostics.
+// info is printf-formatted for readable diagnostics. The job's worktree is
+// attached so a waking LLM can target verification at the right path.
 func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text, format string, args ...any) {
 	if len(text) > 200 {
 		text = text[len(text)-200:]
@@ -552,9 +553,15 @@ func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text
 	if len(args) > 0 {
 		info = fmt.Sprintf(format, args...)
 	}
+	var wt string
+	s.mu.Lock()
+	if r, ok := s.jobs[jobName]; ok {
+		wt = r.job.Worktree
+	}
+	s.mu.Unlock()
 	events.Emit(events.Event{
 		Job: jobName, Event: event, Round: round, RC: rc, DurS: durS,
-		Text: text, Info: info,
+		Text: text, Info: info, Worktree: wt,
 	})
 }
 

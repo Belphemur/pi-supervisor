@@ -32,6 +32,8 @@ type Event struct {
 	DurS  int64  `json:"duration_s,omitempty"`
 	Text  string `json:"text,omitempty"` // short tail of the round output
 	Info  string `json:"info,omitempty"` // human explanation (backoff, fatal)
+	// Worktree is the job's cwd, so a waking LLM can run git/verify there.
+	Worktree string `json:"worktree,omitempty"`
 }
 
 // Terminal reports whether the event ends the watch (and the job's run).
