@@ -210,10 +210,7 @@ func RunlogContains(path, marker string) bool {
 	if err != nil {
 		return false
 	}
-	off := fi.Size() - 4096
-	if off < 0 {
-		off = 0
-	}
+	off := max(fi.Size()-4096, 0)
 	if _, err := f.ReadAt(buf, off); err != nil && !errors.Is(err, io.EOF) {
 		return false
 	}

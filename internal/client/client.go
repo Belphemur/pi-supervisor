@@ -28,8 +28,8 @@ type Options struct {
 	PiBin string
 	// Session resumes an existing session JSONL; when empty a new session is
 	// launched with Name in Worktree.
-	Session string
-	Name    string
+	Session  string
+	Name     string
 	Worktree string
 	// Skills are passed as repeated --skill flags.
 	Skills []string
@@ -305,7 +305,7 @@ func (s *stream) read(r io.Reader) {
 			continue
 		}
 		var e struct {
-			Type string `json:"type"`
+			Type                  string `json:"type"`
 			AssistantMessageEvent struct {
 				Type  string `json:"type"`
 				Delta string `json:"delta"`
@@ -458,7 +458,7 @@ func (c *controlReader) pump(send func(any) error, st *stream, diagOut io.Writer
 	n, err := c.fh.ReadAt(buf, c.pos)
 	if n > 0 {
 		c.pos += int64(n)
-		for _, ln := range strings.Split(string(buf[:n]), "\n") {
+		for ln := range strings.SplitSeq(string(buf[:n]), "\n") {
 			ln = strings.TrimSpace(ln)
 			if ln == "" {
 				continue

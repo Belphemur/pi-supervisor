@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+
+	"pi-supervisor/internal/events"
 )
 
 // Handler is the server-side interface the socket serves; the supervisor
@@ -21,6 +23,15 @@ type Handler interface {
 	Logs(name string, n int) ([]string, error)
 	Reload() error
 }
+
+// Watcher is the optional push extension: cmd "watch" streams events to the
+// client instead of answering once. Implemented by Supervisor.
+type Watcher interface {
+	// Watch subscribes to a job's events ("" = all jobs). A non-nil third
+	// return means the target is already terminal: send it and close.
+	Watch(job string) (<-chan events.Event, func(), *events.Event)
+}
+
 // Request is one control command (one JSON line per connection).
 type Request struct {
 	Cmd  string `json:"cmd"`            // status|start|stop|steer|logs|reload
@@ -31,9 +42,9 @@ type Request struct {
 
 // Response is the single reply.
 type Response struct {
-	OK    bool        `json:"ok"`
-	Error string      `json:"error,omitempty"`
-	Data  interface{} `json:"data,omitempty"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	Data  any    `json:"data,omitempty"`
 }
 
 // Serve accepts JSON-line requests until stop closes.
@@ -65,10 +76,69 @@ func Serve(sockPath string, h Handler, stop chan struct{}) {
 			if err != nil && len(line) == 0 {
 				return
 			}
-			resp := dispatch(h, line)
-			data, _ := json.Marshal(resp)
-			_, _ = c.Write(append(data, '\n'))
+			var req Request
+			if json.Unmarshal(line, &req) == nil && req.Cmd == "watch" {
+				if w, ok := h.(Watcher); ok {
+					serveWatch(c, h, w, req)
+					return
+				}
+				writeOne(c, Response{OK: false, Error: "watch unsupported"})
+				return
+			}
+			writeOne(c, dispatch(h, line))
 		}(conn)
+	}
+}
+
+// writeOne writes one Response line; false = the client is gone.
+func writeOne(c net.Conn, resp Response) bool {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return false
+	}
+	_, werr := c.Write(append(data, '\n'))
+	return werr == nil
+}
+
+// serveWatch holds the connection open and pushes events until a terminal
+// one (or the client disconnects). Filtering by job happens here so the
+// broker stays unfiltered and cheap.
+func serveWatch(c net.Conn, h Handler, w Watcher, req Request) {
+	label := req.Job
+	if label == "" {
+		label = "*"
+	}
+	// Unknown-job guard: error out and close instead of blocking forever.
+	if req.Job != "" {
+		if _, err := h.Status(req.Job); err != nil {
+			writeOne(c, Response{OK: false, Error: err.Error()})
+			return
+		}
+	}
+	ch, cancel, pre := w.Watch(req.Job)
+	if pre != nil {
+		// Requirement 4: a finished run answers immediately, no blocking.
+		_ = writeOne(c, Response{OK: true, Data: *pre})
+		return
+	}
+	defer cancel()
+	if !writeOne(c, Response{OK: true, Data: map[string]string{"watching": label}}) {
+		return
+	}
+	for {
+		e, ok := <-ch
+		if !ok {
+			return
+		}
+		if req.Job != "" && e.Job != req.Job {
+			continue
+		}
+		if !writeOne(c, Response{OK: true, Data: e}) {
+			return
+		}
+		if e.Terminal() {
+			return
+		}
 	}
 }
 

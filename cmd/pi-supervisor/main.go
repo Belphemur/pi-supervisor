@@ -68,7 +68,7 @@ func runDaemon() {
 // ctl talks to the running daemon over the control socket.
 func ctl(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: pi-supervisor status [job] | start|stop <job> | steer <job> <text...> | logs <job> [n] | reload")
+		fmt.Fprintln(os.Stderr, "usage: pi-supervisor status [job] | start|stop <job> | steer <job> <text...> | logs <job> [n] | reload | watch [job] [-t]")
 		os.Exit(2)
 	}
 	var req control.Request
@@ -98,6 +98,19 @@ func ctl(args []string) {
 		}
 	case "reload":
 		req.Cmd = "reload"
+	case "watch":
+		req.Cmd = "watch"
+		terminal := false
+		for _, a := range args[1:] {
+			switch a {
+			case "-t", "--terminal":
+				terminal = true
+			default:
+				req.Job = a
+			}
+		}
+		watchCtl(req, terminal)
+		return
 	default:
 		fatalf("unknown ctl command %q", args[0])
 	}
@@ -134,6 +147,64 @@ func ctl(args []string) {
 	}
 }
 
+// watchCtl blocks on the control socket and prints events as they arrive.
+// Exit 0 on an event (with a footer saying what to run next), 1 when the
+// connection is lost (daemon restart — re-arm), 2 on usage errors.
+func watchCtl(req control.Request, terminal bool) {
+	c, err := net.Dial("unix", socketPath())
+	if err != nil {
+		fatalf("daemon not reachable at %s: %v", socketPath(), err)
+	}
+	defer c.Close()
+	line, _ := json.Marshal(req)
+	if _, err := c.Write(append(line, '\n')); err != nil {
+		fatalf("write: %v", err)
+	}
+
+	sc := bufio.NewScanner(c)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var resp control.Response
+		if err := json.Unmarshal(sc.Bytes(), &resp); err != nil {
+			continue
+		}
+		if !resp.OK {
+			fmt.Fprintln(os.Stderr, "error:", resp.Error)
+			os.Exit(2)
+		}
+		ev, isEvent := resp.Data.(map[string]any)
+		if !isEvent {
+			// The "watching" ack.
+			fmt.Println("watching", req.Job, "— blocked until the supervisor sends data (Ctrl-C to stop)")
+			continue
+		}
+		out, _ := json.Marshal(ev)
+		fmt.Println(string(out))
+		name, _ := ev["job"].(string)
+		kind, _ := ev["event"].(string)
+		info, _ := ev["info"].(string)
+		switch kind {
+		case "done", "fatal", "stopped":
+			fmt.Printf("THE RUN IS OVER — %s %s (%s)\n", name, kind, info)
+			fmt.Printf("status: pi-supervisor status %s\n", name)
+			if kind == "stopped" {
+				fmt.Printf("resume (if intended): pi-supervisor start %s\n", name)
+			} else {
+				fmt.Println("do not re-arm a watch — the job will not emit further events")
+			}
+			os.Exit(0)
+		default:
+			fmt.Printf("next: re-arm (background+notify): pi-supervisor watch %s | status: pi-supervisor status %s\n", name, name)
+			if !terminal {
+				os.Exit(0)
+			}
+		}
+	}
+	// Connection closed by the daemon or lost mid-stream.
+	fmt.Fprintln(os.Stderr, "watch connection lost (daemon restart?) — check: systemctl --user status pi-supervisor, then re-arm: pi-supervisor watch", req.Job)
+	os.Exit(1)
+}
+
 func fatalf(f string, args ...any) {
 	fmt.Fprintf(os.Stderr, f+"\n", args...)
 	os.Exit(2)
@@ -141,12 +212,12 @@ func fatalf(f string, args ...any) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: pi-supervisor run | status [job] | start|stop <job> | steer <job> <text...> | logs <job> [n] | reload")
+		fatalf("usage: pi-supervisor run | status [job] | start|stop <job> | steer <job> <text...> | logs <job> [n] | reload | watch [job] [-t]")
 	}
 	switch os.Args[1] {
 	case "run":
 		runDaemon()
-	case "status", "start", "stop", "steer", "logs", "reload":
+	case "status", "start", "stop", "steer", "logs", "reload", "watch":
 		ctl(os.Args[1:])
 	default:
 		fatalf("unknown command %q", os.Args[1])

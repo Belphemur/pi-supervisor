@@ -78,10 +78,7 @@ func TestRoundCapStopsJob(t *testing.T) {
 	pinSession(t, &j, brief)
 	writeJob(t, j)
 
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	if err := s.Start("capped"); err != nil {
 		t.Fatal(err)
 	}
@@ -120,10 +117,7 @@ func TestMarkerGateFinishesJob(t *testing.T) {
 	pinSession(t, &j, brief)
 	writeJob(t, j)
 
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	if err := s.Start("finished"); err != nil {
 		t.Fatal(err)
 	}
@@ -155,10 +149,7 @@ func TestInstantExitStrikesAccumulate(t *testing.T) {
 	pinSession(t, &j, brief)
 	writeJob(t, j)
 
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	if err := s.Start("striker"); err != nil {
 		t.Fatal(err)
 	}
@@ -199,10 +190,7 @@ func TestRunningCountTracksActiveJobs(t *testing.T) {
 		writeJob(t, j)
 	}
 
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	if n := s.RunningCount(); n != 0 {
 		t.Fatalf("RunningCount = %d before any start, want 0", n)
 	}
@@ -238,10 +226,7 @@ func TestStateSurvivesReload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	st, err := s.Status("persisted")
 	if err != nil {
 		t.Fatal(err)
@@ -271,10 +256,7 @@ func TestStopLeavesResumableState(t *testing.T) {
 		SessionName: "stoppable", MaxRounds: 5, TimeoutS: 60, PiBin: pi,
 	})
 
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	if err := s.Start("stoppable"); err != nil {
 		t.Fatal(err)
 	}
@@ -323,10 +305,7 @@ func TestSteerWritesControlFile(t *testing.T) {
 		Name: "steerable", Brief: "/tmp/x.md", Worktree: t.TempDir(),
 		SessionName: "steerable", MaxRounds: 1, TimeoutS: 20, PiBin: "true",
 	})
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	if err := s.Steer("steerable", `{"type":"prompt","message":"POLICY CHANGE"}`); err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +321,7 @@ func TestSteerWritesControlFile(t *testing.T) {
 // Atomic state writes must never leave a partial file behind.
 func TestStateWriteIsAtomic(t *testing.T) {
 	testEnv(t)
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		if err := job.SaveState("atomic", job.State{Round: i, State: "running"}); err != nil {
 			t.Fatal(err)
 		}
@@ -380,10 +359,7 @@ func TestNeverForkGuardFailsJobWithoutSession(t *testing.T) {
 		SessionName: "forker", MaxRounds: 5, TimeoutS: 20, PiBin: pi, BackoffScale: 0.02,
 	})
 
-	s := New()
-	if err := s.LoadJobs(); err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSupervisor(t)
 	if err := s.Start("forker"); err != nil {
 		t.Fatal(err)
 	}
@@ -412,4 +388,33 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %s", timeout)
+}
+
+// stopAll tears down every running job so tests never leak pi processes.
+func stopAll(s *Supervisor) {
+	s.mu.Lock()
+	names := make([]string, 0, len(s.jobs))
+	for n := range s.jobs {
+		names = append(names, n)
+	}
+	s.mu.Unlock()
+	for _, n := range names {
+		_ = s.Stop(n)
+	}
+	// Give each in-flight round's client goroutine a moment to observe the
+	// stop channel and reap its pi process before the test exits.
+	time.Sleep(time.Second)
+}
+
+// newTestSupervisor wires up a supervisor with the temp HOME already applied by
+// testEnv, and arranges stopAll on test completion to guarantee no leaked
+// pi/fake-pi goroutines across failures.
+func newTestSupervisor(t *testing.T) *Supervisor {
+	t.Helper()
+	s := New()
+	if err := s.LoadJobs(); err != nil {
+		t.Fatalf("LoadJobs: %v", err)
+	}
+	t.Cleanup(func() { stopAll(s) })
+	return s
 }

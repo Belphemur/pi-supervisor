@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"pi-supervisor/internal/client"
+	"pi-supervisor/internal/events"
 	"pi-supervisor/internal/job"
 )
 
@@ -189,11 +190,9 @@ func (s *Supervisor) Start(name string) error {
 	r.mu.Unlock()
 	r.persistState()
 
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
+	s.wg.Go(func() {
 		s.loop(r, stopCh)
-	}()
+	})
 	return nil
 }
 
@@ -207,6 +206,9 @@ func (s *Supervisor) Stop(name string) error {
 	r.mu.Lock()
 	active := r.active
 	if active {
+		// Mark inactive synchronously under the lock so a second Stop() is a
+		// no-op rather than a double-close of the stop channel.
+		r.active = false
 		close(r.stopCh)
 	}
 	pid := r.pid
@@ -214,10 +216,28 @@ func (s *Supervisor) Stop(name string) error {
 	if !active {
 		return fmt.Errorf("job %q not running", name)
 	}
-	if pid > 0 {
-		_ = syscall.Kill(-pid, syscall.SIGTERM) // whole process group
-	}
 	s.logf(name, "stop requested by operator (pid %d)", pid)
+	if pid <= 0 {
+		// The client may not have published its pid yet (still spawning).
+		// The round goroutine's stop path escalates on its own; nothing to
+		// signal here.
+		return nil
+	}
+	// Kill the whole process group, then escalate if it lingers. Bounded so
+	// Stop() never returns while pi is still alive (an orphan pi would keep
+	// writing to the session JSONL unsupervised).
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		gone := r.pid == 0
+		r.mu.Unlock()
+		if gone {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 	return nil
 }
 
@@ -257,12 +277,16 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if round > maxRounds {
 			r.finish("fatal", "round cap reached without marker")
 			s.logf(r.job.Name, "FATAL: round cap %d reached without marker", maxRounds)
+			s.emit(r.job.Name, "fatal", round, 0, 0, "", "round cap %d reached without marker", maxRounds)
 			return
 		}
 		r.mu.Lock()
 		r.state.Round = round
 		j := r.job
 		r.mu.Unlock()
+		if round == 1 {
+			s.emit(j.Name, "job_started", round, 0, 0, "", "round 1 launched")
+		}
 
 		rc, dur, runlogB := s.round(r, round, stopCh)
 		select {
@@ -273,6 +297,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			r.mu.Unlock()
 			r.persistState()
 			s.logf(name, "loop stopped at round %d (client rc=%d)", round, rc)
+			s.emit(name, "stopped", round, rc, dur, "", "operator stop")
 			return
 		default:
 		}
@@ -290,6 +315,10 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		r.state.LastDiag = job.Tail(job.Runlog(name), 240)
 		r.mu.Unlock()
 
+		s.emit(name, "round_done", round, rc, dur, r.stateSnapshot().LastDiag, "")
+		if instant {
+			s.emit(name, "instant_exit", round, rc, dur, "", "instant exit strike %d/3 (rc=%d, %ds)", strikes, rc, dur)
+		}
 		s.logf(name, "round %d: client exit=%d duration=%ds runlog=%dB", round, rc, dur, runlogB)
 		if r.stateSnapshot().LastDiag != "" {
 			s.logf(name, "round %d diagnostic: %s", round, r.stateSnapshot().LastDiag)
@@ -301,12 +330,14 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			r.mu.Unlock()
 			r.persistState()
 			s.logf(name, "round %d: marker %q detected — done", round, j.Marker)
+			s.emit(name, "done", round, 0, dur, "", "marker %q detected — run is over", j.Marker)
 			return
 		}
 
 		if instant && strikes >= 3 {
 			r.finish("fatal", "3 consecutive instant exits — likely context exhaustion or model refusal")
 			s.logf(name, "FATAL: 3 consecutive instant exits — manual intervention required")
+			s.emit(name, "fatal", round, rc, dur, "", "3 consecutive instant exits — likely context exhaustion or model refusal")
 			return
 		}
 
@@ -320,6 +351,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			if p == "" {
 				r.finish("fatal", "could not capture session path after LAUNCH — refusing to fork a new session")
 				s.logf(name, "FATAL: could not capture session path after LAUNCH — aborting instead of forking")
+				s.emit(name, "fatal", round, 0, dur, "", "could not capture session path — refusing to fork")
 				return
 			}
 			r.mu.Lock()
@@ -348,12 +380,14 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			scale = 1.0
 		}
 		sleep = time.Duration(float64(sleep) * scale)
+		s.emit(name, "backoff", round, rc, dur, "", "sleeping %s before round %d", sleep.Round(time.Second), round+1)
 		select {
 		case <-stopCh:
 			r.mu.Lock()
 			r.state.State, r.active = "stopped", false
 			r.mu.Unlock()
 			r.persistState()
+			s.emit(name, "stopped", round, rc, dur, "", "operator stop during backoff")
 			return
 		case <-time.After(sleep):
 		}
@@ -473,8 +507,18 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 
 	case <-stopCh:
 		s.logf(j.Name, "round %d: operator stop — terminating pi process group", round)
-		// The client observes stdin closure and reaps; force the group down
-		// if it lingers past the client's own grace period.
+		// Escalate fast and deterministically so an operator stop (and test
+		// teardown) never leaves an orphan pi writing to the session:
+		// SIGTERM the group, then SIGKILL after a short grace. This mirrors
+		// Stop() but also covers the case where Stop() fired before OnPID
+		// published the pid (pid==0 there), which is exactly when an
+		// unsupervised pi would otherwise survive.
+		r.mu.Lock()
+		spid := r.pid
+		r.mu.Unlock()
+		if spid > 0 {
+			_ = syscall.Kill(-spid, syscall.SIGTERM)
+		}
 		done := make(chan struct{})
 		go func() {
 			o := <-doneCh
@@ -484,7 +528,7 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		}()
 		select {
 		case <-done:
-		case <-time.After(20 * time.Second):
+		case <-time.After(3 * time.Second):
 			r.mu.Lock()
 			pid := r.pid
 			r.mu.Unlock()
@@ -496,6 +540,51 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		o := <-doneCh
 		return o.res.RC, int64(time.Since(start).Seconds()), job.Size(runlog)
 	}
+}
+
+// emit records one lifecycle event (audit JSONL + live fan-out to watches).
+// info is printf-formatted for readable diagnostics.
+func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text, format string, args ...any) {
+	if len(text) > 200 {
+		text = text[len(text)-200:]
+	}
+	info := format
+	if len(args) > 0 {
+		info = fmt.Sprintf(format, args...)
+	}
+	events.Emit(events.Event{
+		Job: jobName, Event: event, Round: round, RC: rc, DurS: durS,
+		Text: text, Info: info,
+	})
+}
+
+// Watch subscribes the caller to a job's lifecycle events ("" = all jobs).
+// If the requested job is already terminal (done|fatal|stopped) it returns a
+// non-nil precheck Event instead of a channel: the server sends it and closes
+// rather than blocking on a finished run (ADR-0003, requirement 4).
+func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events.Event) {
+	id, ch, cancel := events.Subscribe()
+	if jobName != "" {
+		s.mu.Lock()
+		r, ok := s.jobs[jobName]
+		s.mu.Unlock()
+		if ok {
+			snap := r.snapshot()
+			switch snap.State {
+			case "done", "fatal", "stopped":
+				cancel()
+				ev := events.Event{
+					TS: time.Now().UTC().Format(time.RFC3339), Job: jobName,
+					Event: snap.State, Round: snap.Round, RC: snap.LastRC,
+					DurS: snap.LastDurS,
+					Info: "run already " + snap.State + " — nothing to wait for",
+				}
+				return nil, func() {}, &ev
+			}
+		}
+	}
+	_ = id
+	return ch, cancel, nil
 }
 
 // RunningCount reports how many jobs are currently in a running round. Fed

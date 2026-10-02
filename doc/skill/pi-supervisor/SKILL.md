@@ -47,6 +47,10 @@ pi-supervisor status <name>      # one job
 pi-supervisor logs <name> 50     # tail the run log
 pi-supervisor steer <name> 'POLICY CHANGE FROM THE OWNER ...'
 pi-supervisor stop <name>        # SIGTERM the client group; session kept
+
+# Notifications: block until the supervisor sends an event (see below)
+pi-supervisor watch <name>       # exit after the first event
+pi-supervisor watch <name> -t    # exit only when the run is over (done/fatal/stopped)
 ```
 
 ## Architecture
@@ -85,6 +89,44 @@ systemd (Type=notify, WatchdogSec=120)
 - **systemd status:** `systemctl --user status pi-supervisor` shows
   `N parallel pi session(s) running`; it updates on each watchdog beat and
   whenever the count changes.
+
+## Notifications — the `watch` command (ADR-0003)
+
+The session that started a job gets told what happened — no cronjob, no
+polling, no configured chat address. Correctness is structural: the watch is a
+blocking client over the control socket, armed as a background run, and the
+background-completion notification is delivered **to the session that armed
+it**. It cannot go anywhere else.
+
+```
+# Arm (Hermes): a background process that wakes this session on the next event
+terminal(command="pi-supervisor watch power-top", background=true, notify=true)
+
+# Or hold ONE process for the whole campaign; it wakes only when the run is over
+terminal(command="pi-supervisor watch power-top -t", background=true, notify=true)
+```
+
+Behavior:
+
+- **Blocks silently** until the supervisor pushes an event. Events:
+  `job_started`, `round_done` (rc, duration, output tail), `instant_exit`
+  (strike n/3), `backoff` ("not dead, sleeping Ns"), and the terminals
+  `done` / `fatal` / `stopped`.
+- **Finished run ⇒ immediate return.** If the job is already done/fatal/stopped
+  when you arm, the watch does NOT block — it prints
+  `THE RUN IS OVER — <job> <event>`, points at `status`, and says not to re-arm.
+- **Every exit message is self-explanatory** (owner requirement): after a
+  non-terminal event it prints the re-arm command (`pi-supervisor watch <job>`,
+  background+notify) and the status command; after a terminal event it says the
+  run is over and that no re-arm is needed. `stopped` additionally prints the
+  resume command. Act on the event, then re-arm for the next one.
+- **Exit codes:** 0 = event delivered (or run already over), 1 = connection
+  lost (daemon restarted — check `systemctl --user status pi-supervisor`,
+  then re-arm), 2 = usage error (unknown job).
+- Do NOT arm a watch in a foreground tool call — the 600s cap kills it mid-wait.
+  Background+notify is the pattern; a foreground call is only for probing.
+- Every event is also appended to `~/.pi/supervisor/events/<job>.jsonl`
+  (append-only audit trail, human-greppable). Nothing reads it automatically.
 
 ## systemd integration
 

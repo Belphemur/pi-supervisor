@@ -15,7 +15,8 @@ Unix socket.
 | `internal/job/job.go` | Job model (`~/.pi/supervisor/jobs/*.json`), state persistence, session discovery, run-log helpers |
 | `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering, abort-drain handshake, timeout/abort/reap escalation. No Python. |
 | `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard |
-| `internal/control/control.go` | Unix-socket request/response server (one JSON line per connection) |
+| `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
+| `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
 | `install/install.sh` | Build + systemd unit + Hermes skill symlink + verification |
 | `install/pi-supervisor.service` | `Type=notify` user unit (`WatchdogSec=120`) |
 | `doc/adr/` | Architecture decision records |
@@ -40,6 +41,13 @@ Unix socket.
 5. **Per-job file names are load-bearing** (`/tmp/pi_<name>.ctrl`,
    `/tmp/pi_<name>_run.log`, `_orchestrator.log`, `_status.json`): external
    tooling (`pi_control.py`, orchestrator greps) depends on them.
+6. **Watch is push-only, never pulled.** `cmd:"watch"` holds the connection
+   and streams events from the in-process broker; the broker's send is
+   non-blocking (drop, don't stall the round loop). A finished job answers
+   immediately with a precheck event instead of blocking, and the client's
+   exit message must always say how to re-arm / get status (ADR-0003). The
+   only delivery path to Hermes is the blocking `pi-supervisor watch` client
+   armed as a background run — no cronjob, no polling, no chat addressing.
 
 ## Build / test / install
 
