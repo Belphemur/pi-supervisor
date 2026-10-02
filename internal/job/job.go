@@ -197,6 +197,44 @@ func Tail(path string, n int) string {
 	return strings.TrimSpace(strings.ReplaceAll(string(data), "\n", " | "))
 }
 
+// TailLines returns the last n complete lines of a JSONL file, each truncated
+// to maxChars (with a leading "…" marker when cut). It reads at most the last
+// 256KB, so a multi-GB session transcript costs the same as a small one.
+// Missing files return nil — callers treat that as "no transcript yet".
+func TailLines(path string, n, maxChars int) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return nil
+	}
+	const window = 256 << 10
+	off := max(fi.Size()-int64(window), 0)
+	buf := make([]byte, fi.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return nil
+	}
+	lines := strings.Split(strings.TrimRight(string(buf), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		if len(ln) > maxChars {
+			ln = "…" + ln[len(ln)-maxChars:]
+		}
+		out = append(out, ln)
+	}
+	return out
+}
+
 // RunlogContains reports whether the marker appears in the run log's last
 // 4KB window (same window semantics as the bash supervisor).
 func RunlogContains(path, marker string) bool {

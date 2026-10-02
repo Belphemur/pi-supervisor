@@ -159,6 +159,19 @@ func watchFooter(ev map[string]any) {
 	info, _ := ev["info"].(string)
 	rc, _ := ev["rc"].(float64)
 	round, _ := ev["round"].(float64)
+	sess, _ := ev["session_path"].(string)
+
+	// Transcript tail: the last couple of session JSONL lines, plus where the
+	// rest lives. Missing/empty transcript prints nothing extra.
+	if sess != "" {
+		if lines := job.TailLines(sess, 2, 300); len(lines) > 0 {
+			fmt.Printf("last session JSONL lines (%s):\n", sess)
+			for _, ln := range lines {
+				fmt.Printf("  %s\n", ln)
+			}
+			fmt.Printf("  (rest of the transcript: `tail -n 50 %s` or pi_session.py watch)\n", sess)
+		}
+	}
 
 	fmt.Println("—")
 	switch kind {

@@ -553,15 +553,18 @@ func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text
 	if len(args) > 0 {
 		info = fmt.Sprintf(format, args...)
 	}
-	var wt string
+	var wt, sess string
 	s.mu.Lock()
 	if r, ok := s.jobs[jobName]; ok {
+		r.mu.Lock()
 		wt = r.job.Worktree
+		sess = r.job.SessionPath
+		r.mu.Unlock()
 	}
 	s.mu.Unlock()
 	events.Emit(events.Event{
 		Job: jobName, Event: event, Round: round, RC: rc, DurS: durS,
-		Text: text, Info: info, Worktree: wt,
+		Text: text, Info: info, Worktree: wt, SessionPath: sess,
 	})
 }
 
@@ -586,6 +589,10 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 					DurS: snap.LastDurS,
 					Info: "run already " + snap.State + " — nothing to wait for",
 				}
+				r.mu.Lock()
+				ev.Worktree = r.job.Worktree
+				ev.SessionPath = r.job.SessionPath
+				r.mu.Unlock()
 				return nil, func() {}, &ev
 			}
 		}
