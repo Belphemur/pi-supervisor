@@ -11,9 +11,10 @@ Unix socket.
 | Path | Role |
 |---|---|
 | `cmd/pi-supervisor/main.go` | Entry: `run` (daemon) + ctl subcommands (status/start/stop/steer/logs/reload) |
-| `internal/notify/sd.go` | Pure-Go `sd_notify` (`READY=1`, `STOPPING=1`, watchdog pings). No cgo. |
+| `internal/notify/sd.go` | Pure-Go `sd_notify`: `READY=1`, `STOPPING=1`, and `Beat()` which pairs `WATCHDOG=1` with `STATUS=<n> parallel pi session(s) running`. No cgo. |
 | `internal/job/job.go` | Job model (`~/.pi/supervisor/jobs/*.json`), state persistence, session discovery, run-log helpers |
-| `internal/supervisor/supervisor.go` | Round loops: spawn `pi_rpc_client.py`, classify exits, adaptive backoff, marker gate, instant-exit strikes |
+| `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering, abort-drain handshake, timeout/abort/reap escalation. No Python. |
+| `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard |
 | `internal/control/control.go` | Unix-socket request/response server (one JSON line per connection) |
 | `install/install.sh` | Build + systemd unit + Hermes skill symlink + verification |
 | `install/pi-supervisor.service` | `Type=notify` user unit (`WatchdogSec=120`) |
@@ -31,7 +32,7 @@ Unix socket.
    context-exhaustion death-spiral guard; do not turn it into an infinite
    retry.
 3. **Process groups.** The client is spawned with `Setpgid: true`; stop/kill
-   paths always signal `-pid` (the whole group), never just the python pid.
+   paths always signal `-pid` (the whole group), never just the pi pid.
 4. **sd_notify contract.** `READY=1` only after the control socket listens and
    jobs are loaded; `STOPPING=1` before killing clients on SIGTERM. The unit
    is `Type=notify` + `WatchdogSec=120` — a daemon that stops answering the
@@ -44,6 +45,7 @@ Unix socket.
 
 ```bash
 GOTOOLCHAIN=auto go build ./... && go vet ./...   # both must be clean
+GOTOOLCHAIN=auto go test ./... -race              # 19 tests; -race is not optional
 GOTOOLCHAIN=auto go build -o pi-supervisor ./cmd/pi-supervisor
 ./install/install.sh                              # build + unit + skill symlink + enable
 systemctl --user status pi-supervisor             # active (running) = READY accepted

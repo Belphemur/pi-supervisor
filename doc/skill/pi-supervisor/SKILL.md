@@ -49,10 +49,28 @@ pi-supervisor steer <name> 'POLICY CHANGE FROM THE OWNER ...'
 pi-supervisor stop <name>        # SIGTERM the client group; session kept
 ```
 
+## Architecture
+
+The daemon spawns `pi --mode rpc` **directly** — no Python. `internal/client`
+is a Go port of the old `pi_rpc_client.py`: LF-delimited JSON framing, streamed
+text capture, control-file steering, the abort-drain handshake, and
+timeout/abort/SIGTERM/SIGKILL escalation. Exit codes the supervisor classifies:
+`0` agent_end, `1` error/timeout/spawn failure, `2` stdout closed with no
+agent_end.
+
+```
+systemd (Type=notify, WatchdogSec=120)
+└── pi-supervisor run
+    ├── control socket  $XDG_RUNTIME_DIR/pi-supervisor.sock  (JSONL, 0600)
+    ├── notify.Beat     WATCHDOG=1 + STATUS=<n> parallel pi session(s)
+    └── per job: round loop → internal/client → pi --mode rpc
+```
+
 ## Semantics
 
-- **Round loop:** client `--timeout 1800`; hard kill at +120s; adaptive
-  backoff (clean cap 15s / long run 20s / instant implosion 90s / else 30s).
+- **Round loop:** client `--timeout 1800`; supervisor backstop kill at +120s;
+  adaptive backoff (clean cap 15s / long run 20s / instant implosion 90s /
+  else 30s), multiplied by the job's optional `backoff_scale`.
 - **Session rule:** session path captured once after round 1 LAUNCH; every
   later round RESUMEs `--session <path>`. Never re-LAUNCH (forks the session).
 - **Instant-exit strikes:** rc≠0 && <60s && runlog <4KB ⇒ strike; 3 strikes ⇒
@@ -61,8 +79,12 @@ pi-supervisor stop <name>        # SIGTERM the client group; session kept
   job `done`.
 - **Steering:** appends to `/tmp/pi_<name>.ctrl`, the same file
   `pi_control.py` uses — both tools coexist.
-- **State:** `~/.pi/supervisor/state/<name>.json`; daemon restarts adopt jobs
-  as resumable (`stopped`), never auto-running.
+- **State:** `~/.pi/supervisor/state/<name>.json`, written atomically
+  (temp + fsync + rename). Daemon restarts adopt jobs as resumable
+  (`stopped`), never auto-running.
+- **systemd status:** `systemctl --user status pi-supervisor` shows
+  `N parallel pi session(s) running`; it updates on each watchdog beat and
+  whenever the count changes.
 
 ## systemd integration
 
@@ -80,7 +102,8 @@ pi-supervisor stop <name>        # SIGTERM the client group; session kept
 | job state `fatal`, diag "3 consecutive instant exits" | session context wall — start a fresh session (new job or clear state) or trim the session |
 | `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
 | ctl: "daemon not reachable" | `systemctl --user status pi-supervisor`; journal for socket errors |
-| client exits 137 | timeout watchdog SIGKILL (timeout+120s) — task may be oversized |
+| `systemctl status` count is stale | the beat only rewrites STATUS when the count changes; a count that never moves means no round is ending |
+| rc=2 in the log | pi's stdout closed with no agent_end (crash mid-turn) — treated as a failure, not a clean cap |
 
 ## Pitfalls (from the bash era, still true)
 
