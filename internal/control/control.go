@@ -122,7 +122,7 @@ func serveWatch(c net.Conn, h Handler, w Watcher, req Request) {
 		return
 	}
 	defer cancel()
-	if !writeOne(c, Response{OK: true, Data: map[string]string{"watching": label}}) {
+	if !writeOne(c, Response{OK: true, Data: map[string]any{"type": "watch_ack", "watching": label}}) {
 		return
 	}
 	for {

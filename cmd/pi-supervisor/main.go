@@ -173,10 +173,17 @@ func watchCtl(req control.Request, terminal bool) {
 			os.Exit(2)
 		}
 		ev, isEvent := resp.Data.(map[string]any)
-		if !isEvent {
-			// The "watching" ack.
-			fmt.Println("watching", req.Job, "— blocked until the supervisor sends data (Ctrl-C to stop)")
+		if isEvent && ev["type"] == "watch_ack" {
+			// First message is the ack, not an event — keep waiting.
+			w := req.Job
+			if w == "" {
+				w = "*"
+			}
+			fmt.Println("watching", w, "— blocked until the supervisor sends data (Ctrl-C to stop)")
 			continue
+		}
+		if !isEvent {
+			continue // unexpected non-map payload; ignore
 		}
 		out, _ := json.Marshal(ev)
 		fmt.Println(string(out))
