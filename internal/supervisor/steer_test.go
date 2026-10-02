@@ -221,8 +221,14 @@ func TestSteerReportsHeldThenDelivered(t *testing.T) {
 
 	go func() {
 		// Find the frame the steer wrote, then play held -> forwarded.
+		// This helper must find the frame and ack it WELL INSIDE the
+		// supervisor's steerWait budget: under a parallel `go test -race`
+		// run the scheduler can starve this goroutine for seconds, so a
+		// short self-imposed deadline used to lose the race and fail the
+		// suite spuriously. Poll fast, and give the discovery loop a
+		// deadline comfortably below steerWait (20s), never equal to it.
 		var id string
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
 			data, err := os.ReadFile(job.Ctrl("held"))
 			if err == nil {
