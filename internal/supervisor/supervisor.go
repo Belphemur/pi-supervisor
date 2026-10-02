@@ -1,20 +1,20 @@
-// Package supervisor runs the per-job round loops: spawn pi_rpc_client.py,
-// classify exits, adaptive backoff, marker gate, instant-exit strikes.
+// Package supervisor runs the per-job round loops: drives the daemon-native
+// pi RPC client (internal/client), classifies exits, adaptive backoff, marker
+// gate, instant-exit strikes.
 package supervisor
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"pi-supervisor/internal/client"
 	"pi-supervisor/internal/job"
 )
 
@@ -329,6 +329,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			s.logf(name, "round %d: captured session path %s", round, p)
 		}
 
+		// Adaptive backoff: a clean cap means pi is healthy and progressing,
+		// an instant implosion means something is wrong and retrying fast just
+		// burns the context wall. Scale lets tests and operators tune it.
 		var sleep time.Duration
 		switch {
 		case rc == 0:
@@ -340,6 +343,11 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		default:
 			sleep = 30 * time.Second
 		}
+		scale := r.job.BackoffScale
+		if scale <= 0 {
+			scale = 1.0
+		}
+		sleep = time.Duration(float64(sleep) * scale)
 		select {
 		case <-stopCh:
 			r.mu.Lock()
@@ -367,7 +375,8 @@ func (r *runner) finish(state, diag string) {
 	_ = name
 }
 
-// round spawns one pi_rpc_client.py round; hard-kills at timeout+120s.
+// round runs one pi RPC round via the daemon-native client (internal/client);
+// hard-kills the pi process group at timeout+120s as a backstop.
 func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, dur int64, runlogB int64) {
 	r.mu.Lock()
 	j := r.job
@@ -377,21 +386,6 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	_, runlog, _, _ := job.Paths(j.Name)
 	_ = os.Truncate(runlog, 0)
 	_ = os.WriteFile(job.Ctrl(j.Name), nil, 0o644) // fresh steer channel per round
-
-	args := []string{filepath.Join(job.PiScripts(), "pi_rpc_client.py")}
-	if resume {
-		args = append(args, "--session", j.SessionPath)
-	} else {
-		args = append(args, "-C", j.Worktree, "-n", j.SessionName)
-	}
-	for _, sk := range j.Skills {
-		args = append(args, "--skill", sk)
-	}
-	prompt := j.Brief
-	if resume {
-		prompt = j.Cont
-	}
-	args = append(args, "--control", job.Ctrl(j.Name), "-f", prompt, "--timeout", strconv.Itoa(j.TimeoutS))
 
 	if resume {
 		s.logf(j.Name, "round %d: RESUME %s", round, j.SessionPath)
@@ -405,59 +399,123 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	}
 	defer out.Close()
 
-	cmd := exec.Command("python3", args...)
-	cmd.Stdout = out
-	cmd.Stderr = out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		s.logf(j.Name, "round %d: spawn failed: %v", round, err)
+	promptPath := j.Brief
+	if resume {
+		promptPath = j.Cont
+	}
+	prompt, err := client.DefaultPromptFile(promptPath)
+	if err != nil {
+		s.logf(j.Name, "round %d: prompt unreadable: %v", round, err)
 		return 1, 0, 0
 	}
-	r.mu.Lock()
-	r.pid = cmd.Process.Pid
-	r.started = start
-	r.mu.Unlock()
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	timer := time.NewTimer(time.Duration(j.TimeoutS+120) * time.Second)
-	defer timer.Stop()
+	opts := client.Options{
+		PiBin:       j.PiBin,
+		Session:     j.SessionPath,
+		Name:        j.SessionName,
+		Worktree:    j.Worktree,
+		Skills:      j.Skills,
+		Provider:    j.Provider,
+		Model:       j.Model,
+		Prompt:      prompt,
+		ControlPath: job.Ctrl(j.Name),
+		Timeout:     time.Duration(j.TimeoutS) * time.Second,
+		GracePeriod: 30 * time.Second,
+		Out:         out,
+		Diag:        out,
+		OnPID: func(pid int) {
+			r.mu.Lock()
+			r.pid = pid
+			r.started = time.Now()
+			r.mu.Unlock()
+		},
+	}
+
+	type outcome struct {
+		res client.Result
+	}
+	doneCh := make(chan outcome, 1)
+	start := time.Now()
+	go func() {
+		doneCh <- outcome{res: client.Run(opts)}
+	}()
+
+	backstop := time.NewTimer(time.Duration(j.TimeoutS+120) * time.Second)
+	defer backstop.Stop()
+
+	clearPID := func() {
+		r.mu.Lock()
+		r.pid = 0
+		r.mu.Unlock()
+	}
 
 	select {
-	case err := <-done:
-		r.mu.Lock()
-		r.pid = 0
-		r.mu.Unlock()
-		if err == nil {
-			return 0, int64(time.Since(start).Seconds()), job.Size(runlog)
+	case o := <-doneCh:
+		clearPID()
+		if o.res.Err != "" {
+			s.logf(j.Name, "round %d: client error: %s", round, o.res.Err)
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			return ee.ExitCode(), int64(time.Since(start).Seconds()), job.Size(runlog)
-		}
-		return 1, int64(time.Since(start).Seconds()), job.Size(runlog)
-	case <-timer.C:
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		s.logf(j.Name, "round %d: hard kill after %ds (timeout watchdog)", round, int(time.Since(start).Seconds()))
-		<-done
+		return o.res.RC, int64(time.Since(start).Seconds()), job.Size(runlog)
+
+	case <-backstop.C:
+		// Last-resort net: the client owns its own soft deadline, so this only
+		// fires if the client goroutine itself wedged.
 		r.mu.Lock()
-		r.pid = 0
+		pid := r.pid
 		r.mu.Unlock()
-		return 137, int64(time.Since(start).Seconds()), job.Size(runlog)
+		if pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+		s.logf(j.Name, "round %d: hard kill after %ds (supervisor backstop)", round, int(time.Since(start).Seconds()))
+		o := <-doneCh
+		clearPID()
+		return o.res.RC, int64(time.Since(start).Seconds()), job.Size(runlog)
+
 	case <-stopCh:
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		s.logf(j.Name, "round %d: operator stop — terminating pi process group", round)
+		// The client observes stdin closure and reaps; force the group down
+		// if it lingers past the client's own grace period.
+		done := make(chan struct{})
+		go func() {
+			o := <-doneCh
+			clearPID()
+			doneCh <- o
+			close(done)
+		}()
 		select {
 		case <-done:
-		case <-time.After(15 * time.Second):
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		case <-time.After(20 * time.Second):
+			r.mu.Lock()
+			pid := r.pid
+			r.mu.Unlock()
+			if pid > 0 {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
 			<-done
 		}
-		r.mu.Lock()
-		r.pid = 0
-		r.mu.Unlock()
-		return 143, int64(time.Since(start).Seconds()), job.Size(runlog)
+		o := <-doneCh
+		return o.res.RC, int64(time.Since(start).Seconds()), job.Size(runlog)
 	}
+}
+
+// RunningCount reports how many jobs are currently in a running round. Fed
+// to systemd as STATUS= on every watchdog beat.
+func (s *Supervisor) RunningCount() int {
+	s.mu.Lock()
+	runners := make([]*runner, 0, len(s.jobs))
+	for _, r := range s.jobs {
+		runners = append(runners, r)
+	}
+	s.mu.Unlock()
+	n := 0
+	for _, r := range runners {
+		r.mu.Lock()
+		if r.active && r.state.State == "running" {
+			n++
+		}
+		r.mu.Unlock()
+	}
+	return n
 }
 
 // statusList is the typed StatusAll used internally by Monitor.

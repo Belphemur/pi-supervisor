@@ -38,25 +38,49 @@ func Send(state string) error {
 	return err
 }
 
-// Watchdog answers systemd's watchdog (WATCHDOG_USEC) with WATCHDOG=1 pings
-// at half the interval, until stop closes. No-op when unset.
-func Watchdog(stop <-chan struct{}) {
+// Beat sends one combined notify datagram: the watchdog ping plus a human
+// status line. countFn supplies the number of running sessions for STATUS=;
+// when it returns an error the ping still goes out alone.
+func Beat(stop <-chan struct{}, countFn func() int) {
 	usec := os.Getenv("WATCHDOG_USEC")
-	if usec == "" {
-		return
+	interval := 30 * time.Second
+	if usec != "" {
+		if us, err := strconv.Atoi(usec); err == nil && us > 0 {
+			interval = time.Duration(us/2) * time.Microsecond
+		}
 	}
-	us, err := strconv.Atoi(usec)
-	if err != nil || us <= 0 {
-		return
+	// Always report status, even when systemd didn't arm a watchdog, so
+	// `systemctl status` stays live in the non-notify case too.
+	if os.Getenv("WATCHDOG_USEC") == "" {
+		interval = 15 * time.Second
 	}
-	t := time.NewTicker(time.Duration(us/2) * time.Microsecond)
+	t := time.NewTicker(interval)
 	defer t.Stop()
+	lastCount := -1
 	for {
 		select {
 		case <-stop:
 			return
 		case <-t.C:
-			_ = Send("WATCHDOG=1")
+			if countFn == nil {
+				_ = Send("WATCHDOG=1")
+				continue
+			}
+			n := countFn()
+			// Skip the write when nothing changed: sd_notify is a syscall
+			// per beat and the count is usually static between round ends.
+			if n == lastCount {
+				_ = Send("WATCHDOG=1")
+				continue
+			}
+			lastCount = n
+			_ = Send(fmt.Sprintf("STATUS=%d parallel pi session(s) running\nWATCHDOG=1", n))
 		}
 	}
+}
+
+// Watchdog answers systemd's watchdog (WATCHDOG_USEC) with WATCHDOG=1 pings
+// at half the interval, until stop closes. No-op when unset.
+func Watchdog(stop <-chan struct{}) {
+	Beat(stop, nil)
 }

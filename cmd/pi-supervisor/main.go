@@ -45,7 +45,9 @@ func runDaemon() {
 	stop := make(chan struct{})
 	go control.Serve(socketPath(), sup, stop)
 	go sup.Monitor(stop)
-	go notify.Watchdog(stop)
+	// One sd_notify beat carries both the watchdog ping and STATUS=<n>
+	// parallel pi session(s) running, visible in `systemctl status`.
+	go notify.Beat(stop, sup.RunningCount)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)

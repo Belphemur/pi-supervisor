@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -33,6 +32,15 @@ type Job struct {
 	MaxRounds   int      `json:"max_rounds"`
 	TimeoutS    int      `json:"timeout_s"`
 	Skills      []string `json:"skills"`
+	// PiBin is the pi executable; empty means resolve "pi" on PATH.
+	PiBin string `json:"pi_bin,omitempty"`
+	// Provider/Model optionally pin pi's backend for this job.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	// BackoffScale multiplies every inter-round sleep. 0 means the default
+	// (1.0). Tests use a small value to keep round cycles fast; operators
+	// can raise it for expensive campaigns.
+	BackoffScale float64 `json:"backoff_scale,omitempty"`
 }
 
 // Paths returns the per-job working files (compat with the bash supervisor's
@@ -107,7 +115,37 @@ func Load(path string) (Job, error) {
 	if j.SessionName == "" {
 		j.SessionName = j.Name
 	}
+	if j.BackoffScale <= 0 {
+		j.BackoffScale = 1.0
+	}
 	return j, nil
+}
+
+// writeAtomic writes data to path via a temp file + fsync + rename, so a crash
+// mid-write can never leave a truncated/corrupt state file behind.
+func writeAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeded
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // Save atomically persists a job config (after session-path adoption).
@@ -116,7 +154,7 @@ func Save(j Job) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(JobsDir(), j.Name+".json"), data, 0o644)
+	return writeAtomic(filepath.Join(JobsDir(), j.Name+".json"), data)
 }
 
 func SaveState(name string, st State) error {
@@ -124,7 +162,7 @@ func SaveState(name string, st State) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(StateDir(), name+".json"), data, 0o644)
+	return writeAtomic(filepath.Join(StateDir(), name+".json"), data)
 }
 
 func LoadState(name string) (State, error) {
@@ -204,18 +242,9 @@ func LastLines(path string, n int) ([]string, error) {
 	return all, nil
 }
 
-// FindSession resolves a session JSONL by name via pi_session.py, falling
-// back to the newest .jsonl in the worktree's munged session dir.
+// FindSession resolves a session JSONL for a job: the newest .jsonl in the
+// worktree's munged session dir. Pure Go — no pi_session.py subprocess.
 func FindSession(name, worktree string) string {
-	out, err := exec.Command("python3", filepath.Join(PiScripts(), "pi_session.py"),
-		"list", "--name", name, "--last", "1").Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if i := strings.Index(line, Home()+"/"); i >= 0 && strings.HasSuffix(strings.TrimSpace(line), ".jsonl") {
-				return strings.TrimSpace(line[i:])
-			}
-		}
-	}
 	dir := MungedSessionsDir(worktree)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
