@@ -470,7 +470,9 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	if err != nil {
 		return 1, 0, 0
 	}
-	defer out.Close()
+	// The run log is a diagnostic mirror; the round's verdict comes from
+	// the client Result, so a failed close (append-only handle) is not fatal.
+	defer func() { _ = out.Close() }()
 
 	promptPath := j.Brief
 	if resume {
@@ -630,19 +632,33 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 			// Cap reached: instruct the agent to finish the report, then
 			// close the run as a review-loop failure. Keep the round alive
 			// so the abort+prompt turn can actually deliver the report.
-			s.interruptWith(name, "CI/review stall cap reached ("+fmt.Sprint(capN)+
-				" parks with no transcript progress). Stop polling CI. Finish the review "+
-				"report NOW: summarize what landed, what failed, and what the operator "+
-				"must check. The supervisor is closing this run as a failure to finish "+
-				"the review loop.")
+			interrupt := "CI/review stall cap reached (" + fmt.Sprint(capN) +
+				" parks with no transcript progress). Stop polling CI. Finish the review " +
+				"report NOW: summarize what landed, what failed, and what the operator " +
+				"must check. The supervisor is closing this run as a failure to finish " +
+				"the review loop."
+			interruptErr := s.interruptWith(name, interrupt)
+			if interruptErr != nil {
+				// The round can no longer be told to finish the report, so the
+				// agent will be killed without it — surface that instead of
+				// silently reporting "agent instructed".
+				s.logf(name, "ERROR: CI-stall cap interrupt not delivered: %v", interruptErr)
+			}
+			delivered := ""
+			if interruptErr == nil {
+				delivered = "; agent instructed to finish the report"
+			} else {
+				delivered = "; FINISH-THE-REPORT INTERRUPT NOT DELIVERED (" +
+					interruptErr.Error() + ")"
+			}
 			r.mu.Lock()
 			r.state.State, r.state.LastDiag, r.active = "fatal",
-				"CI review retry cap exceeded — review loop did not finish", false
+				"CI review retry cap exceeded — review loop did not finish"+delivered, false
 			r.mu.Unlock()
 			r.persistState()
-			s.logf(name, "FATAL: CI review retry cap %d exceeded — agent instructed to finish the report", capN)
+			s.logf(name, "FATAL: CI review retry cap %d exceeded%s", capN, delivered)
 			s.emit(name, "fatal", round, 0, 0, "",
-				"CI review retry cap %d exceeded — review loop did not finish; agent instructed to finish the report", capN)
+				"CI review retry cap %d exceeded — review loop did not finish%s", capN, delivered)
 			return
 		}
 	}
@@ -656,7 +672,7 @@ func (s *Supervisor) interruptWith(name, text string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer f.Close() // control file: the frames are already written below
 	rid := fmt.Sprintf("%d", time.Now().UnixNano())
 	for _, frame := range []any{
 		map[string]any{"id": "abort-" + rid, "type": "abort"},
