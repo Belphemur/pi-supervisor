@@ -46,6 +46,7 @@ pi-supervisor status             # all jobs: state, round, session size/age
 pi-supervisor status <name>      # one job
 pi-supervisor logs <name> 50     # tail the run log (one line per log line)
 pi-supervisor steer <name> 'POLICY CHANGE FROM THE OWNER ...'
+pi-supervisor steer <name> -n '...'  # don't wait for pi's ack
 pi-supervisor stop <name>        # SIGTERM the client group; session kept
 
 # Notifications: block until the supervisor sends an event (see below)
@@ -81,8 +82,14 @@ systemd (Type=notify, WatchdogSec=120)
   job `fatal` (context wall / model refusal — needs operator action).
 - **Completion:** final report exists AND marker in the run log's last 4KB ⇒
   job `done`.
-- **Steering:** appends to `/tmp/pi_<name>.ctrl`, the same file
-  `pi_control.py` uses — both tools coexist.
+- **Steering:** writes a JSON frame to `/tmp/pi_<name>.ctrl` — the same
+  file `pi_control.py` uses, so both tools coexist. Prose is wrapped in a
+  prompt frame; a hand-written JSON frame is passed through. Every frame gets
+  an id and the client acks what it did with it in
+  `/tmp/pi_<name>_ack.jsonl`, so `steer` prints a real outcome
+  (`forwarded` / `held` then delivered / `send failed` / `bad frame` /
+  `no live round`) and exits non-zero unless pi took the frame. `-n` skips
+  the wait and reports `written`. See ADR-0005.
 - **State:** `~/.pi/supervisor/state/<name>.json`, written atomically
   (temp + fsync + rename). Daemon restarts adopt jobs as resumable
   (`stopped`), never auto-running.
@@ -152,6 +159,7 @@ Behavior:
 | `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
 | ctl: "daemon not reachable" | `systemctl --user status pi-supervisor`; journal for socket errors |
 | `systemctl status` count is stale | the beat only rewrites STATUS when the count changes; a count that never moves means no round is ending |
+| `steer` says `no live round` / `not confirmed` | no round was polling the ctrl file, or pi never acked within ~7s — the frame was NOT delivered; check `status` and the run log, then re-send |
 | rc=2 in the log | pi's stdout closed with no agent_end (crash mid-turn) — treated as a failure, not a clean cap |
 
 ## Pitfalls (from the bash era, still true)
@@ -159,6 +167,11 @@ Behavior:
 - Never run the RPC client in a foreground tool call — the timeout kills it
   mid-turn. The daemon exists to make this moot.
 - One steer = one coherent directive block; never re-send the whole brief.
-- Steers to a *finished* job's ctrl file never land — check `status` first.
+- A steer to a job with no running round is refused (`no live round`), not
+  queued: the ctrl file is truncated at the start of every round, so it would
+  be wiped unread. Wait for `status` to show a round, then re-send.
+- `not confirmed` means pi never acked the frame within ~7s (or the round
+  ended first). Check the run log for `[control] forwarded:` and re-send —
+  do not treat it as delivered.
 - Session JSONL is the memory: never delete it to "reset"; clear the job
   state instead.

@@ -12,9 +12,9 @@ Unix socket.
 |---|---|
 | `cmd/pi-supervisor/main.go` | Entry: `run` (daemon) + ctl subcommands (status/start/stop/steer/logs/reload) |
 | `internal/notify/sd.go` | Pure-Go `sd_notify`: `READY=1`, `STOPPING=1`, and `Beat()` which pairs `WATCHDOG=1` with `STATUS=<n> parallel pi session(s) running`. No cgo. |
-| `internal/job/job.go` | Job model (`~/.pi/supervisor/jobs/*.json`), state persistence, session discovery, run-log helpers |
-| `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering, abort-drain handshake, timeout/abort/reap escalation. No Python. |
-| `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard |
+| `internal/job/job.go` | Job model (`~/.pi/supervisor/jobs/*.json`), state persistence, session discovery, run-log helpers, steer ack model (`job.Ack`, `job.AckRecord`, `job.SteerReport`) |
+| `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering (with per-frame acks), abort-drain handshake, timeout/abort/reap escalation. No Python. |
+| `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard, `Steer` (frame + ack wait, ADR-0005) |
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
 | `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap |
 | `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
@@ -41,7 +41,8 @@ Unix socket.
    watchdog gets restarted by systemd, which is the "doesn't die" guarantee.
 5. **Per-job file names are load-bearing** (`/tmp/pi_<name>.ctrl`,
    `/tmp/pi_<name>_run.log`, `_orchestrator.log`, `_status.json`): external
-   tooling (`pi_control.py`, orchestrator greps) depends on them.
+   tooling (`pi_control.py`, orchestrator greps) depends on them. The ack log
+   `/tmp/pi_<name>_ack.jsonl` (ADR-0005) is additive and advisory.
 6. **Watch is push-only, never pulled.** `cmd:"watch"` holds the connection
    and streams events from the in-process broker; the broker's send is
    non-blocking (drop, don't stall the round loop). A finished job answers
@@ -53,6 +54,14 @@ Unix socket.
    closes each active runner's stop channel (under `r.mu`, so a concurrent
    `Stop` cannot double-close) before signalling the client groups, so the
    daemon never spawns a fresh pi on its way out.
+8. **Steer never claims success it cannot prove (ADR-0005).** Prose is wrapped
+   into a `prompt` frame (the client's wire contract stays strict JSON-LF);
+   each frame carries an id; the client appends an ack record per frame it
+   acts on and `steer` waits (bounded by the poll interval, holding no lock)
+   for the terminal one. `no live round` and `not confirmed` are failures with
+   a non-zero exit, never a quiet exit 0. The ctrl file is truncated at every
+   round start **and the reader starts at offset 0** — those two are one
+   mechanism; don't "fix" one without the other.
 
 ## Build / test / install
 
