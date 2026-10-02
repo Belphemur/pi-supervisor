@@ -58,12 +58,40 @@ Unix socket.
 
 ```bash
 GOTOOLCHAIN=auto go build ./... && go vet ./...   # both must be clean
-GOTOOLCHAIN=auto go test ./... -race              # 92 tests; -race is not optional
+gofmt -l .                                         # must print nothing
+GOTOOLCHAIN=auto go test ./... -race              # -race is not optional
+/home/balor/go/bin/golangci-lint run ./...        # must exit 0 (v2.14.0)
 GOTOOLCHAIN=auto go build -o pi-supervisor ./cmd/pi-supervisor
 ./install/install.sh                              # build + unit + skill symlink + enable
 systemctl --user status pi-supervisor             # active (running) = READY accepted
 pi-supervisor status                              # ctl over the socket
 ```
+
+### golangci-lint gate
+
+`.golangci.yml` (schema `version: "2"`) enables errcheck, govet,
+staticcheck (incl. gosimple), ineffassign, unused, bodyclose, errorlint,
+copyloopvar, misspell, unconvert and a curated low-noise revive rule set.
+No whitespace/lll/godot/godox — they are stylistic churn, not defects.
+
+Toolchain caveats that cost real time:
+
+- The binary is **not on PATH** for non-login shells. Always invoke it as
+  `/home/balor/go/bin/golangci-lint run ./...` (absolute path).
+- It must be **built against go1.27.0** (this module declares `go 1.27`).
+  Rebuild with:
+  ```bash
+  cd /tmp && GOTOOLCHAIN=go1.27.0 GOBIN=/home/balor/go/bin \
+    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+  ```
+  Plain `GOTOOLCHAIN=auto` builds it with go1.26 and it then REFUSES to run
+  ("language version used to build golangci-lint is lower than the targeted
+  Go version").
+- Do **not** downgrade to v2.12.2: its bundled staticcheck (honnef.co/go/tools
+  v0.7.0) panics on go1.27 IR.
+- Suppression policy: fix in code, not with `//nolint`. An explicitly
+  ignored error (`_ = f.Close()`) is acceptable only where the call cannot
+  fail meaningfully AND carries a comment saying why.
 
 Socket: `$XDG_RUNTIME_DIR/pi-supervisor.sock` (0600). CLI and socket use the
 same JSON shapes (`internal/control.Request`/`Response`).
