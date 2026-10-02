@@ -1,0 +1,16 @@
+[Unit]
+Description=pi RPC supervisor daemon (round loops, session monitoring, control socket)
+
+[Service]
+Type=notify
+NotifyAccess=main
+# pi and other user tools live in ~/.local/bin; systemd's default PATH omits it.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/pi-supervisor run
+Restart=on-failure
+RestartSec=5
+# Watchdog: the daemon pings WATCHDOG=1 at half this interval (internal/notify).
+WatchdogSec=120
+
+[Install]
+WantedBy=default.target
