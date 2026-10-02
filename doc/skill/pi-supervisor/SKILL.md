@@ -110,8 +110,11 @@ Behavior:
 
 - **Blocks silently** until the supervisor pushes an event. Events:
   `job_started`, `round_done` (rc, duration, output tail), `instant_exit`
-  (strike n/3), `backoff` ("not dead, sleeping Ns"), and the terminals
-  `done` / `fatal` / `stopped`.
+  (strike n/3), `backoff` ("not dead, sleeping Ns"), `ci_stall` (the agent
+  parked on the CI/answer-code-review loop — see ADR-0004: the daemon tails
+  the session JSONL and at `ci_stall_cap` parks interrupts the session with a
+  finish-the-report prompt and closes the run as a review-loop failure), and
+  the terminals `done` / `fatal` / `stopped`.
 - **Finished run ⇒ immediate return.** If the job is already done/fatal/stopped
   when you arm, the watch does NOT block — it prints
   `THE RUN IS OVER — <job> <event>`, points at `status`, and says not to re-arm.

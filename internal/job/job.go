@@ -41,6 +41,15 @@ type Job struct {
 	// (1.0). Tests use a small value to keep round cycles fast; operators
 	// can raise it for expensive campaigns.
 	BackoffScale float64 `json:"backoff_scale,omitempty"`
+	// CI-stall awareness (ADR-0004): the daemon tails the session JSONL for
+	// markers that the agent is parked on the CI / code-review loop, and
+	// counts one "retry" per quiet park. At CIStallCap stalls (default 3,
+	// 0 = default) it interrupts the session with a finish-the-report prompt
+	// and closes the run as a failure to finish the review loop.
+	// CIStallIdleS is the quiet window that turns an armed marker into a
+	// stall (default 300, 0 = default).
+	CIStallCap   int `json:"ci_stall_cap,omitempty"`
+	CIStallIdleS int `json:"ci_stall_idle_s,omitempty"`
 }
 
 // Paths returns the per-job working files (compat with the bash supervisor's
@@ -71,6 +80,7 @@ type State struct {
 	InstantExits int    `json:"instant_exits"`
 	LastDiag     string `json:"last_diag"`
 	StartedAt    string `json:"started_at"`
+	CIStalls     int    `json:"ci_stalls"` // parks on the CI/review loop, cumulative
 }
 
 // Status is the live snapshot served over the socket / written to disk.
@@ -87,6 +97,7 @@ type Status struct {
 	LastDurS      int64   `json:"last_duration_s"`
 	LastRunlogB   int64   `json:"last_runlog_bytes"`
 	InstantExits  int     `json:"instant_exits"`
+	CIStalls      int     `json:"ci_stalls"`
 	LastDiag      string  `json:"last_diag"`
 	MarkerFound   bool    `json:"marker_found"`
 	FinalReportOK bool    `json:"final_report_exists"`

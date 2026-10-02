@@ -17,6 +17,7 @@ import (
 	"pi-supervisor/internal/client"
 	"pi-supervisor/internal/events"
 	"pi-supervisor/internal/job"
+	"pi-supervisor/internal/stall"
 )
 
 // Handler is the control-socket surface (implemented by Supervisor).
@@ -118,6 +119,7 @@ func (r *runner) snapshot() job.Status {
 		MaxRounds: r.job.MaxRounds, SessionPath: r.job.SessionPath,
 		ClientPID: r.pid, LastRC: r.state.LastRC, LastDurS: r.state.LastDurS,
 		LastRunlogB: r.runlogB, InstantExits: r.state.InstantExits,
+		CIStalls: r.state.CIStalls,
 		LastDiag: r.state.LastDiag, LastUpdate: time.Now().Format(time.RFC3339),
 	}
 	if r.job.FinalReport != "" {
@@ -288,7 +290,26 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			s.emit(j.Name, "job_started", round, 0, 0, "", "round 1 launched")
 		}
 
-		rc, dur, runlogB := s.round(r, round, stopCh)
+		// CI-stall watcher (ADR-0004): rounds with a captured transcript get
+		// a detector that interrupts the session and fails the run once the
+		// agent has parked on the CI/review loop ci_stall_cap times.
+		r.mu.Lock()
+		sess := r.job.SessionPath
+		r.mu.Unlock()
+		var rc int
+		var dur, runlogB int64
+		if sess != "" {
+			watchStop, watchExited := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(watchExited)
+				s.watchCIStalls(r, sess, round, watchStop, stopCh)
+			}()
+			rc, dur, runlogB = s.round(r, round, stopCh)
+			close(watchStop)
+			<-watchExited // watcher stopped before the round is classified
+		} else {
+			rc, dur, runlogB = s.round(r, round, stopCh)
+		}
 		select {
 		case <-stopCh:
 			r.mu.Lock()
@@ -331,6 +352,14 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			r.persistState()
 			s.logf(name, "round %d: marker %q detected — done", round, j.Marker)
 			s.emit(name, "done", round, 0, dur, "", "marker %q detected — run is over", j.Marker)
+			return
+		}
+
+		// A CI-stall cap intervention may have closed the run mid-round
+		// (ADR-0004). The done-check above already had its chance to upgrade
+		// a finished report to done; otherwise the fatal stands.
+		if r.stateSnapshot().State == "fatal" {
+			s.logf(name, "round %d: run closed by CI-stall intervention", round)
 			return
 		}
 
@@ -540,6 +569,95 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		o := <-doneCh
 		return o.res.RC, int64(time.Since(start).Seconds()), job.Size(runlog)
 	}
+}
+
+// watchCIStalls tails the session transcript for one round and intervenes at
+// the stall cap (ADR-0004). Non-cap stalls only emit; the cap stall writes
+// abort+prompt frames telling the agent to finish the report, then closes the
+// run as a failure to finish the review loop. The round itself is left alive
+// so the report turn can actually run.
+func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop, stopCh chan struct{}) {
+	r.mu.Lock()
+	capN, idleS, name := r.job.CIStallCap, r.job.CIStallIdleS, r.job.Name
+	r.mu.Unlock()
+	if capN <= 0 {
+		capN = 3
+	}
+	if idleS <= 0 {
+		idleS = 300
+	}
+	d := stall.New(sess, time.Duration(idleS)*time.Second)
+	tick := time.Duration(idleS) / 10
+	if tick < 200*time.Millisecond {
+		tick = 200 * time.Millisecond
+	}
+	if tick > 15*time.Second {
+		tick = 15 * time.Second
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-watchStop:
+			return
+		case <-stopCh:
+			return
+		case <-t.C:
+			stalled, marker := d.Poll()
+			if !stalled {
+				continue
+			}
+			r.mu.Lock()
+			r.state.CIStalls++
+			n := r.state.CIStalls
+			r.mu.Unlock()
+			s.logf(name, "round %d: CI/review stall %d/%d (%s)", round, n, capN, marker)
+			s.emit(name, "ci_stall", round, 0, 0, "",
+				"stall %d/%d — agent parked on CI/review: %s", n, capN, marker)
+			if n < capN {
+				continue
+			}
+			// Cap reached: instruct the agent to finish the report, then
+			// close the run as a review-loop failure. Keep the round alive
+			// so the abort+prompt turn can actually deliver the report.
+			s.interruptWith(name, "CI/review stall cap reached ("+fmt.Sprint(capN)+
+				" parks with no transcript progress). Stop polling CI. Finish the review "+
+				"report NOW: summarize what landed, what failed, and what the operator "+
+				"must check. The supervisor is closing this run as a failure to finish "+
+				"the review loop.")
+			r.mu.Lock()
+			r.state.State, r.state.LastDiag, r.active = "fatal",
+				"CI review retry cap exceeded — review loop did not finish", false
+			r.mu.Unlock()
+			r.persistState()
+			s.logf(name, "FATAL: CI review retry cap %d exceeded — agent instructed to finish the report", capN)
+			s.emit(name, "fatal", round, 0, 0, "",
+				"CI review retry cap %d exceeded — review loop did not finish; agent instructed to finish the report", capN)
+			return
+		}
+	}
+}
+
+// interruptWith delivers an instant abort+fresh-prompt pair to a live round's
+// control file — the same wire format pi_control.py --interrupt writes and
+// the client's abort-drain handshake consumes.
+func (s *Supervisor) interruptWith(name, text string) error {
+	f, err := os.OpenFile(job.Ctrl(name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	rid := fmt.Sprintf("%d", time.Now().UnixNano())
+	for _, frame := range []any{
+		map[string]any{"id": "abort-" + rid, "type": "abort"},
+		map[string]any{"id": "int-" + rid, "type": "prompt", "message": text},
+	} {
+		line, _ := json.Marshal(frame)
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // emit records one lifecycle event (audit JSONL + live fan-out to watches).

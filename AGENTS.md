@@ -16,6 +16,7 @@ Unix socket.
 | `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering, abort-drain handshake, timeout/abort/reap escalation. No Python. |
 | `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard |
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
+| `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap |
 | `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
 | `install/install.sh` | Build + systemd unit + Hermes skill symlink + verification |
 | `install/pi-supervisor.service` | `Type=notify` user unit (`WatchdogSec=120`) |
