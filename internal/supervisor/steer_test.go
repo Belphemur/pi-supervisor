@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,6 +60,56 @@ func appendAck(t *testing.T, path string, rec job.AckRecord) {
 	if _, err := f.Write(append(line, '\n')); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// waitAckVisible blocks until the ack log at path contains a record with the
+// given id and outcome, as read through acksSince — the exact path waitAck
+// uses — so the helper synchronizes with the waiter's view instead of racing
+// it on a blind timer. Fails the test on timeout (default 5s).
+func waitAckVisible(t *testing.T, path, wantID, wantOutcome string) {
+	t.Helper()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("ack %s/%s never observed in %s", wantOutcome, wantID, path)
+		case <-tick.C:
+		}
+		// acksSince opens the file from offset 0; that matches how waitAck
+		// sweeps on each poll.
+		for _, rec := range acksSince(path, 0) {
+			if rec.ID == wantID && rec.Outcome == wantOutcome {
+				return
+			}
+		}
+	}
+}
+
+// lastFrameID reads the newest control-frame id from a ctrl file. It returns
+// ("", false) if the file is absent, empty, or holds no well-formed frame, so
+// a test helper can poll without distinguishing "not yet" from "broken".
+func lastFrameID(t *testing.T, path string) (string, bool) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	id := ""
+	for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		var f map[string]any
+		if json.Unmarshal([]byte(ln), &f) == nil {
+			if v, ok := f["id"].(string); ok && v != "" {
+				id = v
+			}
+		}
+	}
+	return id, id != ""
 }
 
 // The documented usage is prose: `steer <job> 'POLICY CHANGE ...'`. It must
@@ -211,48 +262,74 @@ func TestSteerPassesThroughJSONFrame(t *testing.T) {
 // record, including how long the frame waited behind the abort.
 func TestSteerReportsHeldThenDelivered(t *testing.T) {
 	testEnv(t)
+	// Unique job name per test ITERATION so job.Ack/Ctrl's fixed
+	// /tmp/pi_<name>_* paths do not collide across -count runs (t.Name()
+	// is identical for every iteration of the same test). Without this,
+	// run 2's waiter reads run 1's stale Held record and the held-then-
+	// delivered detail never fires.
+	name := "held-" + t.Name() + fmt.Sprintf("-run%d", time.Now().UnixNano())
 	writeJob(t, job.Job{
-		Name: "held", Brief: "/tmp/x.md", Worktree: t.TempDir(),
-		SessionName: "held", MaxRounds: 1, TimeoutS: 20, PiBin: "true",
+		Name: name, Brief: "/tmp/x.md", Worktree: t.TempDir(),
+		SessionName: name, MaxRounds: 1, TimeoutS: 20, PiBin: "true",
 	})
 	s := newTestSupervisor(t)
 	s.steerWait = 20 * time.Second
-	armFakeRound(t, s, "held", 4343)
+	armFakeRound(t, s, name, 4343)
 
 	go func() {
-		// Find the frame the steer wrote, then play held -> forwarded.
-		// This helper must find the frame and ack it WELL INSIDE the
-		// supervisor's steerWait budget: under a parallel `go test -race`
-		// run the scheduler can starve this goroutine for seconds, so a
-		// short self-imposed deadline used to lose the race and fail the
-		// suite spuriously. Poll fast, and give the discovery loop a
-		// deadline comfortably below steerWait (20s), never equal to it.
-		var id string
-		deadline := time.Now().Add(15 * time.Second)
-		for time.Now().Before(deadline) {
-			data, err := os.ReadFile(job.Ctrl("held"))
-			if err == nil {
-				for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-					var f map[string]any
-					if json.Unmarshal([]byte(line), &f) == nil {
-						id, _ = f["id"].(string)
-					}
-				}
+		// Play held -> forwarded. We do NOT discover the frame id by polling the
+		// ctrl file with a deadline (the prior version did: a 15s discovery
+		// window that lost the race under a parallel `go test -race` run,
+		// because the scheduler can starve this goroutine for seconds while
+		// Steer blocks its caller). Instead we append ack records for ANY id
+		// we see in the ctrl file: Steer's waitAck filters by FrameID, so a
+		// record whose id has not landed yet is simply ignored and re-scanned
+		// on the next poll. The loop runs until the waiter has gone quiet, so
+		// there is no discovery deadline to lose and no fixed sleeps to misjudge.
+		heldWritten := false
+		// Run no longer than the supervisor's own steerWait budget so the test
+		// fails fast instead of waiting for the 20s timeout when something is
+		// actually wrong.
+		deadline := time.After(s.steerWait)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-deadline:
+				return
+			case <-ticker.C:
 			}
-			if id != "" {
-				break
+			id, ok := lastFrameID(t, job.Ctrl(name))
+			if !ok || id == "" {
+				continue
 			}
-			time.Sleep(20 * time.Millisecond)
+			if !heldWritten {
+				appendAck(t, job.Ack(name), job.AckRecord{
+					ID: id, Outcome: job.AckHeld, Type: "prompt",
+				})
+				heldWritten = true
+				// waitAck only tags detail as "held then delivered" when it
+				// observes the Held record BEFORE the Forwarded one in the same
+				// poll batch. A blind sleep cannot guarantee that under `go test
+				// -race` (the scheduler can deliver both acks before the 100ms
+				// waiter poll fires). Synchronize instead: block until the held
+				// ack is actually visible through the same acksSince path the
+				// waiter reads, then write forwarded. This makes the
+				// two-step transition deterministic, not timing-dependent.
+				waitAckVisible(t, job.Ack(name), id, job.AckHeld)
+				continue
+			}
+			appendAck(t, job.Ack(name), job.AckRecord{
+				ID:      id,
+				Outcome: job.AckForwarded,
+				Type:    "prompt",
+				Detail:  "queued behind an abort; delivered once the drain settled",
+				DelayMS: 320,
+			})
 		}
-		appendAck(t, job.Ack("held"), job.AckRecord{ID: id, Outcome: job.AckHeld, Type: "prompt"})
-		time.Sleep(300 * time.Millisecond)
-		appendAck(t, job.Ack("held"), job.AckRecord{
-			ID: id, Outcome: job.AckForwarded, Type: "prompt",
-			Detail: "queued behind an abort; delivered once the drain settled", DelayMS: 320,
-		})
 	}()
 
-	rep, err := s.Steer("held", "POLICY CHANGE", false)
+	rep, err := s.Steer(name, "POLICY CHANGE", false)
 	if err != nil {
 		t.Fatalf("Steer: %v (%+v)", err, rep)
 	}
