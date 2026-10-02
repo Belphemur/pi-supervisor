@@ -173,6 +173,7 @@ Behavior:
 | `systemctl status` count is stale | the beat only rewrites STATUS when the count changes; a count that never moves means no round is ending |
 | `steer` says `no live round` / `not confirmed` | no round was polling the ctrl file, or pi never acked within the bounded wait (~20s) — the frame was NOT delivered; check `status` and the run log, then re-send |
 | rc=2 in the log | pi's stdout closed with no agent_end (crash mid-turn) — treated as a failure, not a clean cap |
+| `status` shows no `pr <url>` but a PR is open on GitHub | the daemon scrapes the PR URL from the round's transcript as it tails it (ADR-0006); it only sees URLs the agent *linked* in its messages. A PR opened without the agent writing the `pull/<number>` link — e.g. a toolResult that truncated the URL, or a PR filed by CI/a hook — is not surfaced. An empty field means "not linked in the transcript", not "no PR exists"; link the PR in your next round to have it appear. |
 
 ## Pitfalls (from the bash era, still true)
 
