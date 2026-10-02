@@ -1,2 +1,4 @@
-pi-supervisor
+/pi-supervisor          # the built binary (anchored: cmd/pi-supervisor/ is source)
 *.new
+# pi agent scratch state (task lists) — never part of the repo
+.pi/
