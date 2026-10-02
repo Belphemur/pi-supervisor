@@ -1,0 +1,109 @@
+# golangci-lint v2 configuration for pi-supervisor.
+#
+# Toolchain caveat: golangci-lint must be built against go1.27.0 to lint this
+# module (go.mod says `go 1`). Rebuild with:
+#   cd /tmp && GOTOOLCHAIN=go1.27.0 GOBIN=/home/balor/go/bin \
+#     go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+# Plain GOTOOLCHAIN=auto builds it with go1.26 and it then refuses to run
+# ("language version used to build golangci-lint is lower than the targeted
+# Go version"). v2.12.2 must not be used: its bundled staticcheck panics on
+# go1.27 IR. The binary is not on PATH for non-login shells — always invoke it
+# as /home/balor/go/bin/golangci-lint.
+#
+# Set is deliberately low-noise: correctness only. No whitespace/lll/godot/
+# godox/nolintlint-style churn linters.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - bodyclose      # unclosed HTTP response bodies
+    - copyloopvar    # Go 1.22+ per-iteration loop vars (redundant copies)
+    - errcheck       # unchecked errors
+    - errorlint      # %w / errors.Is-errors.As usage, no type-asserted errors
+    - govet
+    - ineffassign    # writes that can never be read
+    - misspell
+    - revive         # curated low-noise rule set, see below
+    - staticcheck    # includes the former gosimple checks in v2
+    - unconvert      # redundant type conversions
+    - unused         # dead code (incl. unused struct fields)
+  settings:
+    errcheck:
+      # Explicit `_ = f.Close()` is a deliberate, commented decision — only
+      # unchecked calls are reported.
+      check-blank: false
+      check-type-assertions: true
+    govet:
+      enable-all: false
+      enable:
+        - appends
+        - atomic
+        - bools
+        - copylocks
+        - defers
+        - lostcancel
+        - loopclosure
+        - nilness
+        - printf
+        - shift
+        - stdmethods
+        - stringintconv
+        - tests
+        - unmarshal
+        - unreachable
+        - unusedresult
+    misspell:
+      # The repo's prose is US English.
+      locale: US
+    revive:
+      # Correctness rules only. No exported/var-naming docstring demands:
+      # those are repo-wide stylistic churn, not defects.
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+    staticcheck:
+      checks:
+        - all
+        # ST1000/ST1003/ST1020/ST1021/ST1022 are package/naming/comment docs.
+        - -ST1000
+        - -ST1003
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # QF1008 is an "omit embedded field" style suggestion.
+        - -QF1008
+    unconvert:
+      fast-math: false
+      safe: false
+  exclusions:
+    # golangci's vetted default exclusions (std-error-handling covers the
+    # fmt.Fprintf/Close-in-defer noise) plus generated-file tolerance.
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # A test that fails mid-way may leave a dialed socket open on purpose.
+      - path: _test\.go
+        linters:
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
