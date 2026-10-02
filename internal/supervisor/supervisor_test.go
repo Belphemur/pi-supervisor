@@ -88,7 +88,10 @@ func TestRoundCapStopsJob(t *testing.T) {
 		return m.State == "fatal"
 	})
 	st, _ := s.Status("capped")
-	m := st.(job.Status)
+	m, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("status = %#v, want a job.Status", st)
+	}
 	if m.Round != 2 {
 		t.Fatalf("Round = %d, want 2 (the cap)", m.Round)
 	}
@@ -127,7 +130,11 @@ func TestMarkerGateFinishesJob(t *testing.T) {
 		return m.State == "done"
 	})
 	st, _ := s.Status("finished")
-	if got := st.(job.Status); !got.MarkerFound {
+	fin, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("status = %#v, want a job.Status", st)
+	}
+	if !fin.MarkerFound {
 		t.Fatal("MarkerFound false on a done job")
 	}
 }
@@ -160,7 +167,10 @@ func TestInstantExitStrikesAccumulate(t *testing.T) {
 		return m.State == "fatal"
 	})
 	st, _ := s.Status("striker")
-	m := st.(job.Status)
+	m, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("status = %#v, want a job.Status", st)
+	}
 	if m.InstantExits < 3 {
 		t.Fatalf("InstantExits = %d, want >= 3", m.InstantExits)
 	}
@@ -231,7 +241,10 @@ func TestStateSurvivesReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := st.(job.Status)
+	m, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("status = %#v, want a job.Status", st)
+	}
 	if m.Round != 1 {
 		t.Fatalf("Round = %d, want the persisted 1", m.Round)
 	}
@@ -295,7 +308,11 @@ func TestStopLeavesResumableState(t *testing.T) {
 	if err := s.Start("stoppable"); err != nil {
 		t.Fatalf("restart after stop rejected: %v", err)
 	}
-	s.Stop("stoppable")
+	// The second stop is idempotent: stopping an already-stopped job is
+	// accepted, not an error.
+	if err := s.Stop("stoppable"); err != nil {
+		t.Fatalf("stop of an already-stopped job rejected: %v", err)
+	}
 }
 
 // Steering appends to the ctrl file the client polls.
@@ -369,7 +386,10 @@ func TestNeverForkGuardFailsJobWithoutSession(t *testing.T) {
 		return m.State == "fatal"
 	})
 	st, _ := s.Status("forker")
-	m := st.(job.Status)
+	m, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("status = %#v, want a job.Status", st)
+	}
 	if m.Round != 1 {
 		t.Fatalf("Round = %d, want 1 — a second LAUNCH would fork the session", m.Round)
 	}

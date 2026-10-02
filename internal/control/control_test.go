@@ -84,7 +84,9 @@ func (f *watchHandler) Watch(job string) (<-chan events.Event, func(), *events.E
 	if f.pre != nil {
 		return nil, func() {}, f.pre
 	}
-	return f.events, func() { f.record("cancel:" + job) }, nil
+	// The cancel closure runs on the watcher's own goroutine, possibly after
+	// the test returned, so its bookkeeping error cannot fail the test.
+	return f.events, func() { _ = f.record("cancel:" + job) }, nil
 }
 
 func startServer(t *testing.T, h Handler) (sock string, stop chan struct{}) {
@@ -112,11 +114,15 @@ func ask(t *testing.T, sock, raw string) Response {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	// Test client socket: a close error after the assertions cannot
+	// fail the test, so it is deliberately ignored.
+	defer func() { _ = c.Close() }()
 	if _, err := c.Write([]byte(raw + "\n")); err != nil {
 		t.Fatal(err)
 	}
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	line, err := bufio.NewReader(c).ReadBytes('\n')
 	if err != nil && len(line) == 0 {
 		t.Fatalf("no response to %q: %v", raw, err)
@@ -249,12 +255,16 @@ func TestServeWatchStreamsFilteredEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	// Test client socket: a close error after the assertions cannot
+	// fail the test, so it is deliberately ignored.
+	defer func() { _ = c.Close() }()
 	if _, err := c.Write([]byte(`{"cmd":"watch","job":"a"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
 	r := bufio.NewReader(c)
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	var ack Response
 	if err := json.Unmarshal(mustLine(t, r), &ack); err != nil {
@@ -287,7 +297,9 @@ func TestServeWatchStreamsFilteredEvents(t *testing.T) {
 	if td["event"] != "done" {
 		t.Fatalf("terminal event = %+v, want done", td)
 	}
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	if line, err := r.ReadBytes('\n'); err == nil {
 		t.Fatalf("server kept streaming after a terminal event: %q", string(line))
 	}
@@ -303,12 +315,16 @@ func TestServeWatchAllJobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	// Test client socket: a close error after the assertions cannot
+	// fail the test, so it is deliberately ignored.
+	defer func() { _ = c.Close() }()
 	if _, err := c.Write([]byte(`{"cmd":"watch"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
 	r := bufio.NewReader(c)
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	var ack Response
 	if err := json.Unmarshal(mustLine(t, r), &ack); err != nil {
 		t.Fatal(err)
@@ -340,11 +356,15 @@ func TestServeWatchPrecheckAnswersImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	// Test client socket: a close error after the assertions cannot
+	// fail the test, so it is deliberately ignored.
+	defer func() { _ = c.Close() }()
 	if _, err := c.Write([]byte(`{"cmd":"watch","job":"a"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	r := bufio.NewReader(c)
 	var resp Response
 	if err := json.Unmarshal(mustLine(t, r), &resp); err != nil {
@@ -374,7 +394,9 @@ func TestServeWatchCancelsOnDisconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := bufio.NewReader(c)
-	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	_ = mustLine(t, r) // ack
 	_ = c.Close()
 
@@ -391,7 +413,7 @@ func TestServeWatchCancelsOnDisconnect(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("subscription never cancelled: calls %v", h.seen())
+	t.Fatalf("subscription never canceled: calls %v", h.seen())
 }
 
 // Closing stop tears the listener down and Serve returns.

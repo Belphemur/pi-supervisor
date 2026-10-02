@@ -133,7 +133,8 @@ func TestControlFileSteeringIsForwarded(t *testing.T) {
 	if _, err := f.WriteString(`{"type":"prompt","message":"TEST_STREAM"}` + "\n"); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	// The reader may already be past this frame; close is best-effort here.
+	_ = f.Close()
 
 	select {
 	case res := <-done:

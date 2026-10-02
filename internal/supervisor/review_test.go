@@ -71,7 +71,8 @@ func TestStartRefusesFinishedJob(t *testing.T) {
 	}
 	waitFor(t, 60*time.Second, func() bool {
 		st, _ := s.Status("finished")
-		return st.(job.Status).State == "done"
+		s, ok := st.(job.Status)
+		return ok && s.State == "done"
 	})
 	if err := s.Start("finished"); err == nil || !strings.Contains(err.Error(), "already done") {
 		t.Fatalf("Start after done = %v, want a refusal", err)
@@ -106,10 +107,15 @@ func TestEmptyMarkerCannotFinishJob(t *testing.T) {
 	}
 	waitFor(t, 60*time.Second, func() bool {
 		st, _ := s.Status("nomarker")
-		return st.(job.Status).State == "fatal" // round cap, not done
+		s, ok := st.(job.Status)
+		return ok && s.State == "fatal" // round cap, not done
 	})
 	st, _ := s.Status("nomarker")
-	if got := st.(job.Status).State; got != "fatal" {
+	sj, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("status = %#v, want a job.Status", st)
+	}
+	if got := sj.State; got != "fatal" {
 		t.Fatalf("state = %q, want fatal (an empty marker must not finish a run)", got)
 	}
 }
@@ -147,7 +153,8 @@ func TestStopTwiceIsSafe(t *testing.T) {
 	}
 	waitFor(t, 30*time.Second, func() bool {
 		st, _ := s.Status("stoppable")
-		return st.(job.Status).State == "stopped"
+		s, ok := st.(job.Status)
+		return ok && s.State == "stopped"
 	})
 	if s.RunningCount() != 0 {
 		t.Fatal("RunningCount must drop to 0 after a stop")
@@ -246,8 +253,9 @@ func TestReloadDropsAndSkipsJobs(t *testing.T) {
 	writeJob(t, job.Job{Name: "keep", Brief: "/tmp/x", Worktree: t.TempDir(), MaxRounds: 1})
 	writeJob(t, job.Job{Name: "gone", Brief: "/tmp/x", Worktree: t.TempDir(), MaxRounds: 1})
 	s := newTestSupervisor(t)
-	if len(s.StatusAll().([]job.Status)) != 2 {
-		t.Fatal("expected two jobs")
+	first, ok := s.StatusAll().([]job.Status)
+	if !ok || len(first) != 2 {
+		t.Fatalf("expected two jobs, got %#v", first)
 	}
 	if err := os.Remove(filepath.Join(job.JobsDir(), "gone.json")); err != nil {
 		t.Fatal(err)
@@ -258,7 +266,10 @@ func TestReloadDropsAndSkipsJobs(t *testing.T) {
 	if err := s.Reload(); err != nil {
 		t.Fatalf("a corrupt job file must not fail the reload: %v", err)
 	}
-	all := s.StatusAll().([]job.Status)
+	all, ok := s.StatusAll().([]job.Status)
+	if !ok {
+		t.Fatalf("StatusAll = %#v, want []job.Status", s.StatusAll())
+	}
 	if len(all) != 1 || all[0].Name != "keep" {
 		t.Fatalf("after reload = %#v, want only keep", all)
 	}
@@ -272,8 +283,12 @@ func TestReloadDropsAndSkipsJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := fresh.Status("keep")
-	if got := st.(job.Status); got.State != "stopped" || got.Round != 2 {
-		t.Fatalf("adopted state = %+v, want stopped at round 2", got)
+	adopted, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("adopted status = %#v, want a job.Status", st)
+	}
+	if adopted.State != "stopped" || adopted.Round != 2 {
+		t.Fatalf("adopted state = %+v, want stopped at round 2", adopted)
 	}
 	// A reload of an EXISTING runner keeps the live state: reload is for
 	// config, not for re-reading runtime state (a round in flight must not
@@ -285,8 +300,12 @@ func TestReloadDropsAndSkipsJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ = s.Status("keep")
-	if got := st.(job.Status); got.Round != 0 {
-		t.Fatalf("reload re-read runtime state: round = %d, want the live 0", got.Round)
+	live, ok := st.(job.Status)
+	if !ok {
+		t.Fatalf("live status = %#v, want a job.Status", st)
+	}
+	if live.Round != 0 {
+		t.Fatalf("reload re-read runtime state: round = %d, want the live 0", live.Round)
 	}
 }
 

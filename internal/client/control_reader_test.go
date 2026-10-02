@@ -25,7 +25,8 @@ func appendTo(t *testing.T, path, s string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	// Test fixture: the frame is read back, so a close error is irrelevant.
+	defer func() { _ = f.Close() }()
 	if _, err := f.WriteString(s); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +36,6 @@ func appendTo(t *testing.T, path, s string) {
 type sent struct {
 	mu sync.Mutex
 	f  []map[string]any
-	d  strings.Builder
 }
 
 func (s *sent) send(v any) error {

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -40,7 +41,7 @@ func cli(t *testing.T) string {
 		cmd := exec.Command("go", "build", "-cover", "-coverpkg=pi-supervisor/...", "-o", binPath, ".")
 		cmd.Env = append(os.Environ(), "GOTOOLCHAIN=auto")
 		if out, err := cmd.CombinedOutput(); err != nil {
-			buildErr = fmt.Errorf("go build: %v\n%s", err, out)
+			buildErr = fmt.Errorf("go build: %w\n%s", err, out)
 		}
 	})
 	if buildErr != nil {
@@ -63,7 +64,8 @@ func runCLI(t *testing.T, sock string, args ...string) runResult {
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
 	code := 0
-	if ee, ok := err.(*exec.ExitError); ok {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
 		code = ee.ExitCode()
 	} else if err != nil {
 		t.Fatalf("run %v: %v", args, err)
@@ -111,7 +113,7 @@ func respJSON(t *testing.T, v map[string]any) string {
 	return string(b)
 }
 
-// socketPath honours PI_SUPERVISOR_SOCK, then XDG_RUNTIME_DIR, then /tmp.
+// socketPath honors PI_SUPERVISOR_SOCK, then XDG_RUNTIME_DIR, then /tmp.
 func TestSocketPathPrecedence(t *testing.T) {
 	t.Setenv("PI_SUPERVISOR_SOCK", "/tmp/explicit.sock")
 	if got := socketPath(); got != "/tmp/explicit.sock" {
