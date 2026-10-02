@@ -43,7 +43,8 @@ pi-supervisor start <name>       # round 1 LAUNCHes, later rounds RESUME
 
 # Operate
 pi-supervisor status             # all jobs: state, round, session size/age
-pi-supervisor status <name>      # one job
+pi-supervisor status <name>      # one job; ends with `pr <url>` when the
+                                 # transcript linked a GitHub PR (ADR-0006)
 pi-supervisor logs <name> 50     # tail the run log (one line per log line)
 pi-supervisor steer <name> 'POLICY CHANGE FROM THE OWNER ...'
 pi-supervisor steer <name> -n '...'  # don't wait for pi's ack
@@ -126,6 +127,13 @@ Behavior:
   the session JSONL and at `ci_stall_cap` parks interrupts the session with a
   finish-the-report prompt and closes the run as a review-loop failure), and
   the terminals `done` / `fatal` / `stopped`.
+- **The pull request is in the payload.** The daemon scrapes
+  `https://github.com/<owner>/<repo>/pull/<number>` out of the round's
+  transcript as it tails it (ADR-0006): every event carries `pr_url`, the
+  `round_done` output tail gains ` | pr <url>`, and the exit message prints
+  `pull request: <url>`. It is a best-effort scrape, so `pr_url` is absent
+  when the agent opened a PR without linking it — "" means "not linked", not
+  "no PR".
 - **Finished run ⇒ immediate return.** If the job is already done/fatal/stopped
   when you arm, the watch does NOT block — it prints
   `THE RUN IS OVER — <job> <event>`, points at `status`, and says not to re-arm.

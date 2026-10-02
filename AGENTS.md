@@ -16,7 +16,7 @@ Unix socket.
 | `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering (with per-frame acks), abort-drain handshake, timeout/abort/reap escalation. No Python. |
 | `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard, `Steer` (frame + ack wait, ADR-0005) |
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
-| `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap |
+| `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap. Same tail scrapes the round's GitHub PR URL (ADR-0006) |
 | `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
 | `install/install.sh` | Build + systemd unit + Hermes skill symlink + verification |
 | `install/pi-supervisor.service` | `Type=notify` user unit (`WatchdogSec=120`) |
@@ -62,6 +62,13 @@ Unix socket.
    a non-zero exit, never a quiet exit 0. The ctrl file is truncated at every
    round start **and the reader starts at offset 0** — those two are one
    mechanism; don't "fix" one without the other.
+9. **`pr_url` is a best-effort transcript scrape (ADR-0006).** No GitHub auth,
+   no `gh`, no network: the PR URL comes from the session JSONL the daemon
+   already tails for CI stalls (`stall.prRe`, digits required so a truncated
+   `…/pull/` never matches). It is stored on `job.State` and surfaced on every
+   event, so `status <job>` ends with `pr <url>` and `watch` prints it. "" means
+   "the agent never linked a PR", never "no PR exists" — don't make it an error
+   path, and don't add a second tailer for it.
 
 ## Build / test / install
 
