@@ -76,7 +76,10 @@ func Serve(sockPath string, h Handler, stop chan struct{}) {
 			}
 		}
 		go func(c net.Conn) {
-			defer c.Close()
+			// One-shot request/response or watch stream: once the handler
+			// returns the connection is finished, so a close error (peer
+			// already gone) carries no information.
+			defer func() { _ = c.Close() }()
 			line, err := bufio.NewReader(c).ReadBytes('\n')
 			if err != nil && len(line) == 0 {
 				return

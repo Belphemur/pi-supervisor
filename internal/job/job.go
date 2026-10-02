@@ -145,14 +145,14 @@ func writeAtomic(path string, data []byte) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename succeeded
+	// No-op once the rename succeeded; on the error paths below the caller
+	// gets the real failure, so the cleanup result is irrelevant.
+	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
 	if err := tmp.Close(); err != nil {
 		return err
@@ -224,7 +224,7 @@ func TailLines(path string, n, maxChars int) []string {
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read-only handle; close cannot lose data
 	fi, err := f.Stat()
 	if err != nil || fi.Size() == 0 {
 		return nil

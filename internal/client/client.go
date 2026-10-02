@@ -129,8 +129,11 @@ func Run(o Options) Result {
 	// concurrent Flush + WriteString.
 	out := bufio.NewWriterSize(o.Out, 32*1024)
 	st := &stream{
-		out:   out,
-		diagf: func(f string, a ...any) { fmt.Fprintf(o.Diag, f+"\n", a...) },
+		out: out,
+		// Diagnostics are best-effort by construction: the diag sink IS the
+		// error channel, so there is nowhere to report a failure to write to
+		// it. The round's real result travels in res (RC/Text/Duration).
+		diagf: func(f string, a ...any) { _, _ = fmt.Fprintf(o.Diag, f+"\n", a...) },
 	}
 	flusherDone := make(chan struct{})
 	go func() {
@@ -176,7 +179,6 @@ func Run(o Options) Result {
 
 	ctl := newControlReader(o.ControlPath, st.diagf)
 	deadline := time.Now().Add(o.Timeout)
-	waited := false
 
 	for {
 		select {
@@ -204,11 +206,10 @@ func Run(o Options) Result {
 			ctl.pump(send, st, o.Diag)
 
 		case <-time.After(time.Until(deadline)):
-			if waited {
-				// Grace already spent; nothing more to try.
-				continue
-			}
-			waited = true
+			// One-shot escalation (ADR-0002): abort, then hold the drain
+			// window for the aborted turn's agent_end, then reap and fail.
+			// There is no second attempt — the deadline has been reached, so
+			// re-arming it would only extend an already-expired round.
 			st.diagf("timeout at %ds — sending abort", int(time.Since(start).Seconds()))
 			_ = send(map[string]any{"type": "abort"})
 			// The aborted turn may still emit agent_end; wait for the drain
@@ -322,7 +323,10 @@ func (s *stream) read(r io.Reader) {
 				s.mu.Lock()
 				s.buf.WriteString(e.AssistantMessageEvent.Delta)
 				if s.out != nil {
-					s.out.WriteString(e.AssistantMessageEvent.Delta)
+					// Run-log mirroring is best-effort: the authoritative
+					// text is s.buf (returned as Result.Text), so a failed
+					// mirror cannot change the round's classification.
+					_, _ = s.out.WriteString(e.AssistantMessageEvent.Delta)
 				}
 				s.mu.Unlock()
 			}
@@ -482,13 +486,13 @@ func (c *controlReader) pump(send func(any) error, st *stream, diagOut io.Writer
 			}
 			var frame map[string]any
 			if jerr := json.Unmarshal([]byte(ln), &frame); jerr != nil {
-				fmt.Fprintf(diagOut, "[control] bad frame skipped: %v\n", jerr)
+				_, _ = fmt.Fprintf(diagOut, "[control] bad frame skipped: %v\n", jerr)
 				continue
 			}
 			_, held := st.forwardable(frameType(frame))
 			if held {
 				st.hold(frame)
-				fmt.Fprintf(diagOut, "[control] held until abort settles: %s\n", frameType(frame))
+				_, _ = fmt.Fprintf(diagOut, "[control] held until abort settles: %s\n", frameType(frame))
 				continue
 			}
 			if err := send(frame); err != nil {
