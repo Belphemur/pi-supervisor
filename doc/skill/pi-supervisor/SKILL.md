@@ -327,3 +327,18 @@ actually emits, not what the fixtures assume it emits):
   writes **no** frame rather than degrading to a queued steer.
 - Session JSONL is the memory: never delete it to "reset"; clear the job
   state instead.
+
+### 7. Review campaigns (ADR-0012)
+
+A review campaign is a job whose fix-rounds the daemon orchestrates rather
+than the agent: the daemon owns the outer loop (poll GitHub -> decide ->
+enforce budget), pi runs each round, and the two are joined by the completion
+gate from §3 — a round ends at its marker, and the gate's `pr_url` is what
+arms the next review phase.
+
+- **Surface.** `pi-supervisor review <job> --pr <N> [--rounds N] [--skill PATH]`. `--pr` starts a manual campaign; `--auto` writes an `auto_review` stanza so the completion gate arms one when the linked PR is open (see below). `--rounds` is the campaign's `MaxRounds`, **default 2** (reply round + verification round) — not a heuristic, an operator count. `--skill` defaults to `answer-code-review`, so triage rules are unchanged; the brief additionally loads the `pi_supervisor_review` skill so the round knows to route every GitHub action through the `_pi-supervisor-review` shim at `$PI_SUPERVISOR_SOCKET` — never `gh` or `reply_review.py` from the shell.
+- **Two control planes, cleanly split.** Daemon = poll `gh` read-only -> decide "one more pi round?" -> enforce `MaxRounds`. Pi = one round's fix + triage. The daemon never authors replies or decides to resolve; it only serves reads and records writes the shim asks for. The shim is **not** an MCP plugin process — it is a CLI (`/home/balor/.local/bin/_pi-supervisor-review`) that speaks the daemon's JSON control protocol directly over the unix socket. New endpoint, additive: `POST /review/action` with `list_threads` | `post_reply` | `resolve_thread`.
+- **Auth.** Reuse the token in `~/.config/gh/hosts.yml` (confirmed `repo` + `workflow` scopes); the daemon execs `gh api` for both reads and writes. No `go-github` dependency, no second credential. The daemon refuses a `/review/action` call when no `review <job>` round is live — the shim is only valid inside the round it was armed for.
+- **Auto-trigger on marker + open PR.** When a marked round links an OPEN PR (`pr_url` from §4 scrape) and the job def carries `auto_review`: (1) post the configured trigger comment (default `@coderabbitai review`), (2) wait the warmup (`review.coderabbit_warmup`, default 5m — a fresh PR has zero threads until CodeRabbit finishes its pass), (3) re-check: > 0 threads -> arm `review <job> --pr <N>`; 0 threads -> emit `review_skipped`. `--rounds 0` means auto-derive at arm time (`ceil(open / per_round)`, `per_round` default 12), capped — a convenience for large PRs, not a bot deciding scope.
+- **`watch` is the review dashboard.** Arm it after `start`; each `round_done` carries open-thread count + `head_sha` + the remaining-thread list (threads whose latest reply is not by this job's `gh` user). Do not hand off the repo after a single review round — the next round is a fresh `watch` re-arm, same as every other job.
+- **Pre-merge is a gate, never an action.** The campaign gates *on* `pre-merge --pr <N>`; it never merges. The owner merges once the last review round lands and threads read zero — same contract as §3's "final report + marker => done".
