@@ -65,8 +65,13 @@ func tailStr(s string, n int) string {
 //     retry, this fails — the bug needed 14)
 func TestLiveRealPiDetectsMarker(t *testing.T) {
 	piBin := liveSkip(t)
-	testEnv(t)
-
+	// DELIBERATELY no testEnv(): this test drives a REAL pi, which needs the
+	// REAL HOME (model credentials, pi config, provider setup). testEnv()
+	// points HOME at a temp dir, which makes pi exit immediately with no
+	// transcript — a test-harness artifact that looks exactly like the bug.
+	//
+	// Isolation instead comes from a private Worktree and a namespaced Job
+	// name, so nothing here can collide with a live campaign job.
 	brief := liveBrief()
 	if _, err := os.Stat(brief); err != nil {
 		t.Skipf("live brief missing (%s): %v", brief, err)
@@ -78,43 +83,47 @@ func TestLiveRealPiDetectsMarker(t *testing.T) {
 	}
 
 	j := job.Job{
-		Name: "adr0011-live", Brief: brief, Cont: brief,
+		Name: "adr0011-live-verify", Brief: brief, Cont: brief,
 		FinalReport: report, Marker: liveMarker,
 		Worktree: wt, SessionName: "adr0011-live",
 		MaxRounds: 1, TimeoutS: 180, PiBin: piBin, BackoffScale: 0.02,
 	}
-	// Resume-shaped so the watcher has a path from the start; the LAUNCH path
-	// resolves the transcript lazily and is covered by the unit tests.
-	seed := filepath.Join(wt, "seed.jsonl")
-	if err := os.WriteFile(seed, []byte(`{"type":"session","id":"seed"}`+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	j.SessionPath = seed
+	// A true LAUNCH (SessionPath empty): pi creates its own session in the
+	// worktree's munged dir, which is what FindSession resolves. Seeding a
+	// bogus resume path instead would make pi write somewhere the supervisor
+	// cannot discover — a flaw in the test, not the fix.
 	writeJob(t, j)
 
 	s := newTestSupervisor(t)
-	if err := s.Start("adr0011-live"); err != nil {
+	if err := s.Start("adr0011-live-verify"); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Stop("adr0011-live") })
-
-	// Wait for pi to write a real transcript.
-	real := job.FindSession(j.SessionName, wt)
-	waitFor(t, 90*time.Second, func() bool {
-		real = job.FindSession(j.SessionName, wt)
-		return real != "" && job.Size(real) > 100
+	t.Cleanup(func() {
+		_ = s.Stop("adr0011-live-verify")
+		// Leave no trace in the real ~/.pi/supervisor tree: this job only
+		// exists to validate the detector.
+		_ = os.Remove(filepath.Join(job.JobsDir(), "adr0011-live-verify.json"))
+		_ = os.Remove(filepath.Join(job.StateDir(), "adr0011-live-verify.json"))
 	})
-	if real == "" || job.Size(real) <= 100 {
-		t.Fatalf("pi wrote no usable transcript — the live run did not happen (found %q)", real)
+
+	// Wait for pi to write a real transcript. Resolve via the job's worktree
+	// so we read the session pi actually created for THIS worktree.
+	liveSess := ""
+	waitFor(t, 120*time.Second, func() bool {
+		liveSess = job.FindSession(j.SessionName, wt)
+		return liveSess != "" && job.Size(liveSess) > 200
+	})
+	if liveSess == "" || job.Size(liveSess) <= 100 {
+		t.Fatalf("pi wrote no usable transcript — the live run did not happen (found %q)", liveSess)
 	}
-	t.Logf("real transcript: %s (%d bytes)", real, job.Size(real))
+	t.Logf("real transcript: %s (%d bytes)", liveSess, job.Size(liveSess))
 
 	// The production predicate must find the marker in what pi really wrote.
 	waitFor(t, 150*time.Second, func() bool {
-		return job.TranscriptContains(real, liveMarker)
+		return job.TranscriptContains(liveSess, liveMarker)
 	})
-	if !job.TranscriptContains(real, liveMarker) {
-		body, _ := os.ReadFile(real)
+	if !job.TranscriptContains(liveSess, liveMarker) {
+		body, _ := os.ReadFile(liveSess)
 		t.Fatalf("marker %q absent from a REAL pi transcript.\ntail:\n%s",
 			liveMarker, tailStr(string(body), 3000))
 	}
@@ -122,11 +131,11 @@ func TestLiveRealPiDetectsMarker(t *testing.T) {
 
 	// And the job must reach done on this round.
 	waitFor(t, 120*time.Second, func() bool {
-		st, _ := s.Status("adr0011-live")
+		st, _ := s.Status("adr0011-live-verify")
 		m, ok := st.(job.Status)
 		return ok && m.State == "done"
 	})
-	st, _ := s.Status("adr0011-live")
+	st, _ := s.Status("adr0011-live-verify")
 	fin, ok := st.(job.Status)
 	if !ok {
 		t.Fatalf("status = %#v, want job.Status", st)
