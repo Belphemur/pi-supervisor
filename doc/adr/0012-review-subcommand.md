@@ -87,6 +87,33 @@ Mutations are `gh api` writes; reads are `gh api` reads. All reuse the single
 `gh` token from `~/.config/gh/hosts.yml` (confirmed: `repo` + `workflow`
 scopes).
 
+The shim is MCP-**less**: it speaks the daemon's JSON control protocol over
+the unix socket and the daemon does the GH calls. The daemon's GH auth is an
+internal detail that never reaches pi or the system prompt.
+
+### 6. Auth posture
+
+The daemon authenticates to GitHub in one of two ways, chosen per `Start`,
+in priority order:
+
+1. **GitHub App (preferred).** If `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`
+   are set, the daemon signs a JWT (std-lib `crypto/ecdsa` or the 60-LOC
+   `/golang-jwt`; no app-specific SDK), exchanges it for an
+   installation token per request (1-hour TTL, rotated by the daemon), and
+   uses that token for all `gh api` calls. The App is installed on the repos
+   the daemon may review; the token is ephemeral, so it never rests on disk.
+2. **`gh` token fallback.** If the App env is absent, the daemon runs
+   `gh auth status` at `Start`; if authenticated, it execs
+   `gh api ... --hostname github.com` (which inherits `$GH_TOKEN` / the
+   cached host token) for every GH call. Unauthenticated → `Start`
+   refuses (exit 1) with `GitHub auth unavailable: run 'gh auth login'`
+   or set `GITHUB_APP_ID`.
+
+No PAT is ever read from config. A `GITHUB_TOKEN` env, if set by the shell,
+is used by `gh` under the fallback path — the daemon does not parse it
+directly, so there is no token-parsing code in the daemon and no second
+auth code path to keep in sync.
+
 The daemon does **not** re-implement the inline-answer-before-resolve rule from
 the `answer-code-review` skill, nor its REST-reply-then-GraphQL-resolve path —
 those live in the skill/`_pi-supervisor-review` shim, which is a thin adapter
@@ -187,6 +214,10 @@ never executes it — confirming that matches your mental model.
   unchanged.
 - The auto-trigger makes finishing a job and PR-ing it the natural handoff
   into review, with no operator command in between.
+- **Auth prereq.** The preferred path requires a GitHub App installed on the
+  reviewed repos (created once, `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`
+  passed at `Start`). The `gh` fallback needs no setup, so local review jobs
+  work with zero config once `gh auth login` is active.
 
 ## Non-goals
 
