@@ -28,9 +28,25 @@ type Handler interface {
 	Status(job string) (any, error)
 	Start(name string) error
 	Stop(name string) error
-	Steer(name, text string, noWait bool) (job.SteerReport, error)
+	Steer(name, text string, noWait, interrupt bool) (job.SteerReport, error)
 	Logs(name string, n int) ([]string, error)
 	Reload() error
+}
+
+// interruptPID SIGINTs pi's process group so an in-flight turn is asked to
+// stop and the steer frame becomes the next thing pi works on (ADR-0007).
+//
+// SIGINT targets `-pid` (the whole group), never the pi pid alone: the client
+// spawns pi with Setpgid, and signaling the group reaches pi plus anything it
+// spawned. It is deliberately SIGINT (not SIGTERM) so pi can abort the current
+// generation and stay available for the steer, and it reports whether the
+// signal was SENT — whether pi actually stops is pi's call, which is why the
+// steer report marks it as requested, not obeyed.
+func interruptPID(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("no pi pid to interrupt")
+	}
+	return syscall.Kill(-pid, syscall.SIGINT)
 }
 
 // controlPollInterval is how often the client polls the ctrl file. Tests
@@ -263,7 +279,7 @@ func (s *Supervisor) Stop(name string) error {
 // frame is passed through unchanged. The write is only a request: the real
 // outcome comes from the client's ack record for this frame id, and the wait
 // for it holds no supervisor lock so the round loop keeps running.
-func (s *Supervisor) Steer(name, text string, noWait bool) (job.SteerReport, error) {
+func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.SteerReport, error) {
 	s.mu.Lock()
 	r, ok := s.jobs[name]
 	s.mu.Unlock()
@@ -304,6 +320,35 @@ func (s *Supervisor) Steer(name, text string, noWait bool) (job.SteerReport, err
 	// Remember where the ack log ends so only records the client writes for
 	// THIS frame are considered (a restart reuses the same file).
 	off := job.Size(rep.AckPath)
+
+	// Interrupt mode: ask pi to stop its current turn BEFORE the frame lands,
+	// so the steer is what it picks up next (ADR-0007). Signaling first is
+	// what makes it an interrupt rather than a queued message — a steer that
+	// only queues would be answered after the turn already in flight.
+	//
+	// A failed signal is a failure, not a warning: the operator asked for the
+	// running turn to be dropped, and silently degrading to a plain queued
+	// steer would be exactly the "looks like it worked, wasn't" outcome ADR-0005
+	// exists to prevent. The frame is NOT written in that case — no point
+	// queueing a steer the operator would read as an interrupt.
+	if interrupt {
+		r.mu.Lock()
+		pid := r.pid
+		r.mu.Unlock()
+		if err := interruptPID(pid); err != nil {
+			rep.Outcome = job.AckSendFail
+			rep.Detail = fmt.Sprintf("interrupt requested but cannot SIGINT pi group (-%d): %v; frame not written", pid, err)
+			return rep, fmt.Errorf("%s", rep.Detail)
+		}
+		rep.Interrupted = true
+		s.logf(name, "steer --interrupt: SIGINT to pi group -%d (round %d)", pid, rep.Round)
+		// No sleep here on purpose: the client owns the abort-drain handshake.
+		// A frame that lands mid-abort is held by that handshake and forwarded
+		// when the aborted turn ends, which the report surfaces as
+		// held-then-forwarded. Sleeping would only delay the delivery the
+		// client is already scheduling correctly.
+	}
+
 	if err := appendCtrl(rep.CtrlPath, frame); err != nil {
 		rep.Outcome = job.AckSendFail
 		rep.Detail = fmt.Sprintf("cannot write %s: %v", rep.CtrlPath, err)

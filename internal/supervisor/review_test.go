@@ -31,7 +31,7 @@ func TestControlSurfaceGuards(t *testing.T) {
 	if err := s.Stop("nope"); err == nil {
 		t.Fatal("Stop of an unknown job must error")
 	}
-	if _, err := s.Steer("nope", "x", false); err == nil {
+	if _, err := s.Steer("nope", "x", false, false); err == nil {
 		t.Fatal("Steer of an unknown job must error")
 	}
 	if all, ok := s.StatusAll().([]job.Status); !ok || len(all) != 1 || all[0].Name != "g" {

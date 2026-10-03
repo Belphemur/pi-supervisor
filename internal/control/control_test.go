@@ -63,11 +63,11 @@ func (f *fakeHandler) StatusAll() any {
 
 func (f *fakeHandler) Start(name string) error { return f.record("start:" + name) }
 func (f *fakeHandler) Stop(name string) error  { return f.record("stop:" + name) }
-func (f *fakeHandler) Steer(name, text string, noWait bool) (job.SteerReport, error) {
-	if err := f.record(fmt.Sprintf("steer:%s:%s:%t", name, text, noWait)); err != nil {
+func (f *fakeHandler) Steer(name, text string, noWait, interrupt bool) (job.SteerReport, error) {
+	if err := f.record(fmt.Sprintf("steer:%s:%s:%t:%t", name, text, noWait, interrupt)); err != nil {
 		return job.SteerReport{Job: name}, err
 	}
-	return job.SteerReport{Job: name, FrameID: "steer-1", Outcome: job.AckForwarded, Confirmed: true}, nil
+	return job.SteerReport{Job: name, FrameID: "steer-1", Outcome: job.AckForwarded, Confirmed: true, Interrupted: interrupt}, nil
 }
 
 func (f *fakeHandler) Logs(name string, n int) ([]string, error) {
@@ -155,7 +155,7 @@ func TestSteerAlwaysReturnsItsReport(t *testing.T) {
 		t.Fatalf("steer data = %#v", resp.Data)
 	}
 
-	h.failOn["steer:b:go:false"] = errors.New("boom")
+	h.failOn["steer:b:go:false:false"] = errors.New("boom")
 	resp = ask(t, sock, `{"cmd":"steer","job":"b","text":"go"}`)
 	if resp.OK || resp.Error != "boom" {
 		t.Fatalf("failing steer = %+v", resp)
@@ -205,7 +205,7 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 	// The handler actually saw each routed call. The three malformed/unknown
 	// requests are rejected by dispatch itself and never reach the handler.
 	want := []string{
-		"statusall", "status:a", "start:a", "stop:a", "steer:a:go left:false",
+		"statusall", "status:a", "start:a", "stop:a", "steer:a:go left:false:false",
 		"logs:a:2", "logs:a:0", "reload",
 	}
 	got := h.seen()
@@ -219,6 +219,38 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 	}
 }
 
+// The steer interrupt flag crosses the wire: request.interrupt becomes the
+// handler's 4th argument, and the report echoes it back (ADR-0007).
+func TestSteerInterruptReachesHandler(t *testing.T) {
+	h := newFakeHandler()
+	sock, stop := startServer(t, h)
+	defer close(stop)
+
+	resp := ask(t, sock, `{"cmd":"steer","job":"a","text":"stop","interrupt":true}`)
+	if !resp.OK {
+		t.Fatalf("steer interrupt = %+v", resp)
+	}
+	if got := h.seen(); len(got) != 1 || got[0] != "steer:a:stop:false:true" {
+		t.Fatalf("handler saw %v, want [steer:a:stop:false:true]", got)
+	}
+	data, _ := resp.Data.(map[string]any)
+	if iv, _ := data["interrupted"].(bool); !iv {
+		t.Fatalf("report.interrupted = %v, want true (report %v)", data["interrupted"], data)
+	}
+}
+
+// A steer without the flag leaves interrupt false and never signals.
+func TestSteerWithoutInterruptFlagStaysFalse(t *testing.T) {
+	h := newFakeHandler()
+	sock, stop := startServer(t, h)
+	defer close(stop)
+
+	ask(t, sock, `{"cmd":"steer","job":"a","text":"note"}`)
+	if got := h.seen(); len(got) != 1 || got[0] != "steer:a:note:false:false" {
+		t.Fatalf("handler saw %v, want [steer:a:note:false:false]", got)
+	}
+}
+
 // A handler error is surfaced as ok:false with the message, not a dropped
 // connection.
 func TestDispatchPropagatesHandlerErrors(t *testing.T) {
@@ -227,7 +259,7 @@ func TestDispatchPropagatesHandlerErrors(t *testing.T) {
 	h.failOn["start:a"] = boom
 	h.failOn["status:a"] = boom
 	h.failOn["stop:a"] = boom
-	h.failOn["steer:a:x:false"] = boom
+	h.failOn["steer:a:x:false:false"] = boom
 	h.failOn["logs:a:3"] = boom
 	h.failOn["reload"] = boom
 	sock, stop := startServer(t, h)

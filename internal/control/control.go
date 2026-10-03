@@ -21,7 +21,7 @@ type Handler interface {
 	StatusAll() any
 	Start(name string) error
 	Stop(name string) error
-	Steer(name, text string, noWait bool) (job.SteerReport, error)
+	Steer(name, text string, noWait, interrupt bool) (job.SteerReport, error)
 	Logs(name string, n int) ([]string, error)
 	Reload() error
 }
@@ -43,6 +43,11 @@ type Request struct {
 	// NoWait asks steer to return as soon as the frame is on disk instead of
 	// waiting for the client's ack (the report still says "written").
 	NoWait bool `json:"no_wait,omitempty"`
+	// Interrupt (steer --interrupt, ADR-0007) asks the daemon to SIGINT pi's
+	// process group before writing the frame, so the current turn is asked to
+	// stop and the steer becomes the next thing pi works on. The daemon
+	// reports whether the signal was sent; whether pi obeys is pi's call.
+	Interrupt bool `json:"interrupt,omitempty"`
 }
 
 // Response is the single reply.
@@ -182,7 +187,7 @@ func dispatch(h Handler, raw []byte) Response {
 	case "steer":
 		// The report travels even on failure: "no live round" and "cannot
 		// write" are exactly the facts the operator needs to see.
-		rep, err := h.Steer(req.Job, req.Text, req.NoWait)
+		rep, err := h.Steer(req.Job, req.Text, req.NoWait, req.Interrupt)
 		if err != nil {
 			return Response{OK: false, Error: err.Error(), Data: rep}
 		}

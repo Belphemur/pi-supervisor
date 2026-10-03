@@ -110,6 +110,11 @@ type SteerReport struct {
 	AckPath     string `json:"ack_path"`
 	LiveRound   bool   `json:"live_round"`
 	ClientPID   int    `json:"client_pid,omitempty"`
+	// Interrupted is true when the steer signaled pi's process group
+	// (SIGINT) before writing the frame, so the running turn is asked to
+	// stop and pick this message up (ADR-0007). It reports the signal was
+	// sent, not that pi obeyed it.
+	Interrupted bool   `json:"interrupted"`
 	Outcome     string `json:"outcome"`
 	Detail      string `json:"detail,omitempty"`
 	DelayMS     int64  `json:"delay_ms,omitempty"`

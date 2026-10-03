@@ -10,7 +10,8 @@ Unix socket.
 
 | Path | Role |
 |---|---|
-| `cmd/pi-supervisor/main.go` | Entry: `run` (daemon) + ctl subcommands (status/start/stop/steer/logs/reload) |
+| `cmd/pi-supervisor/main.go` | Cobra entry: `run` (daemon) + ctl subcommands (status/start/stop/steer/logs/reload/watch) + `completion install` |
+| `cmd/pi-supervisor/completion.go` | Shell-completion install: detect bash/zsh/fish/powershell on PATH, generate each script, append an idempotent marker-guarded block to the rc file (ADR-0008) |
 | `internal/notify/sd.go` | Pure-Go `sd_notify`: `READY=1`, `STOPPING=1`, and `Beat()` which pairs `WATCHDOG=1` with `STATUS=<n> parallel pi session(s) running`. No cgo. |
 | `internal/job/job.go` | Job model (`~/.pi/supervisor/jobs/*.json`), state persistence, session discovery, run-log helpers, steer ack model (`job.Ack`, `job.AckRecord`, `job.SteerReport`) |
 | `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering (with per-frame acks), abort-drain handshake, timeout/abort/reap escalation. No Python. |
@@ -69,6 +70,17 @@ Unix socket.
    event, so `status <job>` ends with `pr <url>` and `watch` prints it. "" means
    "the agent never linked a PR", never "no PR exists" — don't make it an error
    path, and don't add a second tailer for it.
+10. **`steer --interrupt` is opt-in and fail-loud (ADR-0007).** `-i`/`--interrupt`
+   SIGINTs pi's process group (`-pid`) BEFORE writing the frame, so the running
+   turn is asked to stop and the steer is what pi picks up next. A failed signal
+   is an error and writes NO frame — never silently degrade to a queued steer.
+   The report marks the signal as sent (`interrupted`), never as obeyed; a plain
+   steer never signals.
+11. **Exit codes are a CLI contract (ADR-0008).** 2 = usage/validation (and
+   "no daemon on the socket"), 1 = daemon refused / bad response, 0 = success.
+   The CLI is cobra + viper; viper binds config as flag > `PI_SUPERVISOR_*` env >
+   `~/.config/pi-supervisor/config.yaml` > default. `completion install` only
+   ever APPENDS an idempotent marker-guarded block to an rc file; never clobber.
 
 ## Build / test / install
 
@@ -77,6 +89,7 @@ GOTOOLCHAIN=auto go build ./... && go vet ./...   # both must be clean
 gofmt -l .                                         # must print nothing
 GOTOOLCHAIN=auto go test ./... -race              # -race is not optional
 /home/balor/go/bin/golangci-lint run ./...        # must exit 0 (v2.14.0)
+pi-supervisor completion install               # detect+install shell completion (idempotent)
 GOTOOLCHAIN=auto go build -o pi-supervisor ./cmd/pi-supervisor
 ./install/install.sh                              # build + unit + skill symlink + enable
 systemctl --user status pi-supervisor             # active (running) = READY accepted

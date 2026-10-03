@@ -47,12 +47,19 @@ pi-supervisor status <name>      # one job; ends with `pr <url>` when the
                                  # transcript linked a GitHub PR (ADR-0006)
 pi-supervisor logs <name> 50     # tail the run log (one line per log line)
 pi-supervisor steer <name> 'POLICY CHANGE FROM THE OWNER ...'
+pi-supervisor steer <name> -i '...'  # INTERRUPT: SIGINT pi's group first, so the
+                                 # running turn is dropped and this steer is
+                                 # what pi does next (ADR-0007)
 pi-supervisor steer <name> -n '...'  # don't wait for pi's ack
 pi-supervisor stop <name>        # SIGTERM the client group; session kept
 
 # Notifications: block until the supervisor sends an event (see below)
 pi-supervisor watch <name>       # exit after the first event
 pi-supervisor watch <name> -t    # exit only when the run is over (done/fatal/stopped)
+
+# Shell completion (idempotent; detects bash/zsh/fish/powershell on PATH)
+pi-supervisor completion install
+pi-supervisor --help              # cobra: per-command help for every subcommand
 ```
 
 ## Architecture
@@ -171,6 +178,7 @@ Behavior:
 | `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
 | ctl: "daemon not reachable" | `systemctl --user status pi-supervisor`; journal for socket errors |
 | `systemctl status` count is stale | the beat only rewrites STATUS when the count changes; a count that never moves means no round is ending |
+| `steer -i` says `interrupt requested but cannot SIGINT` | the pi group was already gone (round ended between your `status` and the steer). Nothing was written — check `status`, then re-send; if the round is genuinely running this is a real failure, not a silent no-op |
 | `steer` says `no live round` / `not confirmed` | no round was polling the ctrl file, or pi never acked within the bounded wait (~20s) — the frame was NOT delivered; check `status` and the run log, then re-send |
 | rc=2 in the log | pi's stdout closed with no agent_end (crash mid-turn) — treated as a failure, not a clean cap |
 | `status` shows no `pr <url>` but a PR is open on GitHub | the daemon scrapes the PR URL from the round's transcript as it tails it (ADR-0006); it only sees URLs the agent *linked* in its messages. A PR opened without the agent writing the `pull/<number>` link — e.g. a toolResult that truncated the URL, or a PR filed by CI/a hook — is not surfaced. An empty field means "not linked in the transcript", not "no PR exists"; link the PR in your next round to have it appear. |
@@ -186,5 +194,11 @@ Behavior:
   with no live round reports `no live round` — the ctrl file is truncated at
   every round start, so a queued frame would be wiped unread. Wait for
   `status` to show a round, then re-send.
+- **`-i` interrupts; a plain steer queues.** `steer -i` SIGINTs pi's process
+  group first (ADR-0007) so the current turn is dropped and the steer is what
+  pi does next; the report line `interrupted` means the signal was *sent*, not
+  that pi obeyed it. A plain steer never signals — it queues behind the turn
+  already in flight. If the SIGINT cannot be delivered, `-i` fails loudly and
+  writes **no** frame rather than degrading to a queued steer.
 - Session JSONL is the memory: never delete it to "reset"; clear the job
   state instead.

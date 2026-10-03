@@ -147,7 +147,7 @@ func TestSteerProseReachesPiStdin(t *testing.T) {
 		return m.ClientPID != 0
 	})
 
-	rep, err := s.Steer("prose", "TEST_FRAMELOG POLICY CHANGE FROM THE OWNER: stop the review loop", false)
+	rep, err := s.Steer("prose", "TEST_FRAMELOG POLICY CHANGE FROM THE OWNER: stop the review loop", false, false)
 	if err != nil {
 		t.Fatalf("Steer: %v (report %+v)", err, rep)
 	}
@@ -207,7 +207,7 @@ func TestSteerNoLiveRoundIsNotQueued(t *testing.T) {
 	})
 	s := newTestSupervisor(t)
 
-	rep, err := s.Steer("idle", "POLICY CHANGE", false)
+	rep, err := s.Steer("idle", "POLICY CHANGE", false, false)
 	if err == nil {
 		t.Fatalf("Steer on an idle job must fail, got %+v", rep)
 	}
@@ -233,7 +233,7 @@ func TestSteerPassesThroughJSONFrame(t *testing.T) {
 	s := newTestSupervisor(t)
 	armFakeRound(t, s, "pass", 4242)
 
-	rep, err := s.Steer("pass", `{"id":"my-own-id","type":"abort"}`, true)
+	rep, err := s.Steer("pass", `{"id":"my-own-id","type":"abort"}`, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ func TestSteerPassesThroughJSONFrame(t *testing.T) {
 	}
 
 	// A JSON object that is not a frame (no type) is prose, not garbage.
-	rep, err = s.Steer("pass", `{"just":"data"}`, true)
+	rep, err = s.Steer("pass", `{"just":"data"}`, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestSteerReportsHeldThenDelivered(t *testing.T) {
 		}
 	}()
 
-	rep, err := s.Steer(name, "POLICY CHANGE", false)
+	rep, err := s.Steer(name, "POLICY CHANGE", false, false)
 	if err != nil {
 		t.Fatalf("Steer: %v (%+v)", err, rep)
 	}
@@ -356,7 +356,7 @@ func TestSteerUnconfirmedIsNotReportedAsSuccess(t *testing.T) {
 	s.steerWait = 600 * time.Millisecond
 	armFakeRound(t, s, "quiet", 4444)
 
-	rep, err := s.Steer("quiet", "POLICY CHANGE", false)
+	rep, err := s.Steer("quiet", "POLICY CHANGE", false, false)
 	if err == nil {
 		t.Fatal("an unacked steer must be an error, not a success")
 	}
@@ -374,7 +374,7 @@ func TestSteerUnconfirmedIsNotReportedAsSuccess(t *testing.T) {
 		time.Sleep(150 * time.Millisecond)
 		disarmRound(s, "quiet")
 	}()
-	rep, err = s.Steer("quiet", "POLICY CHANGE AGAIN", false)
+	rep, err = s.Steer("quiet", "POLICY CHANGE AGAIN", false, false)
 	if err == nil {
 		t.Fatal("an unacked steer must be an error")
 	}
@@ -395,7 +395,7 @@ func TestSteerRejectsEmptyText(t *testing.T) {
 	})
 	s := newTestSupervisor(t)
 	armFakeRound(t, s, "empty", 4646)
-	if _, err := s.Steer("empty", "   \n", true); err == nil {
+	if _, err := s.Steer("empty", "   \n", true, false); err == nil {
 		t.Fatal("empty steer text must be rejected")
 	}
 	if job.Size(job.Ctrl("empty")) != 0 {

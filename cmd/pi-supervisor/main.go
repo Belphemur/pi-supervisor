@@ -1,11 +1,18 @@
 // pi-supervisor — systemd user daemon supervising long-running pi RPC
 // delegations (spawn/resume rounds, session monitoring, instant-exit
 // strikes) with a Unix-socket control API.
+//
+// The CLI is cobra (command tree, flags, help, generated completions) with
+// viper for configuration precedence: explicit flag > PI_SUPERVISOR_* env >
+// optional config file > built-in default. Exit codes are a contract the test
+// suite and scripts depend on: 2 = usage/validation, 1 = runtime/daemon
+// refused, 0 = success. See the exit constants and main().
 package main
 
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,14 +23,35 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+
 	"pi-supervisor/internal/control"
 	"pi-supervisor/internal/job"
 	"pi-supervisor/internal/notify"
 	"pi-supervisor/internal/supervisor"
 )
 
+// Exit codes, kept as named constants because the test suite asserts on them.
+const (
+	exitOK      = 0
+	exitRuntime = 1
+	exitUsage   = 2
+)
+
+// Sentinels that classify a failure as usage-class (exit 2), matching the
+// pre-cobra behavior: errUsage covers bad operator input, errUnreachable
+// covers "no daemon on the socket" (there is simply nothing to answer).
+var (
+	errUsage       = errors.New("usage")
+	errUnreachable = errors.New("daemon not reachable")
+)
+
 func socketPath() string {
 	if p := os.Getenv("PI_SUPERVISOR_SOCK"); p != "" {
+		return p
+	}
+	if p := viper.GetString("socket"); p != "" {
 		return p
 	}
 	rt := os.Getenv("XDG_RUNTIME_DIR")
@@ -31,6 +59,27 @@ func socketPath() string {
 		rt = "/tmp"
 	}
 	return filepath.Join(rt, "pi-supervisor.sock")
+}
+
+// initConfig wires viper: optional ~/.config/pi-supervisor/config.yaml plus
+// PI_SUPERVISOR_SOCKET / PI_SUPERVISOR_CONFIG env overrides for `socket`. A
+// missing config file is not an error — every value has an env or default
+// fallback.
+func initConfig() {
+	viper.SetDefault("socket", "")
+	if v := os.Getenv("PI_SUPERVISOR_SOCKET"); v != "" {
+		viper.SetDefault("socket", v)
+	}
+	if cfg := os.Getenv("PI_SUPERVISOR_CONFIG"); cfg != "" {
+		viper.SetConfigFile(cfg)
+	} else {
+		home, _ := os.UserHomeDir()
+		viper.AddConfigPath(filepath.Join(home, ".config", "pi-supervisor"))
+		viper.SetConfigName("config")
+		viper.SetConfigType("yaml")
+	}
+	viper.AutomaticEnv()
+	_ = viper.ReadInConfig() // absent config is fine
 }
 
 // runDaemon is ExecStart: load jobs, serve control socket, monitor, ready.
@@ -65,96 +114,36 @@ func runDaemon() {
 	select {} // loops run in goroutines
 }
 
-// ctl talks to the running daemon over the control socket.
-func ctl(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: pi-supervisor status [job] | start|stop <job> | steer <job> <text...> | logs <job> [n] | reload | watch [job] [-t]")
-		os.Exit(2)
-	}
-	var req control.Request
-	switch args[0] {
-	case "status":
-		req.Cmd = "status"
-		if len(args) > 1 {
-			req.Job = args[1]
-		}
-	case "start", "stop":
-		if len(args) < 2 {
-			fatalf("%s requires a job name", args[0])
-		}
-		req.Cmd, req.Job = args[0], args[1]
-	case "steer":
-		if len(args) < 3 {
-			fatalf("steer requires <job> <text...>")
-		}
-		req.Cmd, req.Job = "steer", args[1]
-		var text []string
-		for _, a := range args[2:] {
-			if a == "-n" || a == "--no-wait" {
-				req.NoWait = true
-				continue
-			}
-			text = append(text, a)
-		}
-		if len(text) == 0 {
-			fatalf("steer requires <job> <text...>")
-		}
-		req.Text = strings.Join(text, " ")
-	case "logs":
-		if len(args) < 2 {
-			fatalf("logs requires a job name")
-		}
-		req.Cmd, req.Job = "logs", args[1]
-		if len(args) > 2 {
-			req.N, _ = strconv.Atoi(args[2])
-		}
-	case "reload":
-		req.Cmd = "reload"
-	case "watch":
-		req.Cmd = "watch"
-		terminal := false
-		for _, a := range args[1:] {
-			switch a {
-			case "-t", "--terminal":
-				terminal = true
-			default:
-				req.Job = a
-			}
-		}
-		watchCtl(req, terminal)
-		return
-	default:
-		fatalf("unknown ctl command %q", args[0])
-	}
-
+// sendCTL performs one-shot request/response against the running daemon and
+// renders the reply. The returned error is mapped to an exit code by main().
+func sendCTL(req control.Request) error {
 	c, err := net.Dial("unix", socketPath())
 	if err != nil {
-		fatalf("daemon not reachable at %s: %v", socketPath(), err)
+		return fmt.Errorf("%w at %s: %w", errUnreachable, socketPath(), err)
 	}
 	defer c.Close()
 	line, _ := json.Marshal(req)
 	if _, err := c.Write(append(line, '\n')); err != nil {
-		fatalf("write: %v", err)
+		return fmt.Errorf("write: %w", err)
 	}
 	respData, err := io.ReadAll(c)
 	if err != nil {
-		fatalf("read: %v", err)
+		return fmt.Errorf("read: %w", err)
 	}
 	var resp control.Response
 	if err := json.Unmarshal(respData, &resp); err != nil {
-		fatalf("bad response: %s", string(respData))
+		return fmt.Errorf("bad response: %s", string(respData))
 	}
 	if !resp.OK {
 		if req.Cmd == "steer" {
 			// The report is the answer even when the steer failed.
 			printSteer(resp)
 		}
-		fmt.Fprintln(os.Stderr, "error:", resp.Error)
-		os.Exit(1)
+		return errors.New(resp.Error)
 	}
 	if req.Cmd == "steer" {
 		printSteer(resp)
-		return
+		return nil
 	}
 	// A JSON array decodes into []any, not []string: print a string array
 	// (logs) line by line, anything else as indented JSON.
@@ -170,11 +159,11 @@ func ctl(args []string) {
 		}
 		if strs != nil {
 			for _, s := range strs {
-				// ctl's own stdout: there is no upstream to report a write
+				// sendCTL's own stdout: there is no upstream to report a write
 				// failure to, and the exit code stays 0 either way.
 				_, _ = fmt.Println(s)
 			}
-			return
+			return nil
 		}
 	}
 	out, _ := json.MarshalIndent(resp.Data, "", "  ")
@@ -182,6 +171,7 @@ func ctl(args []string) {
 	if line := prStatusLine(resp.Data); line != "" {
 		fmt.Println(line)
 	}
+	return nil
 }
 
 // prStatusLine renders the trailing `pr <url>` field of a single-job status,
@@ -202,7 +192,8 @@ func prStatusLine(data any) string {
 
 // printSteer renders a steer report: where the frame was sent, then what pi
 // actually did with it (ADR-0005). The outcome line is the whole point —
-// never print a bare success for a frame nobody acknowledged.
+// never print a bare success for a frame nobody acknowledged. An interrupt
+// steer also states that the running turn was asked to stop (ADR-0007).
 func printSteer(resp control.Response) {
 	raw, err := json.Marshal(resp.Data)
 	if err != nil {
@@ -223,6 +214,9 @@ func printSteer(resp control.Response) {
 		outcome = "not sent"
 	}
 	fmt.Printf("steer  job=%s round=%d (%s, pi pid %d)\n", r.Job, r.Round, live, r.ClientPID)
+	if r.Interrupted {
+		fmt.Printf("       interrupt  SIGINT sent to pi process group (-%d): current turn asked to stop\n", r.ClientPID)
+	}
 	fmt.Printf("       session  %s\n", orDash(r.SessionPath))
 	fmt.Printf("       ctrl     %s\n", orDash(r.CtrlPath))
 	if r.FrameID != "" {
@@ -238,7 +232,7 @@ func printSteer(resp control.Response) {
 	}
 	fmt.Println(line)
 	if r.Detail != "" {
-		fmt.Printf("       %s\n", r.Detail)
+		fmt.Printf("       detail  %s\n", r.Detail)
 	}
 }
 
@@ -290,7 +284,7 @@ func watchFooter(ev map[string]any) {
 		fmt.Printf("   2. scan the round log — `tail -n 40 /tmp/pi_%s_run.log`\n", name)
 		if rc != 0 {
 			fmt.Printf("   3. off-course or error — `pi-supervisor steer %s \"...\"` (end of turn) or\n", name)
-			fmt.Printf("      `pi-supervisor interrupt` to stop mid-turn. Then proceed\n")
+			fmt.Printf("      `pi-supervisor steer --interrupt %s \"...\"` to stop mid-turn. Then proceed\n", name)
 		}
 		fmt.Printf("  re-arm: pi-supervisor watch %s   (background+notify=true)\n", name)
 	case "instant_exit":
@@ -321,7 +315,9 @@ func watchFooter(ev map[string]any) {
 
 // watchCtl blocks on the control socket and prints events as they arrive.
 // Exit 0 on an event (with a footer of next steps), 1 when the connection is
-// lost (daemon restart — re-arm), 2 on usage errors.
+// lost (daemon restart — re-arm), 2 on usage errors. It owns its own exits
+// because it streams and must distinguish each terminal condition; the tests
+// pin all three codes.
 func watchCtl(req control.Request, terminal bool) {
 	c, err := net.Dial("unix", socketPath())
 	if err != nil {
@@ -377,20 +373,230 @@ func watchCtl(req control.Request, terminal bool) {
 
 func fatalf(f string, args ...any) {
 	fmt.Fprintf(os.Stderr, f+"\n", args...)
-	os.Exit(2)
+	os.Exit(exitUsage)
+}
+
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "pi-supervisor",
+		Short: "Supervise long-running pi RPC delegations",
+		Long: "pi-supervisor runs as a systemd --user daemon that spawns/resumes\n" +
+			"pi RPC rounds, monitors sessions, and answers queries over a\n" +
+			"Unix socket. This CLI is the control surface: run the daemon\n" +
+			"(`run`) or query/steer it (status/start/stop/steer/logs/watch).",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		// No subcommand = usage-class failure, as before the cobra migration.
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return fmt.Errorf("%w: see 'pi-supervisor --help'", errUsage)
+		},
+	}
+	// Flag parse errors are usage errors (exit 2), matching pre-cobra.
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return fmt.Errorf("%w: %w", errUsage, err)
+	})
+	root.CompletionOptions.HiddenDefaultCmd = true // we ship our own `completion install`
+
+	root.AddCommand(
+		newRunCmd(),
+		newStatusCmd(),
+		newJobCmd("start"),
+		newJobCmd("stop"),
+		newSteerCmd(),
+		newLogsCmd(),
+		newReloadCmd(),
+		newWatchCmd(),
+		newCompletionCmd(root),
+	)
+	return root
+}
+
+func newRunCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "run",
+		Short:  "Run the supervisor daemon (ExecStart for the systemd unit)",
+		Hidden: true, // invoked by systemd, not by hand
+		Args:   cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			runDaemon()
+			return nil
+		},
+	}
+}
+
+func newStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:               "status [job]",
+		Short:             "Show job status (all jobs when no name is given)",
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeJobNames,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req := control.Request{Cmd: "status"}
+			if len(args) == 1 {
+				req.Job = args[0]
+			}
+			return sendCTL(req)
+		},
+	}
+}
+
+func newJobCmd(verb string) *cobra.Command {
+	return &cobra.Command{
+		Use:               verb + " <job>",
+		Short:             strings.ToUpper(verb[:1]) + verb[1:] + " a job",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeJobNames,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return sendCTL(control.Request{Cmd: verb, Job: args[0]})
+		},
+	}
+}
+
+func newSteerCmd() *cobra.Command {
+	var noWait, interrupt bool
+	c := &cobra.Command{
+		Use:   "steer <job> <text...>",
+		Short: "Send a steer message to a running round",
+		Long: "steer wraps prose into a prompt frame and delivers it to the live\n" +
+			"round's pi process (ADR-0005). It reports where the frame went and\n" +
+			"what pi did with it. With --interrupt, pi's process group is\n" +
+			"SIGINTed first so the current turn is asked to stop and this steer\n" +
+			"is what pi picks up next (ADR-0007).",
+		Args: cobra.MinimumNArgs(2), // <job> + at least one text token
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeJobNames(cmd, args, toComplete)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return sendCTL(control.Request{
+				Cmd:       "steer",
+				Job:       args[0],
+				Text:      strings.Join(args[1:], " "),
+				NoWait:    noWait,
+				Interrupt: interrupt,
+			})
+		},
+	}
+	c.Flags().BoolVarP(&noWait, "no-wait", "n", false, "return once the frame is on disk, without waiting for pi's ack")
+	c.Flags().BoolVarP(&interrupt, "interrupt", "i", false, "SIGINT pi's process group first so the current turn stops and this steer is next")
+	return c
+}
+
+func newLogsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "logs <job> [n]",
+		Short: "Show the last n lines of a job's run log (default all)",
+		Args:  cobra.RangeArgs(1, 2),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeJobNames(cmd, args, toComplete)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req := control.Request{Cmd: "logs", Job: args[0]}
+			if len(args) > 1 {
+				req.N, _ = strconv.Atoi(args[1])
+			}
+			return sendCTL(req)
+		},
+	}
+}
+
+func newReloadCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "reload",
+		Short: "Reload job definitions from disk",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return sendCTL(control.Request{Cmd: "reload"})
+		},
+	}
+}
+
+func newWatchCmd() *cobra.Command {
+	var terminal bool
+	c := &cobra.Command{
+		Use:               "watch [job]",
+		Short:             "Stream job events until a terminal one (default: all jobs)",
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeJobNames,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req := control.Request{Cmd: "watch"}
+			if len(args) == 1 {
+				req.Job = args[0]
+			}
+			watchCtl(req, terminal) // watchCtl owns its exit codes
+			return nil
+		},
+	}
+	c.Flags().BoolVarP(&terminal, "terminal", "t", false, "keep streaming after non-terminal events")
+	return c
+}
+
+// completeJobNames offers known job names (from ~/.pi/supervisor/jobs/*.json)
+// for shell completion. It never touches the daemon and never fails the tab.
+func completeJobNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	entries, err := os.ReadDir(job.JobsDir())
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		names = append(names, strings.TrimSuffix(e.Name(), ".json"))
+	}
+	return names, cobra.ShellCompDirectiveNoFileComp
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fatalf("usage: pi-supervisor run | status [job] | start|stop <job> | steer <job> <text...> | logs <job> [n] | reload | watch [job] [-t]")
+	initConfig()
+	root := newRootCmd()
+	_, err := root.ExecuteC()
+	if err == nil {
+		os.Exit(exitOK)
 	}
-	switch os.Args[1] {
-	case "run":
-		runDaemon()
-	case "status", "start", "stop", "steer", "logs", "reload", "watch":
-		ctl(os.Args[1:])
+	// One error print for every failure path. Exit-code mapping:
+	//   usage / no-daemon        -> 2 (pre-cobra behavior, pinned by tests)
+	//   daemon refused / bad rsp -> 1
+	//   cobra arg/flag validation -> 2
+	fmt.Fprintln(os.Stderr, "error:", err)
+	switch {
+	case errors.Is(err, errUsage), errors.Is(err, errUnreachable), isCobraUsageError(err):
+		os.Exit(exitUsage)
 	default:
-		fatalf("unknown command %q", os.Args[1])
+		os.Exit(exitRuntime)
 	}
 	_ = bufio.NewReader // silence if unused after refactors
+}
+
+// isCobraUsageError reports whether err came from cobra's own command lookup /
+// argument validation (as opposed to a RunE handler's own error). Those are
+// usage-class (exit 2). Cobra exposes no typed error for these, so match the
+// stable message prefixes it produces.
+func isCobraUsageError(err error) bool {
+	msg := err.Error()
+	for _, s := range []string{
+		"unknown command",
+		"unknown shorthand flag",
+		"unknown flag",
+		"flag needs an argument",
+		"required flag",
+		"invalid argument",
+		// cobra's Args validators: ExactArgs -> "accepts 1 arg(s)", NoArgs /
+		// MaximumNArgs -> "accepts no/at most ...", RangeArgs -> "accepts
+		// between ...", MinimumNArgs -> "requires at least ..."
+		"accepts ",
+		"requires at least",
+		"requires exactly",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
