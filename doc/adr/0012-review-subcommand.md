@@ -17,11 +17,12 @@ agent's head turn to turn, with no bounded budget the operator can set.
 The request replaces that with a **daemon-owned review loop**: the supervisor
 drives the outer round loop (poll → decide → trigger pi → poll), while pi
 executes one round's fixes. Crucially, per the owner, **pi-supervisor fully
-replaces `reply_review.py`**: rather than the agent shelling out to ad-hoc
-Python, a pi plugin (`pi_supervisor_review`, an MCP tool) exposes CLI-style
-commands, and pi's system prompt tells it to invoke those commands for every
-read/reply/resolve action. The daemon is therefore never the mutation surface
-— it only *serves* the reads and *records* the writes the plugin asks it to do.
+replaces `reply_review.py`: rather than the agent shelling out to ad-hoc
+Python, an injected skill (`pi_supervisor_review`) carries the contract and
+a CLI shim (`_pi-supervisor-review`) that exposes CLI-style commands; pi's
+system prompt tells it to invoke those commands for every read/reply/resolve
+action. The daemon is therefore never the mutation surface — it only *serves*
+the reads and *records* the writes the shim asks it to do.
 
 This reuses the control-flow shape ADR-0004 (`ci_stall`) and ADR-0011
 (completion detection) already established for the daemon: poll an artifact,
@@ -34,16 +35,33 @@ decide based on what is seen, intervene.
 | Concern | Owner | Mechanism |
 |---|---|---|
 | **Outer loop** (poll GH → decide "one more pi round?" → enforce budget) | the daemon | `gh api` (read-only) + the round loop |
-| **Fix execution + triage** (read a thread, classify fix/explain/defer, reply, resolve, push) | pi, via the `pi_supervisor_review` plugin | plugin → daemon RPC (the daemon *serves* the read/write) |
-| **Mutation surface** (post reply, resolve thread, push) | the daemon, as a server | `gh api` writes — but only when asked by the plugin; the daemon never decides to |
+| **Fix execution + triage** (read a thread, classify fix/explain/defer, reply, resolve, push) | pi, via the `pi_supervisor_review` skill + `_pi-supervisor-review` shim | shim → daemon control socket |
+| **Mutation surface** (post reply, resolve thread, push) | the daemon, as a server | `gh api` writes — but only when asked by the shim; the daemon never decides to |
 
-The LLM does NOT shell out to `gh` directly anymore. Its system prompt for a
-review round is: *"use `pi_supervisor_review` for every GitHub review action:
-list threads, get a thread, post a reply, resolve a thread, check CI. Never
-call `gh` or `reply_review.py` from the shell."* The plugin is an MCP stdio
-server that talks to the daemon's control socket.
+The LLM does NOT shell out to `gh` directly anymore. For a review round the
+job brief includes the `pi_supervisor_review` skill, whose system prompt
+tells pi to route every GitHub review action through the
+`_pi-supervisor-review` shim at the daemon's control socket (path in
+`$PI_SUPERVISOR_SOCKET`); the shim is the only thing that ever emits a
+review request. The daemon is MCP-**less** here — the shim speaks its JSON
+control protocol directly.
 
-### 2. The plugin-to-daemon RPC
+### 2. Review API on the control socket
+
+Per the owner: **no plugin/MCP server**. The surface pi uses is the daemon's
+control socket directly, and the contract is carried as an **injected skill**
+(`pi_supervisor_review`, shipped under `doc/skill/pi_supervisor_review/`)
+that the system prompt loads for review rounds. The skill is two things in one:
+
+- a plain-language contract — *"route every GitHub review action to the
+  pi-supervisor at `$PI_SUPERVISOR_SOCKET` via `_pi-supervisor-review`; never
+  call `gh` or `reply_review.py` from the shell"* — and
+- a CLI shim (`_pi-supervisor-review list_threads …`, `_pi-supervisor-review
+  post_reply …`, `… resolve_thread …`, `… check_ci …`) that talks to the
+  daemon's control socket. The shim is what the system prompt's code blocks
+  point at; the shim is the only thing that ever emits the request. The shim
+  is **not** an MCP server — it speaks the daemon's JSON control protocol
+  directly over the unix socket.
 
 New control-socket method, additive only:
 
@@ -61,18 +79,19 @@ POST /review/action
   -> {"ok":true}
 ```
 
-The daemon authenticates the *call* by the job it is bound to (a socket
-request without a live `review <job>` round is refused) — there is no
-user-facing auth on the plugin because the plugin runs *in* pi, the daemon
-already knows which job owns this round, and the socket is `0600`.
+The daemon authenticates the *call* by the live `review <job>` round it is bound
+to (a control-socket request outside a running review round is refused) —
+there is no user-facing auth on the shim because the shim runs *in* pi, the
+daemon already knows which job owns this round, and the socket is `0600`.
 Mutations are `gh api` writes; reads are `gh api` reads. All reuse the single
 `gh` token from `~/.config/gh/hosts.yml` (confirmed: `repo` + `workflow`
 scopes).
 
 The daemon does **not** re-implement the inline-answer-before-resolve rule from
-the `answer-code-review` skill, nor its GraphQL-vs-REST reply path — those
-live in the plugin, which is a thin adapter over `gh`. The daemon enforces
-the *budget* and the *loop*; it does not triage or author replies.
+the `answer-code-review` skill, nor its REST-reply-then-GraphQL-resolve path —
+those live in the skill/`_pi-supervisor-review` shim, which is a thin adapter
+over `gh`. The daemon enforces the *budget* and the *loop*; it does not triage
+or author replies.
 
 ### 3. Command surface
 
@@ -88,9 +107,13 @@ pi-supervisor review <job> --auto           # arm auto-trigger (§4)
   **Default 2** (per the request), not the derived heuristic I floated earlier
   — an operator-set count beats a bot-computed one, and 2 matches the
   observed pattern (reply round + verification round).
-- `--skill <path>` — the skill pi loads as its system-prompt source for the
-  review rounds. **Defaults to `answer-code-review`** so the triage rules are
-  unchanged; only the *orchestration* moves into the daemon.
+- `--skill <path>` — the skill injected into pi's brief for the review
+  rounds. **Defaults to `answer-code-review`** so the triage rules are
+  unchanged; only the *orchestration* moves into the daemon. The brief also
+  loads the `pi_supervisor_review` skill (the shim contract + system prompt),
+  so a review round's prompt = `answer-code-review` triage rules *plus* the
+  directive to route every GitHub action through `_pi-supervisor-review`
+  instead of shelling out to `gh`.
 
 `Start <job>` on a running review campaign refuses (`already running`); the
 `--fresh` restart (ADR-0010) clears and resets the review loop.
@@ -98,16 +121,22 @@ pi-supervisor review <job> --auto           # arm auto-trigger (§4)
 ### 4. Auto-trigger on PR + marker
 
 When any job's round reaches its completion **marker** (ADR-0011) and that
-and that round's transcript links a **PR** (`--pr`-style scrape, ADR-0006)
+round's transcript links a **PR** (`--pr`-style scrape, ADR-0006)
 that is `OPEN`, and the job's def carries an `auto_review` stanza, the
 supervisor:
 
-1. Resolves the PR's current open-thread count via `gh` (the trigger guard).
-2. If > 0 open threads: arms a `review <job> --pr <N>` campaign with the
-   stanza's `rounds` (default 2) and `skill`, emitting a `review_armed` event.
-3. If 0 threads are open: does **not** arm — a PR with nothing left to review
-   does not auto-start a review loop; emits `review_skipped` with
-   `reason:"no open threads"`.
+1. Posts a `@codereplay please review` / `@coderabbitai review` trigger
+   comment on the PR (so CodeRabbit starts a fresh pass — the owner's note:
+   "No threads is normal [on a fresh PR; you] need to trigger CodeRabbit
+   manually with a comment and then wait 5 minutes before checking for
+   threads").
+2. Waits 5 minutes (`review.coderabbit_warmup`, configurable; default
+   `5m`).
+3. After warmup: resolves the open-thread count via `gh`.
+   - If > 0: arms a `review <job> --pr <N>` campaign with the stanza's
+     `rounds` (default 2) and `skill`, emitting `review_armed`.
+   - If still 0: emits `review_skipped` with `reason:"no open threads
+     after CodeRabbit warmup"` — does not arm.
 
 This makes `mealime-roomux` (marker `ALL_MEALIME_ROOMUX_DONE` + PR #43) →
 review auto-run with 2 rounds, as specified. The trigger is structural: it
@@ -120,25 +149,23 @@ linked `pull/<N>` out of that URL.
 
 ### 5. Open questions (decide before code)
 
-Q1. **Plugin transport.** MCP stdio server on the control socket is my default
-because it's the daemon's existing story (`watch`/`steer` already use the
-socket). A direct HTTP-to-plugin is simpler to implement but adds a second
-listener. MCP-stdio preferred unless you want standalone `gh`-wrappers you can
-also curl.
+Q1. **CodeRabbit trigger comment.** Hardcoded to `@coderabbitai review`?
+Configurable via `review.trigger_comment` (default `@coderabbitai review`)
+so a different bot / org convention is a one-line change, not a rebuild.
 
-Q2. `--rounds 0` semantics. I propose: `0` = auto-derive from the thread count
-at arm time (`ceil(open / 12)`, capped), as a convenience for large PRs. The
-*dafult* stays 2. Acceptable, or should 0 be an error?
+Q2. `--rounds 0` semantics. `0` = auto-derive from the thread count at arm
+time (`ceil(open / 12)`, capped) as a convenience for large PRs. The default
+remains 2. Worth keeping, or should 0 be an error to force an explicit count?
 
 Q3. **Who enforces "answer every thread before resolve"?** Today the skill
 does it by convention. With the daemon owning the loop, do you want the
-daemon to *refuse* a `resolve_thread` RPC whose thread has no agent-authored
-reply in the last N minutes (a cheap server-side guard), or keep it as a
-skill/prompt rule only?
+daemon to *refuse* a `resolve_thread` request via the shim whose thread has no
+agent-authored reply in the last N minutes (a cheap server-side guard), or
+keep it as a skill/prompt rule only?
 
 Q4. **Push detection.** If a round replied but did not push, the head SHA is
 unchanged and the next round re-handles stale threads. Is that the policy you
-want, or should a "no push" round be a strike toward the `MaxRounds` budget?
+want, or should a "no push" round count against the `MaxRounds` budget?
 
 Q5. **Pre-merge gate.** This only gates *on* `pre-merge --pr` (ADR-pre-merge),
 never executes it — confirming that matches your mental model.
@@ -152,12 +179,13 @@ never executes it — confirming that matches your mental model.
   + head SHA + the remaining thread list, driven by the `round_done` event
   payload.
 - No new daemon process model, no new credential surface — one read-only
-  polling path (`gh api` reads) plus one mutation path (`gh api` writes, only on
-  plugin demand).
+  polling path (`gh api` reads) plus one mutation path (`gh api` writes, only
+  on demand from the shim).
 - `answer-code-review` skill is **retired for review jobs only**: replaced by
-  `pi-supervisor review` + the `pi_supervisor_review` plugin for the review
-  shape. Non-review jobs are unchanged.
-- The auto-trigger makes finishing a job and PR'-ing it the natural handoff
+  `pi-supervisor review` + the `pi_supervisor_review` skill + the
+  `_pi-supervisor-review` shim for the review shape. Non-review jobs are
+  unchanged.
+- The auto-trigger makes finishing a job and PR-ing it the natural handoff
   into review, with no operator command in between.
 
 ## Non-goals
@@ -166,4 +194,5 @@ never executes it — confirming that matches your mental model.
 - Non-GitHub review tools.
 - Triaging findings in the daemon (counts only).
 - Replacing the inline-answer-before-resolve rule or the
-  REST-reply-then-GraphQL-resolve fallback — those stay in the plugin/skill.
+  REST-reply-then-GraphQL-resolve fallback — those stay in the
+  skill/shim.
