@@ -162,7 +162,8 @@ func (r *runner) snapshot() job.Status {
 			st.SessionAgeS = time.Since(fi.ModTime()).Seconds()
 		}
 	}
-	st.MarkerFound = r.state.State == "done"
+	// Truthful mid-round, not just after classification (ADR-0011).
+	st.MarkerFound = r.state.State == "done" || r.state.MarkerSeen
 	return st
 }
 
@@ -587,9 +588,26 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// agent has parked on the CI/review loop ci_stall_cap times.
 		r.mu.Lock()
 		sess := r.job.SessionPath
+		marker := r.job.Marker
 		r.mu.Unlock()
 		var rc int
 		var dur, runlogB int64
+		// Completion detection (ADR-0011). The marker lives in pi's ASSISTANT
+		// MESSAGES in the session transcript, streamed live while the round
+		// runs — NOT in the run log, which round() truncates at the start of
+		// every round. Reading the run log made a cumulative question ("has
+		// this job ever finished?") unanswerable: the evidence was destroyed
+		// each round, so mealime-roomux burned 14 rounds on already-finished
+		// work and ended fatal.
+		//
+		// The watcher starts even on a fresh LAUNCH (sess == ""), because pi
+		// creates the transcript as it runs; it re-resolves the path itself.
+		markerStop, markerExited := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(markerExited)
+			s.watchMarker(r, sess, marker, round, markerStop, stopCh)
+		}()
+
 		if sess != "" {
 			watchStop, watchExited := make(chan struct{}), make(chan struct{})
 			go func() {
@@ -608,6 +626,24 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			<-emptyExited // empty-turn watcher likewise
 		} else {
 			rc, dur, runlogB = s.round(r, round, stopCh)
+		}
+		close(markerStop)
+		<-markerExited // completion watcher likewise
+		// Adopt the transcript a fresh LAUNCH just created, so the gate below
+		// has a surface to read on the very round that started the session.
+		if sess == "" {
+			r.mu.Lock()
+			sess = r.job.SessionPath
+			r.mu.Unlock()
+			if sess == "" {
+				if found := job.FindSession(j.SessionName, j.Worktree); found != "" {
+					sess = found
+					r.mu.Lock()
+					r.job.SessionPath = found
+					r.mu.Unlock()
+					_ = job.Save(r.job)
+				}
+			}
 		}
 		select {
 		case <-stopCh:
@@ -649,17 +685,47 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			s.logf(name, "round %d diagnostic: %s", round, r.stateSnapshot().LastDiag)
 		}
 
-		// The marker gate. An empty marker would make RunlogContains match
-		// ANY non-empty run log (strings.Contains(x, "") is true), so a job
-		// configured without a marker could be declared done by a stale final
-		// report. Refuse: no marker, no done.
-		if j.Marker != "" && job.Exists(j.FinalReport) && job.RunlogContains(job.Runlog(name), j.Marker) {
+		// The marker gate (ADR-0011). The completion signal comes from the
+		// SESSION TRANSCRIPT — the streamed MarkerSeen latch, plus a direct
+		// scan as a belt-and-braces for a marker written after the last tick.
+		//
+		// It is NOT the run log: round() truncates /tmp/pi_<job>_run.log at
+		// the start of every round, so a marker emitted in an earlier round is
+		// structurally invisible there. That made mealime-roomux burn 14
+		// rounds and end fatal ("round cap reached without marker") with the
+		// work finished and PR #43 open.
+		//
+		// An empty marker would make any "contains" check match ANY non-empty
+		// text (strings.Contains(x, "") is true), so a job configured without a
+		// marker could be declared done by a stale final report. Refuse: no
+		// marker, no done.
+		//
+		// TWO surfaces, OR'd on purpose:
+		//
+		//  1. the sticky MarkerSeen latch (transcript, streamed live), and
+		//  2. the cumulative transcript scan (belt-and-braces for a marker
+		//     written after the last tick), and
+		//  3. the CURRENT round's run log — the weaker legacy surface, kept
+		//     because an agent can legitimately announce completion on stdout
+		//     without persisting an assistant record.
+		//
+		// The run log alone can never be sufficient across rounds (it is
+		// truncated each round, which is the bug), but within the round that
+		// produced it, it is a valid signal and costs nothing.
+		markerSeen := r.stateSnapshot().MarkerSeen
+		if !markerSeen && j.Marker != "" && sess != "" {
+			markerSeen = job.TranscriptContains(sess, j.Marker)
+		}
+		if !markerSeen && j.Marker != "" {
+			markerSeen = job.RunlogContains(job.Runlog(name), j.Marker)
+		}
+		if j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {
 			r.mu.Lock()
 			r.state.State, r.active = "done", false
 			r.mu.Unlock()
 			r.persistState()
-			s.logf(name, "round %d: marker %q detected — done", round, j.Marker)
-			s.emit(name, "done", round, 0, dur, "", "marker %q detected — run is over", j.Marker)
+			s.logf(name, "round %d: marker %q detected in session transcript — done", round, j.Marker)
+			s.emit(name, "done", round, 0, dur, "", "marker %q detected in session transcript — run is over", j.Marker)
 			return
 		}
 
@@ -899,6 +965,104 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		}
 		o := <-doneCh
 		return o.res.RC, int64(time.Since(start).Seconds()), job.Size(runlog)
+	}
+}
+
+// watchMarker streams the session transcript for one round and latches the
+// completion marker as pi emits it (ADR-0011).
+//
+// It runs WHILE the round is live, so the marker is detected mid-turn instead
+// of only at the next post-round classification — the run-log path could only
+// check after the fact, and after the fact the run log had already been
+// truncated by the next round.
+//
+// `sess` may be empty (fresh LAUNCH: pi creates the transcript as it runs), in
+// which case the path is re-resolved on each tick until it appears.
+//
+// The latch lives in the watcher (sticky for the round). This function only
+// records it on the runner so `status` is truthful mid-round and the gate can
+// read it at the round boundary. It never interrupts pi: the agent still has
+// to end its turn cleanly, and `done` additionally requires final_report.
+func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watchStop, stopCh chan struct{}) {
+	if marker == "" {
+		return // no marker configured: nothing to detect (and the gate refuses)
+	}
+	r.mu.Lock()
+	name := r.job.Name
+	r.mu.Unlock()
+
+	var w *job.TranscriptWatcher
+	// Create the watcher EAGERLY, before pi can emit anything, so the seed
+	// offset is the file's size at round start and no marker can slip through
+	// the gap between "round began" and "watcher exists". A fresh LAUNCH has no
+	// transcript yet, so resolution retries on the tick — but it is resolved
+	// from the moment the file appears, before the first token is written.
+	if sess != "" {
+		w = job.NewTranscriptWatcher(sess, marker, 0)
+	}
+	ensure := func() *job.TranscriptWatcher {
+		if w != nil {
+			return w
+		}
+		path := sess
+		if path == "" {
+			r.mu.Lock()
+			path = r.job.SessionPath
+			r.mu.Unlock()
+		}
+		if path == "" {
+			path = job.FindSession(r.job.SessionName, r.job.Worktree)
+			if path == "" {
+				return nil
+			}
+			r.mu.Lock()
+			r.job.SessionPath = path
+			r.mu.Unlock()
+			_ = job.Save(r.job)
+		}
+		w = job.NewTranscriptWatcher(path, marker, 0)
+		return w
+	}
+
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-watchStop:
+			// Final fold so a marker written in the last 2s of the round is
+			// not lost to the tick boundary.
+			if mw := ensure(); mw != nil {
+				mw.Poll()
+				s.setMarkerSeen(r, mw.Seen(), round)
+			}
+			return
+		case <-stopCh:
+			return
+		case <-t.C:
+			mw := ensure()
+			if mw == nil {
+				continue // transcript not created yet
+			}
+			if mw.Poll() {
+				s.logf(name, "round %d: marker %q streamed from session transcript", round, marker)
+				s.setMarkerSeen(r, true, round)
+				return // latched; no further polling needed this round
+			}
+		}
+	}
+}
+
+// setMarkerSeen records the completion latch on the runner.
+func (s *Supervisor) setMarkerSeen(r *runner, seen bool, round int) {
+	r.mu.Lock()
+	already := r.state.MarkerSeen
+	r.state.MarkerSeen = seen
+	r.mu.Unlock()
+	if seen && !already {
+		s.logf(r.job.Name, "round %d: completion marker detected in transcript", round)
+	}
+	if seen {
+		r.persistState()
 	}
 }
 

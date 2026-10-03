@@ -21,6 +21,7 @@ Unix socket.
 | `cmd/pi-supervisor/version_cli_test.go` | `pi-supervisor version` offline CLI test |
 | `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard, `Steer` (frame + ack wait, ADR-0005), `interruptPID` (SIGINT group, ADR-0007) |
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
+| `internal/job/transcript.go` | completion surface: `TranscriptContains`, `TranscriptWatcher` (ADR-0011) |
 | `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap. Same tail scrapes the round's GitHub PR URL (ADR-0006) |
 | `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
 | `install/install.sh` | Build + systemd unit + Hermes skill symlink + verification |
@@ -98,6 +99,17 @@ Unix socket.
    seen in the window — growth without a tool call is the model streaming prose,
    which is normal work. One `empty_turn` event, then escalation on the
    `ci_stall` abort+prompt path. Window = `empty_turn_idle_s` (default 60s).
+15. **Completion is detected in the SESSION TRANSCRIPT, streamed (ADR-0011).**
+   The marker gate reads assistant TEXT BLOCKS of the transcript JSONL, latched
+   live by `watchMarker` while the round runs and sticky thereafter. Never read
+   the marker from the run log: `round()` truncates `/tmp/pi_<job>_run.log`
+   every round, so a marker from an earlier round is invisible and a finished
+   job livelocks to MaxRounds (mealime-roomux, PR #43, 14 wasted rounds). Two
+   traps when scanning: DCP `custom`/dcp-state summaries QUOTE the marker, and
+   so do the user brief and `toolCall` arguments — only `type:"message"` +
+   `role:"assistant"` + `text` blocks count. `done` still requires BOTH the
+   marker AND `final_report`, and an empty marker never matches
+   (`strings.Contains(s, "")` is true for any non-empty s).
 14. **A steer `consumed` ack is deliberately absent (ADR-0010).** The ctrl file
    is read by the supervisor's own client goroutine, not pi, so no observable
    event distinguishes "pi buffered it" from "pi is parked in a CI poll". A

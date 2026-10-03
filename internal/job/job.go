@@ -145,6 +145,12 @@ type State struct {
 	LastDiag     string `json:"last_diag"`
 	StartedAt    string `json:"started_at"`
 	CIStalls     int    `json:"ci_stalls"` // parks on the CI/review loop, cumulative
+	// MarkerSeen latches true once the completion marker has been seen in the
+	// session transcript (ADR-0011). Sticky by design: the run log is truncated
+	// at the start of every round, so a marker seen in ANY round must survive
+	// to the gate — otherwise a finished job livelocks to MaxRounds and ends
+	// fatal (exactly what happened to mealime-roomux on PR #43).
+	MarkerSeen bool `json:"marker_seen,omitempty"`
 	// PRURL is the first GitHub pull-request URL scraped from this round's
 	// transcript (ADR-0006). Best-effort: "" when the agent never linked a
 	// PR, even if it opened one.
@@ -166,6 +172,12 @@ type Status struct {
 	LastRunlogB  int64   `json:"last_runlog_bytes"`
 	InstantExits int     `json:"instant_exits"`
 	CIStalls     int     `json:"ci_stalls"`
+	// MarkerSeen latches true once the completion marker has been observed in
+	// the session transcript (ADR-0011). It is deliberately sticky: the run
+	// log is truncated at the start of every round, so a marker seen in ANY
+	// round must survive to the gate — otherwise a finished job livelocks to
+	// MaxRounds and ends fatal.
+	MarkerSeen bool `json:"marker_seen,omitempty"`
 	// PRURL is the pull-request URL found in the last round's transcript
 	// (ADR-0006); "" when none was linked.
 	PRURL         string `json:"pr_url,omitempty"`

@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.3.0
+version: 1.4.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -165,8 +165,16 @@ systemd (Type=notify, WatchdogSec=120)
   later round RESUMEs `--session <path>`. Never re-LAUNCH (forks the session).
 - **Instant-exit strikes:** rc≠0 && <60s && runlog <4KB ⇒ strike; 3 strikes ⇒
   job `fatal` (context wall / model refusal — needs operator action).
-- **Completion:** final report exists AND marker in the run log's last 4KB ⇒
-  job `done`.
+- **Completion:** final report exists AND the marker appears in an **assistant
+  message in the session transcript** ⇒ job `done` (ADR-0011). The transcript
+  is streamed live while the round runs, so the marker is detected mid-turn,
+  and the latch is sticky for the job. It is deliberately NOT the run log:
+  `round()` truncates `/tmp/pi_<job>_run.log` at the start of every round, so a
+  marker from an earlier round is structurally invisible there — that bug made
+  `mealime-roomux` burn 14 rounds on finished work (PR #43) and end `fatal`.
+  Only assistant **text blocks** count: DCP compression summaries, the user
+  brief, and `toolCall` arguments all quote the marker without the agent
+  having finished.
 - **Steering:** wraps prose in a `{"type":"prompt","message":...}` frame
   (a hand-written JSON frame with a `type` field passes through unchanged);
   each frame gets an id (`steer-<ns>-<seq>`) written to the job's control
@@ -265,6 +273,8 @@ Behavior:
 
 | Symptom | Meaning / action |
 |---|---|
+| job ends `fatal` with "round cap reached without marker" but the work is visibly finished and a PR exists | the marker WAS emitted but the gate could not see it. Check `logs <job>` for `marker ... streamed from session transcript`; on a pre-ADR-0011 daemon this was the run-log truncation bug (fixed — upgrade). `status` now shows `marker_found` truthfully mid-round |
+| `status` shows `marker_found: true` but the job is not `done` | the marker was seen but `final_report` does not exist yet — the second half of the gate. Write the report at the path in the job JSON |
 | job state `fatal`, diag "3 consecutive instant exits" | session context wall — start a fresh session (new job or clear state) or trim the session |
 | job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |
 || `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
