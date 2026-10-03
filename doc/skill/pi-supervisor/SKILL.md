@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.0.0
+version: 1.1.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -14,10 +14,13 @@ metadata:
 # pi Supervisor Daemon (Go + systemd)
 
 `pi-supervisor` is a Go 1.27 daemon (systemd `--user`, `Type=notify`, watchdog)
-that runs the pi RPC resume loop for named jobs: spawns `pi_rpc_client.py`
-rounds, resumes the same session JSONL across client caps, classifies deaths,
-backs off adaptively, and answers queries over a Unix socket. It replaces the
-bash `pi_supervisor.sh` for anything that must outlive the launching agent.
+that runs the pi RPC resume loop for named jobs: spawns `pi --mode rpc` rounds
+through its own Go client (no Python), resumes the same session JSONL across
+rounds, classifies deaths, backs off adaptively, and answers queries over a
+Unix socket. It replaces the bash `pi_supervisor.sh` for anything that must
+outlive the launching agent. The CLI is cobra + viper (ADR-0008): every
+subcommand has its own `--help`, tab-completion is installed for every shell
+found on PATH, and `steer --interrupt` can drop the running turn.
 
 Canonical source + docs live in `/home/balor/workspace/pi-supervisor`
 (`AGENTS.md`, `doc/adr/`, `doc/skill/pi-supervisor/` — this skill is a symlink
@@ -62,6 +65,65 @@ pi-supervisor completion install
 pi-supervisor --help              # cobra: per-command help for every subcommand
 ```
 
+## CLI — cobra + viper (ADR-0008)
+
+The CLI is **cobra** (command tree, per-command help, real flag parsing,
+completion generation) with **viper** for configuration. Nothing is positional
+guesswork: every subcommand documents itself.
+
+```bash
+pi-supervisor --help              # the command tree
+pi-supervisor <cmd> --help        # per-command: usage, examples, every flag
+pi-supervisor steer --help        # shows -n/--no-wait AND -i/--interrupt
+```
+
+### Exit codes (a contract — scripts depend on these)
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | the daemon answered but refused (`ok:false`), or a malformed response |
+| 2 | usage/validation: unknown subcommand, bad flag, missing argument — **and "daemon not reachable"** |
+
+`watch` owns its own three exits (see Notifications below) because it streams
+and distinguishes each terminal condition.
+
+### Configuration (viper)
+
+Precedence: **explicit flag > environment > config file > built-in default.**
+
+| Setting | Env override | Default |
+|---|---|---|
+| socket | `PI_SUPERVISOR_SOCK`, `PI_SUPERVISOR_SOCKET` | `$XDG_RUNTIME_DIR/pi-supervisor.sock` |
+| config file | `PI_SUPERVISOR_CONFIG` | `~/.config/pi-supervisor/config.yaml` |
+
+A missing config file is not an error — every value has an env or default
+fallback, so the daemon runs with no config at all.
+
+### Shell completion
+
+Completion is **part of the install**: `install/install.sh` runs
+`pi-supervisor completion install`, which detects every supported shell on
+PATH — bash, zsh, fish, powershell, with the login shell `$SHELL` always
+first — generates that shell's script, writes it to the conventional
+completion directory, and appends an **idempotent, marker-guarded** block to
+the rc file where the shell does not auto-load. Re-running never duplicates
+the block; remove it by deleting the `# >>> pi-supervisor completion >>>`
+section.
+
+```bash
+pi-supervisor completion install    # detect + install for every shell found
+pi-supervisor completion bash       # print one script to stdout (also zsh,
+                                    #   fish, powershell) for manual sourcing
+```
+
+Completion offers real job names (read from `~/.pi/supervisor/jobs/*.json`,
+never from the daemon, so tab-completion can never block) and every flag, so
+`pi-supervisor steer --inter<TAB>` completes to `--interrupt`.
+
+`PI_SUPERVISOR_COMPLETION_HOME` retargets every completion/rc path, which is
+how the tests exercise the install without touching the real home.
+
 ## Architecture
 
 The daemon spawns `pi --mode rpc` **directly** — no Python. `internal/client`
@@ -102,6 +164,13 @@ systemd (Type=notify, WatchdogSec=120)
   (bounded by the job's `timeout_s`, default ~20s) and exits non-zero unless
   pi took the frame. `-n` skips the wait and reports only `written`. See
   ADR-0005.
+- **Interrupting a steer:** `-i`/`--interrupt` first SIGINTs pi's process
+  group (`-pid`), so the turn already in flight is asked to stop and this steer
+  is what pi picks up next; the report then carries an extra `interrupt` line
+  saying the signal was sent. `interrupted` means *sent*, never *obeyed* — the
+  ack outcome stays the source of truth for delivery. If the SIGINT cannot be
+  delivered, the steer fails loudly and writes NO frame rather than silently
+  degrading to a queued one. A plain steer never signals. See ADR-0007.
 - **State:** `~/.pi/supervisor/state/<name>.json`, written atomically
   (temp + fsync + rename). Daemon restarts adopt jobs as resumable
   (`stopped`), never auto-running.

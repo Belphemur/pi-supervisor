@@ -33,6 +33,15 @@ echo "==> enabling service"
 systemctl --user daemon-reload
 systemctl --user enable --now pi-supervisor.service
 
+# Shell completion is part of the install (ADR-0008): detect every shell on
+# PATH (bash/zsh/fish/powershell) and wire it. Idempotent — the guarded rc
+# block is only added once, and re-running never duplicates it. Non-fatal: a
+# headless box with no shell to configure must still install the daemon.
+echo "==> shell completion"
+if ! "${BIN_DIR}/pi-supervisor" completion install; then
+    echo "    completion install skipped (no supported shell on PATH?)"
+fi
+
 echo "==> verification"
 sleep 2
 systemctl --user is-active pi-supervisor.service
