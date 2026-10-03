@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.1.0
+version: 1.2.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -62,6 +62,7 @@ pi-supervisor watch <name> -t    # exit only when the run is over (done/fatal/st
 
 # Shell completion (idempotent; detects bash/zsh/fish/powershell on PATH)
 pi-supervisor completion install
+pi-supervisor version                    # shows the build-time git commit (ADR-0009)
 pi-supervisor --help              # cobra: per-command help for every subcommand
 ```
 
@@ -116,6 +117,19 @@ pi-supervisor completion install    # detect + install for every shell found
 pi-supervisor completion bash       # print one script to stdout (also zsh,
                                     #   fish, powershell) for manual sourcing
 ```
+
+### Version
+
+The CLI is versioned by the git commit it was built from (ADR-0009).
+`install.sh` injects the short commit id at link time; a plain `go build`
+without `-ldflags` reports `dev`.
+
+```bash
+pi-supervisor version    # "pi-supervisor f967040" on an installed binary
+```
+
+The version is also queryable programmatically via `internal/version` for
+anything embedding the supervisor package.
 
 Completion offers real job names (read from `~/.pi/supervisor/jobs/*.json`,
 never from the daemon, so tab-completion can never block) and every flag, so

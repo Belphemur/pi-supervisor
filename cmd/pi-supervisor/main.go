@@ -30,6 +30,7 @@ import (
 	"pi-supervisor/internal/job"
 	"pi-supervisor/internal/notify"
 	"pi-supervisor/internal/supervisor"
+	"pi-supervisor/internal/version"
 )
 
 // Exit codes, kept as named constants because the test suite asserts on them.
@@ -67,6 +68,7 @@ func socketPath() string {
 // fallback.
 func initConfig() {
 	viper.SetDefault("socket", "")
+	viper.SetDefault("version", "dev") // overridden by -ldflags -X at release build
 	if v := os.Getenv("PI_SUPERVISOR_SOCKET"); v != "" {
 		viper.SetDefault("socket", v)
 	}
@@ -406,6 +408,7 @@ func newRootCmd() *cobra.Command {
 		newLogsCmd(),
 		newReloadCmd(),
 		newWatchCmd(),
+		newVersionCmd(),
 		newCompletionCmd(root),
 	)
 	return root
@@ -534,6 +537,25 @@ func newWatchCmd() *cobra.Command {
 	}
 	c.Flags().BoolVarP(&terminal, "terminal", "t", false, "keep streaming after non-terminal events")
 	return c
+}
+
+// newVersionCmd prints the build-time version (ADR-0009). The version is
+// injected at link time by -ldflags="-X internal/version.ver=<commit>";
+// without injection it reads "dev", so a plain `go build` is still identified.
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the pi-supervisor version",
+		Long: "pi-supervisor is versioned by the git commit it was built from\n" +
+			"(" + viper.GetString("version") + "). When built from a clean tree,\n" +
+			"this prints that commit id; a developer `go build` without -ldflags\n" +
+			"prints 'dev'.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			fmt.Println("pi-supervisor", version.Version())
+			return nil
+		},
+	}
 }
 
 // completeJobNames offers known job names (from ~/.pi/supervisor/jobs/*.json)

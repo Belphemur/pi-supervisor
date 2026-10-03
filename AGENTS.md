@@ -10,12 +10,16 @@ Unix socket.
 
 | Path | Role |
 |---|---|
-| `cmd/pi-supervisor/main.go` | Cobra entry: `run` (daemon) + ctl subcommands (status/start/stop/steer/logs/reload/watch) + `completion install` |
+| `cmd/pi-supervisor/main.go` | Cobra entry: `run` (daemon) + ctl subcommands (status/start/stop/steer/logs/reload/watch/version) + `completion install` |
 | `cmd/pi-supervisor/completion.go` | Shell-completion install: detect bash/zsh/fish/powershell on PATH, generate each script, append an idempotent marker-guarded block to the rc file (ADR-0008) |
 | `internal/notify/sd.go` | Pure-Go `sd_notify`: `READY=1`, `STOPPING=1`, and `Beat()` which pairs `WATCHDOG=1` with `STATUS=<n> parallel pi session(s) running`. No cgo. |
 | `internal/job/job.go` | Job model (`~/.pi/supervisor/jobs/*.json`), state persistence, session discovery, run-log helpers, steer ack model (`job.Ack`, `job.AckRecord`, `job.SteerReport`) |
 | `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering (with per-frame acks), abort-drain handshake, timeout/abort/reap escalation. No Python. |
-| `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard, `Steer` (frame + ack wait, ADR-0005) |
+| `internal/version/version.go` | Build-time version string; injected via `-ldflags -X .../version.ver=<commit>` by install.sh, falls back to `dev` (ADR-0009) |
+| `internal/supervisor/interrupt_test.go` | Real process-group SIGINT deliverability test |
+| `internal/control/control_test.go` | fakeHandler 4-arg Steer + interrupt-flows-to-handler tests |
+| `cmd/pi-supervisor/version_cli_test.go` | `pi-supervisor version` offline CLI test |
+| `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard, `Steer` (frame + ack wait, ADR-0005), `interruptPID` (SIGINT group, ADR-0007) |
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
 | `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap. Same tail scrapes the round's GitHub PR URL (ADR-0006) |
 | `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
@@ -90,7 +94,8 @@ gofmt -l .                                         # must print nothing
 GOTOOLCHAIN=auto go test ./... -race              # -race is not optional
 /home/balor/go/bin/golangci-lint run ./...        # must exit 0 (v2.14.0)
 pi-supervisor completion install               # detect+install shell completion (idempotent)
-GOTOOLCHAIN=auto go build -o pi-supervisor ./cmd/pi-supervisor
+GOTOOLCHAIN=auto go build -ldflags="-X pi-supervisor/internal/version.ver=$(git rev-parse --short HEAD)" -o pi-supervisor ./cmd/pi-supervisor
+pi-supervisor version                              # prints the commit id (dev if unlinked)
 ./install/install.sh                              # build + unit + skill symlink + enable
 systemctl --user status pi-supervisor             # active (running) = READY accepted
 pi-supervisor status                              # ctl over the socket

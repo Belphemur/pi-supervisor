@@ -12,7 +12,9 @@ SKILL_LINK_DIR="${HOME}/.hermes/skills/autonomous-ai-agents"
 SKILL_SRC="${REPO_DIR}/doc/skill"
 
 echo "==> building (Go toolchain per go.mod)"
-( cd "$REPO_DIR" && GOTOOLCHAIN=auto go build -trimpath -ldflags="-s -w" \
+GIT_REV="$(cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null || echo dev)"
+( cd "$REPO_DIR" && GOTOOLCHAIN=auto go build -trimpath \
+    -ldflags="-s -w -X pi-supervisor/internal/version.ver=${GIT_REV}" \
     -o "${BIN_DIR}/pi-supervisor" ./cmd/pi-supervisor )
 
 echo "==> unit file"
