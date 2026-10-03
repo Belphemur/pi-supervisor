@@ -293,6 +293,26 @@ Behavior:
 - Never run the RPC client in a foreground tool call — the timeout kills it
   mid-turn. The daemon exists to make this moot.
 - One steer = one coherent directive block; never re-send the whole brief.
+
+### Live real-pi validation pitfalls
+
+When writing a test that drives a real `pi` session through the real
+supervisor path (the only way to prove the marker detector sees what pi
+actually emits, not what the fixtures assume it emits):
+
+- **`testEnv()` starves pi of credentials.** Redirecting `HOME` to a temp dir
+  strips the real pi config + auth, so a real `pi` exits immediately without
+  writing a transcript — a failure that is indistinguishable from the bug
+  under test. Isolate via a private worktree + a namespaced job name; do NOT
+  set a temp HOME, and do NOT use the seeded-resume path.
+- **`t.Setenv` / `testEnv` is for unit fixtures, not integration.** The live
+  test must call pi's real config dir and the real daemon socket; treat the
+  real `$HOME` as part of the harness.
+- **Prefer a true LAUNCH round over a seeded resume.** A seeded-resume path
+  makes pi write the transcript into a session `FindSession` cannot discover,
+  so the round completes with 0 bytes visible — again, structurally identical
+  to the completion-gate bug. A real LAUNCH is the only shape that exercises
+  the eager+`lazy` watcher resolution.
 - **Steering blocks, it does not queue.** `steer` waits for the client's ack
   (bounded by the job's `timeout_s`, default ~20s) and exits non-zero unless
   pi took the frame; `-n` skips the wait and reports only `written`. A steer
