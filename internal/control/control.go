@@ -24,6 +24,7 @@ type Handler interface {
 	Steer(name, text string, noWait, interrupt bool) (job.SteerReport, error)
 	Logs(name string, n int) ([]string, error)
 	Reload() error
+	Restart(name string) error
 }
 
 // Watcher is the optional push extension: cmd "watch" streams events to the
@@ -48,6 +49,10 @@ type Request struct {
 	// stop and the steer becomes the next thing pi works on. The daemon
 	// reports whether the signal was sent; whether pi obeys is pi's call.
 	Interrupt bool `json:"interrupt,omitempty"`
+	// Fresh (restart --fresh) asks the daemon to quarantine the live session
+	// transcript and start a brand-new one rather than re-adopting the old
+	// one. Only meaningful for the "restart" command (ADR-0010).
+	Fresh bool `json:"fresh,omitempty"`
 }
 
 // Response is the single reply.
@@ -181,6 +186,20 @@ func dispatch(h Handler, raw []byte) Response {
 		return Response{OK: true}
 	case "stop":
 		if err := h.Stop(req.Job); err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{OK: true}
+	case "restart":
+		if req.Fresh {
+			if err := h.Restart(req.Job); err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			return Response{OK: true}
+		}
+		if err := h.Stop(req.Job); err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		if err := h.Start(req.Job); err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true}

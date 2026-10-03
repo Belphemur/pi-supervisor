@@ -42,6 +42,9 @@ type Detector struct {
 	ciMode     bool          // armed by a CI/review marker in recent content
 	marker     string        // most recent matched text
 	prURL      string        // first PR URL seen since the detector was created
+	// Empty-turn stall bookkeeping (ADR-0010).
+	lastGrowthSize int64 // file size at the last empty-turn evaluation
+	toolCalls      int   // tool_use markers seen since the last empty-turn evaluation
 }
 
 // New starts detection at the file's current end, so historical content (the
@@ -51,7 +54,10 @@ func New(path string, idle time.Duration) *Detector {
 	if fi, err := os.Stat(path); err == nil {
 		size = fi.Size()
 	}
-	return &Detector{path: path, offset: size, size: size, lastGrowth: time.Now(), idle: idle}
+	return &Detector{
+		path: path, offset: size, size: size, lastGrowth: time.Now(),
+		lastGrowthSize: size, idle: idle,
+	}
 }
 
 // Poll reads any new JSONL content and evaluates the stall condition:
@@ -94,6 +100,9 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 						d.prURL = string(m)
 					}
 				}
+				// Count tool invocations in this slice so EmptyTurn can tell
+				// "streaming prose" from "wedged with no tool call" (ADR-0010).
+				d.toolCalls += len(toolUseRe.FindAll(buf, -1))
 				if m := ciRe.Find(buf); len(m) > 0 {
 					d.ciMode = true
 					d.marker = string(m)
@@ -111,3 +120,61 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 // PRURL is the first pull-request URL seen in the transcript since New, or ""
 // if the agent has not linked one (ADR-0006).
 func (d *Detector) PRURL() string { return d.prURL }
+
+// EmptyTurnWindow is the quiet window that turns "alive but producing nothing"
+// into an empty-turn stall (ADR-0010): the transcript grew, but the agent
+// emitted no assistant text and no tool_use for the whole window, which the
+// lowpower-stats campaign showed can burn a full timeout_s with zero progress
+// and no error signal.
+type EmptyTurnWindow struct {
+	// Idle is how long the transcript may stay under MinGrowth bytes without a
+	// tool call before the round is classified as an empty-turn stall.
+	Idle time.Duration
+	// MinGrowth is the byte threshold that still counts as "no progress".
+	MinGrowth int64
+}
+
+// toolUseRe matches a tool invocation in a transcript line. Counted over the
+// raw JSONL so it survives schema drift: any "tool_use" type marker counts.
+var toolUseRe = regexp.MustCompile(`"tool_use"|"toolu_` + "`" + `|tool_use_id`)
+
+// EmptyTurn reports whether the round is stalled on an empty turn: the
+// transcript has not grown by MinGrowth bytes for Idle, AND no tool_use has
+// been seen in that same window. Growth without a tool call is normal work
+// (the model is streaming text), so both conditions must hold — that pairing
+// is what separates "thinking" from "wedged".
+func (d *Detector) EmptyTurn(w EmptyTurnWindow) (stalled bool, quietFor time.Duration) {
+	if w.Idle <= 0 {
+		w.Idle = 60 * time.Second
+	}
+	if w.MinGrowth <= 0 {
+		w.MinGrowth = 1
+	}
+	// Re-stat rather than trusting the last Poll: this is an independent
+	// question ("is the round producing anything at all?") and must not
+	// silently answer from a stale snapshot.
+	size := d.size
+	if fi, err := os.Stat(d.path); err == nil {
+		size = fi.Size()
+		if size > d.size {
+			d.lastGrowth = time.Now()
+			d.size = size
+		}
+	}
+	quiet := time.Since(d.lastGrowth)
+	if quiet < w.Idle {
+		return false, quiet
+	}
+	// Growth inside the window: the agent IS producing, whatever it is. Only a
+	// transcript frozen below the threshold can be an empty turn.
+	if size-d.lastGrowthSize >= w.MinGrowth {
+		d.lastGrowthSize = size
+		return false, quiet
+	}
+	if d.toolCalls > 0 {
+		d.toolCalls = 0
+		d.lastGrowthSize = size
+		return false, quiet
+	}
+	return true, quiet
+}

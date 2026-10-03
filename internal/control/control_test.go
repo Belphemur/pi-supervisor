@@ -63,6 +63,9 @@ func (f *fakeHandler) StatusAll() any {
 
 func (f *fakeHandler) Start(name string) error { return f.record("start:" + name) }
 func (f *fakeHandler) Stop(name string) error  { return f.record("stop:" + name) }
+func (f *fakeHandler) Restart(name string) error {
+	return f.record("restart:" + name)
+}
 func (f *fakeHandler) Steer(name, text string, noWait, interrupt bool) (job.SteerReport, error) {
 	if err := f.record(fmt.Sprintf("steer:%s:%s:%t:%t", name, text, noWait, interrupt)); err != nil {
 		return job.SteerReport{Job: name}, err
@@ -182,6 +185,8 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 		{"status one", `{"cmd":"status","job":"a"}`, true, ""},
 		{"start", `{"cmd":"start","job":"a"}`, true, ""},
 		{"stop", `{"cmd":"stop","job":"a"}`, true, ""},
+		{"restart (no fresh)", `{"cmd":"restart","job":"a"}`, true, ""},
+		{"restart (fresh)", `{"cmd":"restart","job":"a","fresh":true}`, true, ""},
 		{"steer", `{"cmd":"steer","job":"a","text":"go left"}`, true, ""},
 		{"logs", `{"cmd":"logs","job":"a","n":2}`, true, ""},
 		{"logs default n", `{"cmd":"logs","job":"a"}`, true, ""},
@@ -205,7 +210,8 @@ func TestDispatchRoutesEveryCommand(t *testing.T) {
 	// The handler actually saw each routed call. The three malformed/unknown
 	// requests are rejected by dispatch itself and never reach the handler.
 	want := []string{
-		"statusall", "status:a", "start:a", "stop:a", "steer:a:go left:false:false",
+		"statusall", "status:a", "start:a", "stop:a",
+		"stop:a", "start:a", "restart:a", "steer:a:go left:false:false",
 		"logs:a:2", "logs:a:0", "reload",
 	}
 	got := h.seen()
@@ -259,6 +265,7 @@ func TestDispatchPropagatesHandlerErrors(t *testing.T) {
 	h.failOn["start:a"] = boom
 	h.failOn["status:a"] = boom
 	h.failOn["stop:a"] = boom
+	h.failOn["restart:a"] = boom
 	h.failOn["steer:a:x:false:false"] = boom
 	h.failOn["logs:a:3"] = boom
 	h.failOn["reload"] = boom
@@ -269,6 +276,7 @@ func TestDispatchPropagatesHandlerErrors(t *testing.T) {
 		`{"cmd":"start","job":"a"}`,
 		`{"cmd":"status","job":"a"}`,
 		`{"cmd":"stop","job":"a"}`,
+		`{"cmd":"restart","job":"a"}`,
 		`{"cmd":"steer","job":"a","text":"x"}`,
 		`{"cmd":"logs","job":"a","n":3}`,
 		`{"cmd":"reload"}`,

@@ -85,6 +85,25 @@ Unix socket.
    The CLI is cobra + viper; viper binds config as flag > `PI_SUPERVISOR_*` env >
    `~/.config/pi-supervisor/config.yaml` > default. `completion install` only
    ever APPENDS an idempotent marker-guarded block to an rc file; never clobber.
+12. **`restart --fresh` is the only sanctioned way to drop a session (ADR-0010).**
+   Stop → quarantine (`_archived-stale/<stem>_<ts>.jsonl`, move-only, bytes
+   preserved) → clear `session_path` + reset `Round` → relaunch LAUNCH with
+   brief+cont read from disk. The quarantine TARGET being a subdirectory is what
+   makes re-discovery structurally unable to re-adopt it (`FindSession` skips
+   dirs) — don't "simplify" `job.Quarantine` to write in place. `restart` without
+   `--fresh` is a plain stop+start. Never hand-move the JSONL or delete the state
+   file to force a fresh start.
+13. **Empty-turn stall needs BOTH conditions (ADR-0010).** `stall.EmptyTurn`
+   fires only when the transcript is frozen AND zero `tool_use` markers were
+   seen in the window — growth without a tool call is the model streaming prose,
+   which is normal work. One `empty_turn` event, then escalation on the
+   `ci_stall` abort+prompt path. Window = `empty_turn_idle_s` (default 60s).
+14. **A steer `consumed` ack is deliberately absent (ADR-0010).** The ctrl file
+   is read by the supervisor's own client goroutine, not pi, so no observable
+   event distinguishes "pi buffered it" from "pi is parked in a CI poll". A
+   `consumed` ack derived from the ctrl reader's offset would be true by
+   construction — exactly the false-delivery signal ADR-0005 exists to kill. Use
+   `steer --interrupt` instead. Don't add one.
 
 ## Build / test / install
 

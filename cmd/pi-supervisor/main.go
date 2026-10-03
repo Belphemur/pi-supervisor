@@ -385,7 +385,8 @@ func newRootCmd() *cobra.Command {
 		Long: "pi-supervisor runs as a systemd --user daemon that spawns/resumes\n" +
 			"pi RPC rounds, monitors sessions, and answers queries over a\n" +
 			"Unix socket. This CLI is the control surface: run the daemon\n" +
-			"(`run`) or query/steer it (status/start/stop/steer/logs/watch).",
+			"(`run`) or query/steer it (status/start/stop/restart/steer/logs/watch).\n" +
+			"Use `restart --fresh` to discard a poisoned session and start anew.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		// No subcommand = usage-class failure, as before the cobra migration.
@@ -404,6 +405,7 @@ func newRootCmd() *cobra.Command {
 		newStatusCmd(),
 		newJobCmd("start"),
 		newJobCmd("stop"),
+		newRestartCmd(),
 		newSteerCmd(),
 		newLogsCmd(),
 		newReloadCmd(),
@@ -441,6 +443,26 @@ func newStatusCmd() *cobra.Command {
 			return sendCTL(req)
 		},
 	}
+}
+
+// newRestartCmd implements `pi-supervisor restart <job> [--fresh]` (ADR-0010).
+// Without --fresh it's a plain stop+start (resume the same session). With
+// --fresh the daemon quarantines the transcript and starts a brand-new one.
+func newRestartCmd() *cobra.Command {
+	var fresh bool
+	c := &cobra.Command{
+		Use:               "restart <job>",
+		Short:             "Restart a job (stop then start, or start fresh with --fresh)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeJobNames,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return sendCTL(control.Request{Cmd: "restart", Job: args[0], Fresh: fresh})
+		},
+	}
+	c.Flags().BoolVar(&fresh, "fresh", false,
+		"quarantine the current session transcript and start a brand-new one "+
+			"(round counter resets, brief+cont re-read from disk)")
+	return c
 }
 
 func newJobCmd(verb string) *cobra.Command {

@@ -274,6 +274,66 @@ func (s *Supervisor) Stop(name string) error {
 	return nil
 }
 
+// Restart performs an atomic fresh restart (restart --fresh, ADR-0010):
+//
+//  1. Stop the live round (SIGTERM→SIGKILL with 3s grace), waiting for the
+//     pi process group to be fully reaped — never returns while pi survives.
+//  2. Quarantine the session JSONL → _archived-stale/ with a timestamp
+//     suffix (preserves the audit trail; bytes preserved by os.Rename).
+//  3. Clear the job's session_path + round counter in state, so the next
+//     round LAUNCHes a brand-new session instead of re-adopting the old one.
+//  4. Start a fresh round (spawns pi with a new session, brief + cont read
+//     from disk at spawn time).
+//
+// The whole sequence is guarded under r.mu for steps 2-3 so FindSession cannot
+// observe a half-quarantined state and re-adopt the file between steps.
+func (s *Supervisor) Restart(name string) error {
+	if err := s.Stop(name); err != nil {
+		// "not running" is not a stop failure for a restart — proceed to
+		// clear state and start fresh.
+		if !strings.Contains(err.Error(), "not running") {
+			return fmt.Errorf("restart %s: stop: %w", name, err)
+		}
+	}
+	s.mu.Lock()
+	r, ok := s.jobs[name]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("unknown job %q", name)
+	}
+	r.mu.Lock()
+	r.state.Round = 0
+	oldSession := r.job.SessionPath
+	r.job.SessionPath = ""
+	adopted := r.job
+	state := r.state
+	r.mu.Unlock()
+	s.mu.Unlock()
+
+	// Quarantine the old transcript out of the live session set.
+	var qPath string
+	var qErr error
+	if oldSession != "" {
+		qPath, qErr = job.Quarantine(oldSession)
+	}
+	// Clear persisted state so the round counter restarts and FindSession
+	// sees no session (forces a fresh LAUNCH). save atomically.
+	if err := job.SaveState(name, state); err != nil {
+		return fmt.Errorf("restart %s: persist state: %w", name, err)
+	}
+	if err := job.Save(adopted); err != nil {
+		return fmt.Errorf("restart %s: persist job: %w", name, err)
+	}
+	if qErr != nil {
+		return fmt.Errorf("restart %s: quarantine %s: %w", name, oldSession, qErr)
+	}
+	s.logf(name, "restart --fresh: quarantined %s -> %s, round reset to 0", oldSession, qPath)
+	s.emit(name, "restart_fresh", 0, 0, 0, "",
+		"fresh restart: quarantined %s, round counter reset", qPath)
+
+	return s.Start(name)
+}
+
 // Steer sends one control frame to a live round and reports what pi did with
 // it (ADR-0005). Prose is wrapped in a prompt frame; a caller-supplied JSON
 // frame is passed through unchanged. The write is only a request: the real
@@ -536,9 +596,16 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				defer close(watchExited)
 				s.watchCIStalls(r, sess, round, watchStop, stopCh)
 			}()
+			emptyStop, emptyExited := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(emptyExited)
+				s.watchEmptyTurn(r, sess, round, emptyStop, stopCh)
+			}()
 			rc, dur, runlogB = s.round(r, round, stopCh)
 			close(watchStop)
+			close(emptyStop)
 			<-watchExited // watcher stopped before the round is classified
+			<-emptyExited // empty-turn watcher likewise
 		} else {
 			rc, dur, runlogB = s.round(r, round, stopCh)
 		}
@@ -920,6 +987,75 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 			s.logf(name, "FATAL: CI review retry cap %d exceeded%s", capN, delivered)
 			s.emit(name, "fatal", round, 0, 0, "",
 				"CI review retry cap %d exceeded — review loop did not finish%s", capN, delivered)
+			return
+		}
+	}
+}
+
+// watchEmptyTurn detects the "alive but producing nothing" round that
+// otherwise burns the full timeout_s with no error signal (ADR-0010): the
+// transcript stays frozen and no tool call is seen for the whole window. It
+// emits an empty_turn event on the first detection and then escalates on the
+// same abort+prompt path as the CI-stall cap, so a wedged turn is interrupted
+// and re-prompted instead of waited out.
+func (s *Supervisor) watchEmptyTurn(r *runner, sess string, round int, watchStop, stopCh chan struct{}) {
+	r.mu.Lock()
+	idleS, name := r.job.EmptyTurnIdleS, r.job.Name
+	r.mu.Unlock()
+	if idleS <= 0 {
+		idleS = 60
+	}
+	d := stall.New(sess, time.Duration(idleS)*time.Second)
+	tick := time.Duration(idleS) * time.Second / 5
+	if tick < time.Second {
+		tick = time.Second
+	}
+	if tick > 15*time.Second {
+		tick = 15 * time.Second
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	reported := false
+	for {
+		select {
+		case <-watchStop:
+			return
+		case <-stopCh:
+			return
+		case <-t.C:
+			d.Poll() // keep the offset/PR/tool bookkeeping fresh
+			stalled, quiet := d.EmptyTurn(stall.EmptyTurnWindow{
+				Idle: time.Duration(idleS) * time.Second, MinGrowth: 1,
+			})
+			if !stalled {
+				continue
+			}
+			if !reported {
+				reported = true
+				s.logf(name, "round %d: empty-turn stall — transcript frozen %s, 0 tool calls", round, quiet.Round(time.Second))
+				s.emit(name, "empty_turn", round, 0, 0, "",
+					"empty turn: no transcript growth and no tool call for %s", quiet.Round(time.Second))
+				continue
+			}
+			// Second consecutive empty window: the round is wedged, not slow.
+			// Same escalation as the CI-stall cap: abort + re-prompt, and tell
+			// the round's caller why.
+			msg := "empty-turn stall detected twice (" +
+				quiet.Round(time.Second).String() + " of no transcript growth and no tool call). " +
+				"Stop waiting and act: summarize the current state, commit whatever is complete, " +
+				"and write the final report. If you are blocked, say exactly what you are blocked on."
+			err := s.interruptWith(name, msg)
+			delivered := "; agent re-prompted"
+			if err != nil {
+				delivered = "; RE-PROMPT NOT DELIVERED (" + err.Error() + ")"
+			}
+			r.mu.Lock()
+			r.state.LastDiag = "empty-turn stall — no progress" + delivered
+			r.mu.Unlock()
+			r.persistState()
+			s.logf(name, "round %d: empty-turn stall escalated%s", round, delivered)
+			s.emit(name, "empty_turn_escalated", round, 0, 0, "",
+				"empty-turn stall: round produced nothing twice in a row%s", delivered)
 			return
 		}
 	}

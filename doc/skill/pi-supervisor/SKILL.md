@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.2.0
+version: 1.3.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -63,6 +63,7 @@ pi-supervisor watch <name> -t    # exit only when the run is over (done/fatal/st
 # Shell completion (idempotent; detects bash/zsh/fish/powershell on PATH)
 pi-supervisor completion install
 pi-supervisor version                    # shows the build-time git commit (ADR-0009)
+pi-supervisor restart <job> --fresh     # discard a poisoned session, start a clean one (ADR-0010)
 pi-supervisor --help              # cobra: per-command help for every subcommand
 ```
 
@@ -185,6 +186,13 @@ systemd (Type=notify, WatchdogSec=120)
   ack outcome stays the source of truth for delivery. If the SIGINT cannot be
   delivered, the steer fails loudly and writes NO frame rather than silently
   degrading to a queued one. A plain steer never signals. See ADR-0007.
+- **Discarding a poisoned session:** `restart <job> --fresh` stops the round,
+  moves the transcript to `<session-dir>/_archived-stale/<stem>_<ts>.jsonl`
+  (move-only, bytes preserved), clears `session_path`, resets the round
+  counter, and relaunches with brief+cont re-read from disk. `restart` without
+  `--fresh` is a plain stop+start (same session). This is the supported
+  replacement for the old manual `mv` + `rm state` + `start` dance — do not do
+  that by hand, the daemon's sequence has no re-adoption window. See ADR-0010.
 - **State:** `~/.pi/supervisor/state/<name>.json`, written atomically
   (temp + fsync + rename). Daemon restarts adopt jobs as resumable
   (`stopped`), never auto-running.
@@ -258,7 +266,11 @@ Behavior:
 | Symptom | Meaning / action |
 |---|---|
 | job state `fatal`, diag "3 consecutive instant exits" | session context wall — start a fresh session (new job or clear state) or trim the session |
-| `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
+| job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |
+|| `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
+|| `start` after a stopped run silently resumes the OLD session (fresh-LAUNCH intent defeated) | **RESOLVED — use `pi-supervisor restart <job> --fresh`** (ADR-0010). It quarantines the transcript to `<dir>/_archived-stale/<stem>_<ts>.jsonl`, clears `session_path`, resets the round counter, and relaunches with brief+cont re-read from disk. (Pre-ADR-0010 you had to `mv` the JSONL out of the munged dir and clear the state file by hand; don't do that anymore — the daemon sequence has no re-adoption window.) |
+|| `steer` reports `forwarded` but pi never acted on it | ack `outcome: forwarded` is written when the control frame lands on disk, NOT when pi reads it; the control file is truncated at each round start, so a steer delivered while pi is parked in a CI/review poll (`gh pr checks --watch`) is wiped unread and the `forwarded` ack becomes a false positive. Wait until `status` shows a live round NOT polling CI, then re-send; if the round is in its polling window, use `steer --interrupt` so the current turn is dropped and pi reads the frame on the next prompt. |
+|| round is alive but `tool_use` stays 0 and `session_bytes` is frozen (pi pid alive, `Sl`, empty assistant turns) | empty-turn stall. **Now detected automatically** (ADR-0010): the first window emits an `empty_turn` event in `watch`; a second consecutive window escalates on the same abort+re-prompt path as `ci_stall`. Tune the window with `empty_turn_idle_s` in the job JSON (default 60s). |
 | ctl: "daemon not reachable" | `systemctl --user status pi-supervisor`; journal for socket errors |
 | `systemctl status` count is stale | the beat only rewrites STATUS when the count changes; a count that never moves means no round is ending |
 | `steer -i` says `interrupt requested but cannot SIGINT` | the pi group was already gone (round ended between your `status` and the steer). Nothing was written — check `status`, then re-send; if the round is genuinely running this is a real failure, not a silent no-op |

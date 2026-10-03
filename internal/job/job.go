@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -51,6 +52,11 @@ type Job struct {
 	// stall (default 300, 0 = default).
 	CIStallCap   int `json:"ci_stall_cap,omitempty"`
 	CIStallIdleS int `json:"ci_stall_idle_s,omitempty"`
+	// EmptyTurnIdleS is the quiet window (seconds) that turns "pi alive but
+	// the transcript frozen with zero tool calls" into an empty-turn stall
+	// (ADR-0010). 0 = the 60s default. Such a round otherwise burns the whole
+	// timeout_s producing nothing, with no error signal anywhere.
+	EmptyTurnIdleS int `json:"empty_turn_idle_s,omitempty"`
 }
 
 // Paths returns the per-job working files (compat with the bash supervisor's
@@ -402,4 +408,36 @@ func FindSession(name, worktree string) string {
 		}
 	}
 	return best
+}
+
+// Quarantine moves a session JSONL into a _archived-stale/ subdirectory of its
+// munged sessions dir, renaming it with a timestamp suffix so it is never
+// re-adopted by FindSession (which skips the _archived-stale subdir by
+// construction). The original bytes are preserved (os.Rename) and the new
+// path is returned. If the source file does not exist, Quarantine is a no-op
+// and returns "".
+func Quarantine(sessionPath string) (string, error) {
+	if sessionPath == "" || !Exists(sessionPath) {
+		return "", nil
+	}
+	dir := filepath.Dir(sessionPath)
+	base := filepath.Base(sessionPath)
+	qDir := filepath.Join(dir, "_archived-stale")
+	if err := os.MkdirAll(qDir, 0o755); err != nil {
+		return "", fmt.Errorf("quarantine mkdir %s: %w", qDir, err)
+	}
+	ts := time.Now().Format("2006-01-02T15-04-05")
+	// Guard against same-second collisions.
+	root := strings.TrimSuffix(base, filepath.Ext(base))
+	ext := filepath.Ext(base)
+	name := root + "_" + ts + ext
+	dest := filepath.Join(qDir, name)
+	for c := 1; Exists(dest); c++ {
+		name = fmt.Sprintf("%s_%s_%d%s", root, ts, c, ext)
+		dest = filepath.Join(qDir, name)
+	}
+	if err := os.Rename(sessionPath, dest); err != nil {
+		return "", fmt.Errorf("quarantine rename %s -> %s: %w", sessionPath, dest, err)
+	}
+	return dest, nil
 }
