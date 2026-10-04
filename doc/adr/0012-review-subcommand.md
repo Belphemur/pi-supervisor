@@ -77,7 +77,13 @@ POST /review/action
 
 POST /review/action
 {"action":"resolve_thread","thread_id":3904873498}
-  -> {"ok":true}
+  -> {"ok":true}        # 409 unless this round posted a reply on thread_id
+
+POST /review/action
+{"action":"bulk_resolve","pr":43,"scope":"ids","thread_ids":[...],
+ "reason":"<audit comment posted to the PR>"}
+  -> {"ok":true,"pending_human_ack":true,"threads":[...]}
+     # emits bulk_resolve_requested; daemon acts only after a peer ACKs
 ```
 
 The daemon authenticates the *call* by the live `review <job>` round it is bound
@@ -169,10 +175,11 @@ current round. Typed `go-githubv4` errors make the guard inescapable.
 **Q4 — Push detection: no-push is free.** Only pi-execution rounds consume
 `MaxRounds`.
 
-**Q5 — Pre-merge is a gate, never an action.** Full context:
+**Q5 — Pre-merge is a gate; bulk-close requires an audit comment.** Full
+context:
 
-The existing gate is `reply_review.py pre-merge --pr N`, which in the current
-skill does four things in order:
+The existing gate is `reply_review.py pre-merge --pr N`, which does four
+things in order:
 
 1. *(optional)* `wait` until CI green **and** threads resolved, or timeout;
 2. *(optional)* `close_all` — bulk-resolve every still-open thread, which
@@ -181,29 +188,25 @@ skill does four things in order:
    check is not passing (`neutral`/`skipped` count as passing);
 4. *(optional)* squash-merge via `PUT /repos/{owner}/{repo}/pulls/{n}/merge`.
 
-The review loop **inherits steps 1 and 3 only, and never passes
-`--auto-close` or `--merge`**:
+The review loop **inherits steps 1 and 3, and a guarded version of step 2**:
 
-- **No `--auto-close` (step 2).** That flag is exactly the behavior ADR-0012
-  §Q3 forbids: bulk-resolving threads the agent never answered. The loop's
-  resolve guard makes bulk-close structurally impossible — each thread must
-  carry its own agent reply in the round that closed it.
-- **No `--merge` (step 4).** The owner merges. Same contract as the existing
-  "final report + marker ⇒ done": the supervisor's job ends at "the PR is
-  ready", not "the PR is merged".
-- **Steps 1 and 3 become the loop's own exit condition.** The loop already
-  polls threads and CI every round (§2 `list_threads` returns `ci`), so
-  "0 open threads && CI pass" is the `done` classification, and the timeout
-  arm is `MaxRounds` rather than a wall-clock `wait`. The separate
-  `pre-merge --pr` invocation at the end of a campaign is therefore
-  *redundant* — the daemon already holds both facts.
+- **Step 2 becomes `bulk_resolve` (auditable, not silent).** The blind
+  `close_all`-assumes-answered behavior is forbidden — the Q3 guard on
+  `resolve_thread` already makes *per-thread* close require a reply. But
+  a deliberate `bulk_resolve` action is permitted **only if** it supplies
+  a `reason` that the daemon posts as a PR comment (thread IDs + why
+  closed), emits `bulk_resolve_requested`, and **waits for a peer ACK**
+  before firing the GraphQL mutations. So bulk-close is allowed, but never
+  silent and never autonomous.
+- **No `--merge` (step 4).** The owner merges. Same contract as "final
+  report + marker ⇒ done".
+- **Steps 1 and 3 become the loop's exit condition.** The daemon already
+  polls threads and CI each round; `"0 open threads && CI pass"` is the
+  `done` classification, and `MaxRounds` replaces the wall-clock `wait`.
+  A trailing `pre-merge --pr N` is redundant state the daemon holds.
 
-So the practical contract: **the daemon reports readiness; it never merges and
-never bulk-closes.** A human runs `pre-merge --pr N` (or merges directly) if
-they want the independent second opinion. If you would rather the loop keep
-a final explicit `pre-merge --pr N` call as a belt-and-braces check before
-classifying `done`, say so — it is cheap, but it re-introduces a `gh api`
-call outside the SDK surface and duplicates state the daemon already has.
+So: the daemon reports readiness, never merges, and only bulk-closes with
+an audit comment + a peer ACK — never silently or autonomously.
 
 ### 6. Auth posture
 
@@ -261,7 +264,9 @@ does not triage or author replies.
 - Per-round `--type acceptance|rebuttal`; both answer-and-resolve, so the
   daemon enforces a server-side guard: `resolve_thread` returns `409`
   unless the daemon recorded a `post_reply` on that thread from this job's
-  `gh` user in the current round — inescapable, typed via `go-githubv4`.
+  authenticated user in the current round — inescapable, typed via
+  `go-githubv4`. Bulk closes are a distinct `bulk_resolve` action gated on a
+  human peer ACK (`pi-supervisor ack --event <id>`), never silent.
 - `answer-code-review` skill is **retired for review jobs only**: replaced by
   `pi-supervisor review` + the `pi_supervisor_review` skill + the
   `_pi-supervisor-review` shim for the review shape. Non-review jobs are
