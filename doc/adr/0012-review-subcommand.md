@@ -80,10 +80,18 @@ POST /review/action
   -> {"ok":true}        # 409 unless this round posted a reply on thread_id
 
 POST /review/action
+{"action":"post_replies","pr":43,"round":3,
+ "replies":[{"thread_id":3904873498,"type":"acceptance","body":"..."},
+              {"thread_id":3904873512,"type":"rebuttal","body":"..."}]}
+  -> {"ok":true,"applied":[3904873498,3904873512],
+      "head_sha":"NEW","ci_changed":false}
+     # one LLM turn answers N threads, each with its own body + classification
+
+POST /review/action
 {"action":"bulk_resolve","pr":43,"scope":"ids","thread_ids":[...],
  "reason":"<audit comment posted to the PR>"}
   -> {"ok":true,"pending_human_ack":true,"threads":[...]}
-     # emits bulk_resolve_requested; daemon acts only after a peer ACKs
+     # emits bulk_resolve_requested; daemon acts only after a peer ACK
 ```
 
 The daemon authenticates the *call* by the live `review <job>` round it is bound
@@ -166,11 +174,14 @@ ADR amendment, not a config edit.
 **Q2 — `--rounds 0`** = auto-derive (`ceil(open/12)`, capped). Default stays
 5 on explicit calls.
 
-**Q3 — Resolve guard: server-side (option A).** Both round types
-(`acceptance` and `rebuttal`) answer-and-resolve, so `resolve_thread` refuses
-with `409 already-resolved-without-reply` unless the daemon recorded a
-`post_reply` on that `thread_id` from this job's authenticated user in the
-current round. Typed `go-githubv4` errors make the guard inescapable.
+**Q3 — Resolve guard + batch reply: server-side (option A).** Both round
+types (`acceptance` and `rebuttal`) answer-and-resolve, so `resolve_thread`
+refuses with `409 already-resolved-without-reply` unless the daemon recorded
+a `post_replies` touching that `thread_id` in the current round. Replies go
+through `post_replies` — an array of `(thread_id, type, body)` tuples, so a
+single LLM turn answers N threads each with its own body and classification
+(acceptance/rebuttal). Typed `go-githubv4` errors make the guard
+inescapable.
 
 **Q4 — Push detection: no-push is free.** Only pi-execution rounds consume
 `MaxRounds`.
@@ -190,14 +201,15 @@ things in order:
 
 The review loop **inherits steps 1 and 3, and a guarded version of step 2**:
 
-- **Step 2 becomes `bulk_resolve` (auditable, not silent).** The blind
+- **Step 2 becomes `bulk_resolve` (LLM-gated, not autonomous).** The blind
   `close_all`-assumes-answered behavior is forbidden — the Q3 guard on
-  `resolve_thread` already makes *per-thread* close require a reply. But
-  a deliberate `bulk_resolve` action is permitted **only if** it supplies
-  a `reason` that the daemon posts as a PR comment (thread IDs + why
-  closed), emits `bulk_resolve_requested`, and **waits for a peer ACK**
-  before firing the GraphQL mutations. So bulk-close is allowed, but never
-  silent and never autonomous.
+  `resolve_thread` already makes *per-thread* close require an answer. But
+  a deliberate `bulk_resolve` action is permitted when the LLM judges
+  threads collectively out-of-scope or non-findings: it posts a PR comment
+  (thread IDs + reason), emits `bulk_resolve_requested`, and **waits for a
+  peer ACK** (`pi-supervisor ack --event <id>`) before firing the GraphQL
+  mutations. So bulk-close is LLM-*invoked* but human-*gated*, and never
+  silent.
 - **No `--merge` (step 4).** The owner merges. Same contract as "final
   report + marker ⇒ done".
 - **Steps 1 and 3 become the loop's exit condition.** The daemon already
