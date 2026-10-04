@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"pi-supervisor/internal/events"
+	"pi-supervisor/internal/fault"
 	"pi-supervisor/internal/job"
+	"pi-supervisor/internal/journal"
 )
 
 // Handler is the server-side interface the socket serves; the supervisor
@@ -126,18 +128,54 @@ func Serve(sockPath string, h Handler, stop chan struct{}) {
 			if err != nil && len(line) == 0 {
 				return
 			}
-			var req Request
-			if json.Unmarshal(line, &req) == nil && req.Cmd == "watch" {
+			// Decode the envelope once for routing and for the log's cmd/job
+			// fields. A decode failure is not fatal here: dispatch() is what
+			// reports it (bad_json), with cmd/job empty.
+			var env Request
+			_ = json.Unmarshal(line, &env)
+			if env.Cmd == "watch" {
 				if w, ok := h.(Watcher); ok {
-					serveWatch(c, h, w, req)
+					serveWatch(c, h, w, env)
 					return
 				}
-				writeOne(c, Response{OK: false, Error: "watch unsupported"})
+				resp := Response{OK: false, Error: "watch unsupported", Reason: string(fault.KindUnsupported)}
+				logResponse(env.Cmd, env.Job, resp)
+				writeOne(c, resp)
 				return
 			}
-			writeOne(c, dispatch(h, line))
+			resp := dispatch(h, line)
+			logResponse(env.Cmd, env.Job, resp)
+			writeOne(c, resp)
 		}(conn)
 	}
+}
+
+// logResponse records a refused request. One choke point in front of the
+// reply write means every non-OK response is logged exactly once, including
+// the paths that never reach dispatch (watch precheck, unsupported verbs),
+// and the reason comes from the response's fault kind rather than from
+// matching prose here.
+//
+// Level: a refusal means an operator (or a retrying LLM client) asked for
+// something impossible. WARN keeps it visible in `journalctl -p warning`
+// without putting routine misuse at error severity.
+func logResponse(cmd, jobName string, resp Response) {
+	if resp.OK {
+		return
+	}
+	reason := resp.Reason
+	if reason == "" {
+		reason = string(fault.KindRefused)
+	}
+	journal.Subsys("control").Warn("request_refused",
+		"cmd", cmd, "job", jobName, "reason", reason, "err", truncate(resp.Error, 200))
+}
+
+func truncate(s string, limit int) string {
+	if len(s) > limit {
+		return s[:limit] + "…"
+	}
+	return s
 }
 
 // writeOne writes one Response line; false = the client is gone.
@@ -161,7 +199,9 @@ func serveWatch(c net.Conn, h Handler, w Watcher, req Request) {
 	// Unknown-job guard: error out and close instead of blocking forever.
 	if req.Job != "" {
 		if _, err := h.Status(req.Job); err != nil {
-			writeOne(c, Response{OK: false, Error: err.Error()})
+			resp := Response{OK: false, Error: err.Error(), Reason: string(fault.KindOf(err))}
+			logResponse("watch", req.Job, resp)
+			writeOne(c, resp)
 			return
 		}
 	}
@@ -192,43 +232,51 @@ func serveWatch(c net.Conn, h Handler, w Watcher, req Request) {
 	}
 }
 
+// refuse builds a non-OK Response from a handler error, carrying the
+// error's fault kind as the machine-readable reason (see internal/fault).
+// The Error prose is unchanged, so the CLI's exit-code contract (ADR-0008)
+// is untouched — Reason is purely additive.
+func refuse(err error) Response {
+	return Response{OK: false, Error: err.Error(), Reason: string(fault.KindOf(err))}
+}
+
 func dispatch(h Handler, raw []byte) Response {
 	var req Request
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return Response{OK: false, Error: "bad json: " + err.Error()}
+		return Response{OK: false, Error: "bad json: " + err.Error(), Reason: string(fault.KindBadJSON)}
 	}
 	switch req.Cmd {
 	case "status":
 		if req.Job != "" {
 			data, err := h.Status(req.Job)
 			if err != nil {
-				return Response{OK: false, Error: err.Error()}
+				return refuse(err)
 			}
 			return Response{OK: true, Data: data}
 		}
 		return Response{OK: true, Data: h.StatusAll()}
 	case "start":
 		if err := h.Start(req.Job); err != nil {
-			return Response{OK: false, Error: err.Error()}
+			return refuse(err)
 		}
 		return Response{OK: true}
 	case "stop":
 		if err := h.Stop(req.Job); err != nil {
-			return Response{OK: false, Error: err.Error()}
+			return refuse(err)
 		}
 		return Response{OK: true}
 	case "restart":
 		if req.Fresh {
 			if err := h.Restart(req.Job); err != nil {
-				return Response{OK: false, Error: err.Error()}
+				return refuse(err)
 			}
 			return Response{OK: true}
 		}
 		if err := h.Stop(req.Job); err != nil {
-			return Response{OK: false, Error: err.Error()}
+			return refuse(err)
 		}
 		if err := h.Start(req.Job); err != nil {
-			return Response{OK: false, Error: err.Error()}
+			return refuse(err)
 		}
 		return Response{OK: true}
 	case "steer":
@@ -242,18 +290,18 @@ func dispatch(h Handler, raw []byte) Response {
 	case "logs":
 		data, err := h.Logs(req.Job, req.N)
 		if err != nil {
-			return Response{OK: false, Error: err.Error()}
+			return refuse(err)
 		}
 		return Response{OK: true, Data: data}
 	case "reload":
 		if err := h.Reload(); err != nil {
-			return Response{OK: false, Error: err.Error()}
+			return refuse(err)
 		}
 		return Response{OK: true}
 	case "review", "review_action", "ack":
 		return dispatchReview(h, raw)
 	default:
-		return Response{OK: false, Error: "unknown cmd " + req.Cmd}
+		return Response{OK: false, Error: "unknown cmd " + req.Cmd, Reason: string(fault.KindUnknownCmd)}
 	}
 }
 
@@ -294,11 +342,11 @@ func dispatchReview(h Handler, raw []byte) Response {
 	// it through JSON so internal types never leak into the wire format.
 	data, err := json.Marshal(out)
 	if err != nil {
-		return Response{OK: false, Error: err.Error()}
+		return refuse(err)
 	}
 	var generic any
 	if err := json.Unmarshal(data, &generic); err != nil {
-		return Response{OK: false, Error: err.Error()}
+		return refuse(err)
 	}
 	m, isMap := generic.(map[string]any)
 	if !isMap {

@@ -28,6 +28,7 @@ import (
 
 	"pi-supervisor/internal/control"
 	"pi-supervisor/internal/job"
+	"pi-supervisor/internal/journal"
 	"pi-supervisor/internal/notify"
 	"pi-supervisor/internal/supervisor"
 	"pi-supervisor/internal/version"
@@ -92,6 +93,9 @@ func runDaemon() {
 	sup := supervisor.New()
 	if err := sup.LoadJobs(); err != nil {
 		fmt.Fprintf(os.Stderr, "load jobs: %v\n", err)
+		journal.L().Error("jobs_load_failed", "err", err.Error())
+	} else {
+		journal.L().Info("jobs_loaded", "dir", job.JobsDir(), "count", len(sup.JobNames()))
 	}
 	stop := make(chan struct{})
 	go control.Serve(socketPath(), sup, stop)
@@ -100,21 +104,27 @@ func runDaemon() {
 	// wedge on a gate nobody will visit (ADR-0012 §2.3).
 	go sup.ExpireAcks(stop)
 	// One sd_notify beat carries both the watchdog ping and STATUS=<n>
-	// parallel pi session(s) running, visible in `systemctl status`.
-	go notify.Beat(stop, sup.RunningCount)
+	// parallel pi session(s) running, visible in `systemctl status`. The
+	// second return value appends the fatal-job note to that same line.
+	go notify.BeatStatus(stop, sup.StatusLine)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigCh
+		journal.L().Info("shutdown", "signal", "SIGTERM/SIGINT")
 		_ = notify.Send("STOPPING=1")
 		sup.Shutdown()
+		journal.L().Info("shutdown_complete")
 		os.Exit(0)
 	}()
 
 	if err := notify.Send("READY=1"); err != nil {
 		fmt.Fprintf(os.Stderr, "sd_notify READY: %v\n", err)
+		journal.L().Warn("notify_ready_failed", "err", err.Error())
 	}
+	// The human banner stays verbatim (external tooling and the lifecycle
+	// test key on its text); the journal line above is the queryable form.
 	fmt.Println("pi-supervisor ready at", socketPath())
 	select {} // loops run in goroutines
 }

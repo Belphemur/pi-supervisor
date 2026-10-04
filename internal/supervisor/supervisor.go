@@ -19,7 +19,9 @@ import (
 
 	"pi-supervisor/internal/client"
 	"pi-supervisor/internal/events"
+	"pi-supervisor/internal/fault"
 	"pi-supervisor/internal/job"
+	"pi-supervisor/internal/journal"
 	"pi-supervisor/internal/stall"
 )
 
@@ -231,16 +233,16 @@ func (s *Supervisor) Start(name string) error {
 	r, ok := s.jobs[name]
 	s.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("unknown job %q", name)
+		return fault.New(fault.KindUnknownJob, fmt.Errorf("unknown job %q", name))
 	}
 	r.mu.Lock()
 	if r.active {
 		r.mu.Unlock()
-		return fmt.Errorf("job %q already running", name)
+		return fault.New(fault.KindAlreadyRunning, fmt.Errorf("job %q already running", name))
 	}
 	if r.state.State == "done" {
 		r.mu.Unlock()
-		return fmt.Errorf("job %q already done; clear state to rerun", name)
+		return fault.New(fault.KindAlreadyDone, fmt.Errorf("job %q already done; clear state to rerun", name))
 	}
 	r.active = true
 	r.state.State = "running"
@@ -266,7 +268,7 @@ func (s *Supervisor) Stop(name string) error {
 	r, ok := s.jobs[name]
 	s.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("unknown job %q", name)
+		return fault.New(fault.KindUnknownJob, fmt.Errorf("unknown job %q", name))
 	}
 	r.mu.Lock()
 	active := r.active
@@ -286,7 +288,7 @@ func (s *Supervisor) Stop(name string) error {
 	pid := r.pid
 	r.mu.Unlock()
 	if !active {
-		return fmt.Errorf("job %q not running", name)
+		return fault.New(fault.KindNotRunning, fmt.Errorf("job %q not running", name))
 	}
 	r.persistState()
 	s.logf(name, "stop requested by operator (pid %d)", pid)
@@ -339,7 +341,7 @@ func (s *Supervisor) Restart(name string) error {
 	r, ok := s.jobs[name]
 	if !ok {
 		s.mu.Unlock()
-		return fmt.Errorf("unknown job %q", name)
+		return fault.New(fault.KindUnknownJob, fmt.Errorf("unknown job %q", name))
 	}
 	r.mu.Lock()
 	r.state.Round = 0
@@ -649,6 +651,8 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// happened, and Stop() reads this value when it writes the terminal
 		// state — without it, a stop during round 1 persists Round:0.
 		r.persistState()
+		s.logRound(j.Name, "round_start", round, 0, 0,
+			"round %d/%d", round, maxRounds)
 		if round == 1 {
 			s.emit(j.Name, "job_started", round, 0, 0, "", "round 1 launched")
 		}
@@ -1368,6 +1372,10 @@ func (s *Supervisor) interruptWith(name, text string) error {
 // emit records one lifecycle event (audit JSONL + live fan-out to watches).
 // info is printf-formatted for readable diagnostics. The job's worktree is
 // attached so a waking LLM can target verification at the right path.
+// emit is the single funnel every lifecycle transition already flows through,
+// so the journal line is emitted here rather than at ~40 call sites (DRY):
+// one call means the structured log cannot drift from the event stream.
+// emitJournal maps the event-stream vocabulary onto the log vocabulary.
 func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text, format string, args ...any) {
 	if len(text) > 200 {
 		text = text[len(text)-200:]
@@ -1386,10 +1394,51 @@ func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text
 		r.mu.Unlock()
 	}
 	s.mu.Unlock()
+	s.logEvent(jobName, event, round, rc, durS, info)
 	events.Emit(events.Event{
 		Job: jobName, Event: event, Round: round, RC: rc, DurS: durS,
 		Text: text, Info: info, Worktree: wt, SessionPath: sess, PRURL: pr,
 	})
+}
+
+// logEvent writes one structured line for a lifecycle transition. Level is
+// derived from the event: a failed or halted run must be visible in
+// `journalctl -p warning` without a filter, ordinary progress must not be.
+func (s *Supervisor) logEvent(jobName, event string, round, rc int, durS int64, info string) {
+	l := journal.Subsys("job")
+	args := []any{"job", jobName, "round", round, "rc", rc, "dur_s", durS, "detail", info}
+	switch event {
+	case "fatal", "review_exhausted", "review_gate_error":
+		l.Error(logEventName(event), args...)
+	case "stopped", "bulk_resolve_expired", "review_skipped":
+		l.Warn(logEventName(event), args...)
+	default:
+		l.Info(logEventName(event), args...)
+	}
+}
+
+// logRound writes a structured line for a non-transition round fact.
+func (s *Supervisor) logRound(jobName, event string, round, rc int, durS int64, format string, args ...any) {
+	journal.Subsys("job").Info(event, "job", jobName,
+		"round", round, "rc", rc, "dur_s", durS, "detail", fmt.Sprintf(format, args...))
+}
+
+// logEventName renames an event-stream verb to its log counterpart so the two
+// vocabularies stay recognizable without being identical.
+func logEventName(event string) string {
+	switch event {
+	case "job_started":
+		return "job_start"
+	case "round_done":
+		return "round_end"
+	case "done":
+		return "job_done"
+	case "fatal":
+		return "job_fatal"
+	case "stopped":
+		return "job_stopped"
+	}
+	return event
 }
 
 // Watch subscribes the caller to a job's lifecycle events ("" = all jobs).
@@ -1428,7 +1477,29 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 
 // RunningCount reports how many jobs are currently in a running round. Fed
 // to systemd as STATUS= on every watchdog beat.
+// JobNames lists the loaded job names, sorted. Used by the daemon's own
+// startup log line.
+func (s *Supervisor) JobNames() []string {
+	s.mu.Lock()
+	names := make([]string, 0, len(s.jobs))
+	for n := range s.jobs {
+		names = append(names, n)
+	}
+	s.mu.Unlock()
+	sort.Strings(names)
+	return names
+}
+
 func (s *Supervisor) RunningCount() int {
+	n, _ := s.StatusLine()
+	return n
+}
+
+// StatusLine is RunningCount plus a note for `systemctl status`: the names of
+// jobs whose state is fatal. "0 parallel pi session(s) running" on its own
+// says nothing about WHY the daemon is idle, and a fatal job is exactly the
+// thing an operator must notice without opening the logs.
+func (s *Supervisor) StatusLine() (int, string) {
 	s.mu.Lock()
 	runners := make([]*runner, 0, len(s.jobs))
 	for _, r := range s.jobs {
@@ -1436,14 +1507,23 @@ func (s *Supervisor) RunningCount() int {
 	}
 	s.mu.Unlock()
 	n := 0
+	var fatal []string
 	for _, r := range runners {
 		r.mu.Lock()
 		if r.active && r.state.State == "running" {
 			n++
 		}
+		if r.state.State == "fatal" {
+			fatal = append(fatal, r.job.Name)
+		}
 		r.mu.Unlock()
 	}
-	return n
+	note := ""
+	if len(fatal) > 0 {
+		sort.Strings(fatal)
+		note = "FATAL: " + strings.Join(fatal, ",")
+	}
+	return n, note
 }
 
 // statusList is the typed StatusAll used internally by Monitor.

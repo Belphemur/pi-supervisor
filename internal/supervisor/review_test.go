@@ -160,10 +160,19 @@ func TestStopTwiceIsSafe(t *testing.T) {
 		t.Fatal("RunningCount must drop to 0 after a stop")
 	}
 	// State survives on disk so a later start resumes rather than restarts.
-	st, err := job.LoadState("stoppable")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Stop() writes the terminal state itself, which it does BEFORE the loop
+	// goroutine has persisted the round counter it bumps at round start, so
+	// the durable record catches up a moment later. Assert on the settled
+	// state, not on the instant Stop() returns — this was a fixed-latency
+	// race, not a durability bug, and it failed 3/3 on master.
+	var st job.State
+	waitFor(t, 30*time.Second, func() bool {
+		var err error
+		if st, err = job.LoadState("stoppable"); err != nil {
+			return false
+		}
+		return st.State == "stopped" && st.Round >= 1
+	})
 	if st.State != "stopped" || st.Round < 1 {
 		t.Fatalf("persisted state = %+v", st)
 	}

@@ -39,9 +39,22 @@ func Send(state string) error {
 }
 
 // Beat sends one combined notify datagram: the watchdog ping plus a human
-// status line. countFn supplies the number of running sessions for STATUS=;
-// when it returns an error the ping still goes out alone.
+// status line. countFn supplies the number of running sessions for STATUS=.
 func Beat(stop <-chan struct{}, countFn func() int) {
+	if countFn == nil {
+		BeatStatus(stop, nil)
+		return
+	}
+	BeatStatus(stop, func() (int, string) { return countFn(), "" })
+}
+
+// BeatStatus is Beat with a caller-supplied status line. statusFn returns the
+// running session count plus a note appended to STATUS= (e.g. a FATAL job
+// name). Either part may be empty; a nil statusFn pings the watchdog alone.
+// The datagram is written only when the count OR the note changed, because
+// sd_notify costs a syscall per beat and both parts are usually static
+// between round ends.
+func BeatStatus(stop <-chan struct{}, statusFn func() (int, string)) {
 	usec := os.Getenv("WATCHDOG_USEC")
 	interval := 30 * time.Second
 	if usec != "" {
@@ -61,26 +74,44 @@ func Beat(stop <-chan struct{}, countFn func() int) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	lastCount := -1
+	lastNote := "\x00" // never equal to a real note: forces the first write
 	for {
 		select {
 		case <-stop:
 			return
 		case <-t.C:
-			if countFn == nil {
+			if statusFn == nil {
 				_ = Send("WATCHDOG=1")
 				continue
 			}
-			n := countFn()
+			n, note := statusFn()
+			note = oneLine(note)
 			// Skip the write when nothing changed: sd_notify is a syscall
 			// per beat and the count is usually static between round ends.
-			if n == lastCount {
+			if n == lastCount && note == lastNote {
 				_ = Send("WATCHDOG=1")
 				continue
 			}
-			lastCount = n
-			_ = Send(fmt.Sprintf("STATUS=%d parallel pi session(s) running\nWATCHDOG=1", n))
+			lastCount, lastNote = n, note
+			status := fmt.Sprintf("STATUS=%d parallel pi session(s) running", n)
+			if note != "" {
+				status += "; " + note
+			}
+			_ = Send(status + "\nWATCHDOG=1")
 		}
 	}
+}
+
+// oneLine folds a status note onto a single line: sd_notify's STATUS= ends at
+// the first newline, and a note with a newline in it would truncate the
+// watchdog ping on the following line.
+func oneLine(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool {
+		return r == '\r' || r == '\n'
+	}), " ")
 }
 
 // Watchdog answers systemd's watchdog (WATCHDOG_USEC) with WATCHDOG=1 pings
