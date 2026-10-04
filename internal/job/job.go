@@ -434,34 +434,7 @@ func LastLines(path string, n int) ([]string, error) {
 // The floor is the structural fix: a file that existed before this round
 // launched cannot be this round's session, so it is not a candidate at all.
 func FindSession(name, worktree string, notBefore time.Time) string {
-	dir := MungedSessionsDir(worktree)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	var best string
-	var bestMod time.Time
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		// Reject anything that predates the launch. Allow a small clock/
-		// filesystem-granularity slack: pi may create the file in the same
-		// filesystem tick as the spawn, and an exact comparison would reject
-		// the very transcript we are looking for.
-		if !notBefore.IsZero() && fi.ModTime().Before(notBefore.Add(-sessionScanSlack)) {
-			continue
-		}
-		if best == "" || fi.ModTime().After(bestMod) {
-			best = filepath.Join(dir, e.Name())
-			bestMod = fi.ModTime()
-		}
-	}
-	return best
+	return dirScan(MungedSessionsDir(worktree), notBefore)
 }
 
 // sessionScanSlack absorbs filesystem timestamp granularity and clock skew
