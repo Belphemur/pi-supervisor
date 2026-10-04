@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed. Awaiting joint design discussion on the open questions in §5.
+Accepted. All design questions resolved (§5); ready for implementation.
+Blocking external prerequisite: the GitHub App install (task `t_57751a5a`).
 
 ## Context
 
@@ -34,9 +35,9 @@ decide based on what is seen, intervene.
 
 | Concern | Owner | Mechanism |
 |---|---|---|
-| **Outer loop** (poll GH → decide "one more pi round?" → enforce budget) | the daemon | `gh api` (read-only) + the round loop |
+| **Outer loop** (poll GH → decide "one more pi round?" → enforce budget) | the daemon | `go-github` reads + the round loop |
 | **Fix execution + triage** (read a thread, classify fix/explain/defer, reply, resolve, push) | pi, via the `pi_supervisor_review` skill + `_pi-supervisor-review` shim | shim → daemon control socket |
-| **Mutation surface** (post reply, resolve thread, push) | the daemon, as a server | `gh api` writes — but only when asked by the shim; the daemon never decides to |
+| **Mutation surface** (post reply, resolve thread, push) | the daemon, as a server | `go-githubv4` mutations — but only when asked by the shim; the daemon never decides to |
 
 The LLM does NOT shell out to `gh` directly anymore. For a review round the
 job brief includes the `pi_supervisor_review` skill, whose system prompt
@@ -83,53 +84,11 @@ The daemon authenticates the *call* by the live `review <job>` round it is bound
 to (a control-socket request outside a running review round is refused) —
 there is no user-facing auth on the shim because the shim runs *in* pi, the
 daemon already knows which job owns this round, and the socket is `0600`.
-Mutations are `gh api` writes; reads are `gh api` reads. All reuse the single
-`gh` token from `~/.config/gh/hosts.yml` (confirmed: `repo` + `workflow`
-scopes).
+Reads go through `go-github`; mutations through `go-githubv4` (§6).
 
 The shim is MCP-**less**: it speaks the daemon's JSON control protocol over
 the unix socket and the daemon does the GH calls. The daemon's GH auth is an
 internal detail that never reaches pi or the system prompt.
-
-### 6. Auth posture
-
-The daemon authenticates to GitHub in one of two ways, chosen per `Start`,
-in priority order:
-
-1. **GitHub App (preferred).** `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`
-   (a path or inline PEM) → the daemon signs a JWT with
-   `golang-jwt/jwt/v5` (`github.com/golang-jwt/jwt/v5`, the maintained
-   v4+ successor) and exchanges it for an installation token via
-   `go-github`'s `Apps.GetInstallationToken`. The token (1h TTL) is cached
-   and refreshed by `go-github`'s `InstallationTokenSource`, so there is no
-   hand-rolled refresh loop. The App is installed on the reviewed repos.
-2. **`gh` token fallback.** If the App env is absent, `Start` runs
-   `gh auth token` to obtain the active token (the *only* `gh` call in the
-   daemon's lifecycle — used purely for token acquisition); that token is
-   then passed to `go-github`/`githubv4` as a static token source. If
-   `gh auth token` fails, `Start` refuses (exit 1) with `GitHub auth
-   unavailable: run 'gh auth login' or set GITHUB_APP_ID`.
-
-Two SDK deps, both current as of 2026:
-`github.com/google/go-github/v90` (REST) + `github.com/shurcooL/githubv4`
-(GraphQL). `go-github`'s `InstallationTokenSource` covers App-token refresh;
-`go-githubv4`'s client wraps a plain `http.Client`, so both share one
-authenticated transport and therefore one token source — the daemon never
-holds two auth code paths to keep in sync.
-
-The mutation API the daemon exposes over the control socket (`post_reply`,
-`resolve_thread`, the CodeRabbit trigger comment) calls the GraphQL mutations
-through `go-githubv4`, so the Q3 resolve-guard gets typed GraphQL errors
-(`422 Resource not usable for resolve`, `43 Forbidden`) instead of parsed
-strings.
-
-This is an internal detail that never reaches pi or the system prompt.
-
-The daemon does **not** re-implement the inline-answer-before-resolve rule from
-the `answer-code-review` skill, nor its REST-reply-then-GraphQL-resolve path —
-those live in the skill/`_pi-supervisor-review` shim, which is a thin adapter
-over the GitHub SDKs. The daemon enforces the *budget* and the *loop*; it
-does not triage or author replies.
 
 ### 3. Command surface
 
@@ -182,7 +141,7 @@ supervisor:
      after CodeRabbit warmup"` — does not arm.
 
 This makes `mealime-roomux` (marker `ALL_MEALIME_ROOMUX_DONE` + PR #43) →
-review auto-run with 2 rounds, as specified. The trigger is structural: it
+review auto-run with 5 rounds, as specified. The trigger is structural: it
 rides the sticky marker-latch from ADR-0011, so it fires the moment pi emits
 the marker mid-round, not only at round-end classification.
 
@@ -190,30 +149,101 @@ The `pr_url` the marker-gate already scrapes (ADR-0006) is what the
 auto-trigger reads — no second scrape. The PR number is derived by parsing the
 linked `pull/<N>` out of that URL.
 
-### 5. Open questions (Q1 and Q5)
+### 5. Resolved questions
 
-Q1. **CodeRabbit trigger comment.** Hardcoded to `@coderabbitai review`?
-Configurable via `review.trigger_comment` (default `@coderabbitai review`)
-so a different bot / org convention is a one-line change, not a rebuild.
+**Q1 — CodeRabbit trigger comment: hardcoded.** The auto-trigger posts a
+fixed `@coderabbitai review` comment. No `review.trigger_comment` config
+field: one bot, one convention, and a config knob for a string that never
+varies in this deployment is surface without a user. Changing bots means an
+ADR amendment, not a config edit.
 
-Q2. **`--rounds 0`** now resolved: auto-derive (`ceil(open/12)`, capped).
-Default stays 5 on explicit calls. No further decision needed.
+**Q2 — `--rounds 0`** = auto-derive (`ceil(open/12)`, capped). Default stays
+5 on explicit calls.
 
-Q3. **Who enforces "answer every thread before resolve"?** now resolved:
-**server-side guard (option A)**. Both round types
-(`acceptance` and `rebuttal`) answer-and-resolve, so the daemon's
-`resolve_thread` RPC refuses with `409 already-resolved-without-reply`
-unless the daemon recorded a `post_reply` on that `thread_id` from this
-job's `gh` user in the current round. Typed `go-githubv4` errors make the
-guard ~12 lines and inescapable — no LLM can bypass it by issuing a raw
-resolve. No further decision needed.
+**Q3 — Resolve guard: server-side (option A).** Both round types
+(`acceptance` and `rebuttal`) answer-and-resolve, so `resolve_thread` refuses
+with `409 already-resolved-without-reply` unless the daemon recorded a
+`post_reply` on that `thread_id` from this job's authenticated user in the
+current round. Typed `go-githubv4` errors make the guard inescapable.
 
-Q4. **Push detection** now resolved: a no-push round is free (does NOT count
-against `MaxRounds`) — only pi-execution rounds consume budget. No further
-decision needed.
+**Q4 — Push detection: no-push is free.** Only pi-execution rounds consume
+`MaxRounds`.
 
-Q5. **Pre-merge gate.** This only gates *on* `pre-merge --pr` (ADR-pre-merge),
-never executes it — confirming that matches your mental model.
+**Q5 — Pre-merge is a gate, never an action.** Full context:
+
+The existing gate is `reply_review.py pre-merge --pr N`, which in the current
+skill does four things in order:
+
+1. *(optional)* `wait` until CI green **and** threads resolved, or timeout;
+2. *(optional)* `close_all` — bulk-resolve every still-open thread, which
+   *assumes* they were already answered;
+3. evaluate the gate — fail if **any** thread is open **or** any required CI
+   check is not passing (`neutral`/`skipped` count as passing);
+4. *(optional)* squash-merge via `PUT /repos/{owner}/{repo}/pulls/{n}/merge`.
+
+The review loop **inherits steps 1 and 3 only, and never passes
+`--auto-close` or `--merge`**:
+
+- **No `--auto-close` (step 2).** That flag is exactly the behavior ADR-0012
+  §Q3 forbids: bulk-resolving threads the agent never answered. The loop's
+  resolve guard makes bulk-close structurally impossible — each thread must
+  carry its own agent reply in the round that closed it.
+- **No `--merge` (step 4).** The owner merges. Same contract as the existing
+  "final report + marker ⇒ done": the supervisor's job ends at "the PR is
+  ready", not "the PR is merged".
+- **Steps 1 and 3 become the loop's own exit condition.** The loop already
+  polls threads and CI every round (§2 `list_threads` returns `ci`), so
+  "0 open threads && CI pass" is the `done` classification, and the timeout
+  arm is `MaxRounds` rather than a wall-clock `wait`. The separate
+  `pre-merge --pr` invocation at the end of a campaign is therefore
+  *redundant* — the daemon already holds both facts.
+
+So the practical contract: **the daemon reports readiness; it never merges and
+never bulk-closes.** A human runs `pre-merge --pr N` (or merges directly) if
+they want the independent second opinion. If you would rather the loop keep
+a final explicit `pre-merge --pr N` call as a belt-and-braces check before
+classifying `done`, say so — it is cheap, but it re-introduces a `gh api`
+call outside the SDK surface and duplicates state the daemon already has.
+
+### 6. Auth posture
+
+The daemon authenticates to GitHub in one of two ways, chosen per `Start`,
+in priority order:
+
+1. **GitHub App (preferred).** `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`
+   (a path or inline PEM) → the daemon signs a JWT with
+   `golang-jwt/jwt/v5` (`github.com/golang-jwt/jwt/v5`, the maintained
+   v4+ successor) and exchanges it for an installation token via
+   `go-github`'s `Apps.GetInstallationToken`. The token (1h TTL) is cached
+   and refreshed by `go-github`'s `InstallationTokenSource`, so there is no
+   hand-rolled refresh loop. The App is installed on the reviewed repos.
+2. **`gh` token fallback.** If the App env is absent, `Start` runs
+   `gh auth token` to obtain the active token (the *only* `gh` call in the
+   daemon's lifecycle — used purely for token acquisition); that token is
+   then passed to `go-github`/`githubv4` as a static token source. If
+   `gh auth token` fails, `Start` refuses (exit 1) with `GitHub auth
+   unavailable: run 'gh auth login' or set GITHUB_APP_ID`.
+
+Two SDK deps, both current as of 2026:
+`github.com/google/go-github/v90` (REST) + `github.com/shurcooL/githubv4`
+(GraphQL). `go-github`'s `InstallationTokenSource` covers App-token refresh;
+`go-githubv4`'s client wraps a plain `http.Client`, so both share one
+authenticated transport and therefore one token source — the daemon never
+holds two auth code paths to keep in sync.
+
+The mutation API the daemon exposes over the control socket (`post_reply`,
+`resolve_thread`, the CodeRabbit trigger comment) calls the GraphQL mutations
+through `go-githubv4`, so the Q3 resolve-guard gets typed GraphQL errors
+(`422 Resource not usable for resolve`, `43 Forbidden`) instead of parsed
+strings.
+
+This is an internal detail that never reaches pi or the system prompt.
+
+The daemon does **not** re-implement the inline-answer-before-resolve rule from
+the `answer-code-review` skill, nor its REST-reply-then-GraphQL-resolve path —
+those live in the skill/`_pi-supervisor-review` shim, which is a thin adapter
+over the GitHub SDKs. The daemon enforces the *budget* and the *loop*; it
+does not triage or author replies.
 
 ## Consequences
 
