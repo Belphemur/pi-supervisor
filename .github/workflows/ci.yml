@@ -73,17 +73,22 @@ jobs:
       - name: Test (race)
         run: go test ./... -race
 
-      # golangci-lint must be built against the same major Go as the module:
-      # a binary built with an older toolchain REFUSES to run here and only
-      # says "language version used to build golangci-lint is lower than the
-      # targeted Go version". Do not downgrade the version to dodge that — the
-      # bundled staticcheck panics on newer IR instead.
+      # golangci-lint must be built against the same major Go as the module: a
+      # binary built with an older toolchain REFUSES to run and only says
+      # "language version used to build golangci-lint is lower than the targeted
+      # Go version". Do not downgrade the version to dodge that — the bundled
+      # staticcheck panics on newer IR instead.
+      #
+      # Use the official action, NOT `curl ... install.sh | sh`. That installer
+      # verifies the release tarball against a hardcoded sha256 that is now
+      # stale, so it fails with "hash_sha256_verify checksum ... did not verify"
+      # on every run — which cost the first CI run of this workflow.
       - name: golangci-lint
-        run: |
-          curl -sSfL \
-            https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" v2.14.0
-          "$(go env GOPATH)/bin/golangci-lint" run ./...
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.14.0
+          install-mode: binary
+          args: --timeout=10m
 
       # The installer is shell code that ships with every release; a syntax error
       # in it is invisible to every other gate.
