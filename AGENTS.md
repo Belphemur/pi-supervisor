@@ -12,7 +12,7 @@ Unix socket.
 |---|---|
 | `cmd/pi-supervisor/main.go` | Cobra entry: `run` (daemon) + ctl subcommands (status/start/stop/steer/logs/reload/watch/version) + `completion install` |
 | `cmd/pi-supervisor/completion.go` | Shell-completion install: detect bash/zsh/fish/powershell on PATH, generate each script, append an idempotent marker-guarded block to the rc file (ADR-0008) |
-| `internal/notify/sd.go` | Pure-Go `sd_notify`: `READY=1`, `STOPPING=1`, and `Beat()` which pairs `WATCHDOG=1` with `STATUS=<n> parallel pi session(s) running`. No cgo. |
+| `internal/notify/sd.go` | Pure-Go `sd_notify`: `READY=1`, `STOPPING=1`, and `Beat()`/`BeatStatus()` which pair `WATCHDOG=1` with `STATUS=<n> parallel pi session(s) running` plus an optional note (the fatal-job list). No cgo. |
 | `internal/job/job.go` | Job model (`~/.pi/supervisor/jobs/*.json`), state persistence, session discovery, run-log helpers, steer ack model (`job.Ack`, `job.AckRecord`, `job.SteerReport`) |
 | `internal/client/client.go` | The pi RPC client, in Go: LF-JSON framing, streamed text, control-file steering (with per-frame acks), abort-drain handshake, timeout/abort/reap escalation. No Python. |
 | `internal/version/version.go` | Build-time version string; injected via `-ldflags -X .../version.ver=<commit>` by install.sh, falls back to `dev` (ADR-0009) |
@@ -20,6 +20,8 @@ Unix socket.
 | `internal/control/control_test.go` | fakeHandler 4-arg Steer + interrupt-flows-to-handler tests |
 | `cmd/pi-supervisor/version_cli_test.go` | `pi-supervisor version` offline CLI test |
 | `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard, `Steer` (frame + ack wait, ADR-0005), `interruptPID` (SIGINT group, ADR-0007) |
+| `internal/journal/journal.go` | Structured stdout log for `journalctl`: one `<ts> <LEVEL> <subsystem> event=<name> key=value…` line per transition, custom `slog.Handler` (stdlib only, no third-party logger), shared write mutex so concurrent job loops never interleave a line |
+| `internal/fault/fault.go` | Machine-readable refusal kind carried alongside the error text (`unknown_job`, `not_running`, …), so `internal/control` logs `reason=` without matching prose and without importing the supervisor |
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
 | `internal/job/transcript.go` | completion surface: `TranscriptContains`, `TranscriptWatcher` (ADR-0011) |
 | `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap. Same tail scrapes the round's GitHub PR URL (ADR-0006) |
@@ -184,6 +186,23 @@ Unix socket.
     `NewFromAppsTransport`), which is what go-github's own docs recommend. Do not
     reintroduce the v69-era App helpers; there is no hand-rolled JWT or refresh
     loop in this tree.
+28. **The journal is ADDITIVE and one-line-per-transition.** `internal/journal`
+    writes `<ts> <LEVEL> <subsystem> event=<name> key=value…` for
+    `journalctl --user -u pi-supervisor -o cat`; it never replaces the
+    `/tmp/pi_*` files (invariant 5 still holds), it never logs streamed text,
+    payloads or credentials, and every handler shares ONE write mutex so
+    concurrent job loops cannot splice a line. Lifecycle lines come from the
+    single `emit()` funnel, so the log cannot drift from the event stream.
+    Refusal lines carry `reason=` from `internal/fault`, never from matching
+    error prose. **Level is a STREAM, not a journald priority:** INFO and below
+    go to stdout, WARN and above to stderr, because journald derives PRIORITY
+    from the stream and a ` WARN ` token in the text is just characters. The
+    residual limit, stated honestly: systemd still assigns the whole unit ONE
+    priority, so `journalctl -p warning` does NOT return our warnings. What
+    works today is
+    `journalctl --user -u pi-supervisor -o cat | grep ' WARN \| ERROR '`.
+    Genuine per-record priorities need a `/dev/log` datagram, which issue #1
+    lists under non-goals.
 
 ## State-durability invariants
 

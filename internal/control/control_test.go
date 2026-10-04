@@ -2,19 +2,22 @@ package control
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"pi-supervisor/internal/job"
-
 	"pi-supervisor/internal/events"
+	"pi-supervisor/internal/fault"
+	"pi-supervisor/internal/job"
+	"pi-supervisor/internal/journal"
 )
 
 // fakeHandler is a scriptable Handler: each call can be made to fail, and
@@ -511,4 +514,77 @@ func mustLine(t *testing.T, r *bufio.Reader) []byte {
 		t.Fatalf("read: %v", err)
 	}
 	return line
+}
+
+// Refusals must reach the journal with a machine-readable reason: that is the
+// only way `journalctl -u pi-supervisor | grep request_refused` can answer
+// "why was my stop refused?" without parsing prose.
+func TestRefusalIsLoggedWithReason(t *testing.T) {
+	var sink bytes.Buffer
+	journal.SetOutput(&sink)
+
+	h := newFakeHandler()
+	h.failOn["start:x"] = fault.New(fault.KindAlreadyRunning, errors.New(`job "x" already running`))
+	h.failOn["start:y"] = errors.New("something the handler invented")
+
+	cases := []struct {
+		name string
+		req  string
+		cmd  string
+		want string
+	}{
+		{"handler kind", `{"cmd":"start","job":"x"}`, "start", "already_running"},
+		{"bad json", `{"cmd":`, "", "bad_json"},
+		{"unknown cmd", `{"cmd":"teleport"}`, "teleport", "unknown_cmd"},
+		{"untagged error", `{"cmd":"start","job":"y"}`, "start", "refused"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink.Reset()
+			resp := dispatch(h, []byte(tc.req))
+			if resp.OK {
+				t.Fatalf("expected a refusal, got %+v", resp)
+			}
+			logResponse(tc.cmd, "x", resp)
+			line := strings.TrimSpace(sink.String())
+			if !strings.Contains(line, "event=request_refused") {
+				t.Fatalf("no refusal logged for %s: %q", tc.name, line)
+			}
+			if !strings.Contains(line, "reason="+tc.want) {
+				t.Fatalf("reason=%s, want reason=%s in %q", tc.want, tc.want, line)
+			}
+		})
+	}
+
+	// An OK response must stay silent: the journal is a transition log.
+	sink.Reset()
+	logResponse("status", "", Response{OK: true})
+	if sink.Len() != 0 {
+		t.Fatalf("successful request was logged: %q", sink.String())
+	}
+}
+
+// A second daemon must NOT unlink a socket a live daemon is answering on: the
+// old Remove-then-Listen left the running daemon holding an orphaned inode, so
+// every client got "connection refused" while systemd still reported active.
+func TestServeRefusesToStealALiveSocket(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "live.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	if !alive(sock) {
+		t.Fatal("a socket with a live listener must read as alive")
+	}
+	_ = os.Remove(sock) // t.TempDir cleanup would do it anyway
+	if alive(sock) {
+		t.Fatal("an absent socket must not read as alive")
+	}
+	// A stale inode — file present, nobody listening — is ours to take.
+	_ = os.WriteFile(sock, nil, 0o600)
+	if alive(sock) {
+		t.Fatal("a stale socket file must not read as alive (it must be replaceable)")
+	}
 }

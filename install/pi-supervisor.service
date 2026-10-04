@@ -12,5 +12,18 @@ RestartSec=5
 # Watchdog: the daemon pings WATCHDOG=1 at half this interval (internal/notify).
 WatchdogSec=120
 
+# Journal routing. The daemon writes INFO to stdout and WARN/ERROR to stderr
+# (internal/journal) so the two streams are separable and `-o cat` interleaves
+# them in order.
+#
+# There is deliberately NO SyslogLevel/StandardOutput override here. It was
+# tried: `SyslogLevel=info` applies to BOTH streams, so a WARN record still lands
+# at priority 6 and `journalctl -p warning` still matches nothing (measured:
+# 1 event line at -o cat, 0 at -p warning, SyslogLevel=6). Per-record priorities
+# need a /dev/log datagram, which issue #1 lists under non-goals.
+#
+# So filter on the token, which is why the level is rendered in the line:
+#   journalctl --user -u pi-supervisor -o cat | grep ' WARN \| ERROR '
+
 [Install]
 WantedBy=default.target
