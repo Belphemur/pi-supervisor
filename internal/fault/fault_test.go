@@ -3,6 +3,10 @@ package fault
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -45,22 +49,111 @@ func TestNewKeepsMessageAndUnwraps(t *testing.T) {
 	}
 }
 
-// The exit-code table must cover EVERY kind. A Kind added to the vocabulary
-// without an entry is otherwise invisible: ExitCode's fallback is 1, so the
-// omission would silently reclassify a usage error as retryable.
-func TestEveryKindHasAnExitCode(t *testing.T) {
-	all := All()
-	if len(all) != len(exitCodes) {
-		t.Fatalf("All() has %d kinds, exitCodes has %d — one was added without the other",
-			len(all), len(exitCodes))
+// declaredKind is one Kind constant as the SOURCE declares it: the Go
+// identifier and its string value.
+type declaredKind struct {
+	name  string
+	value string
+}
+
+// declaredKinds parses fault.go and returns every Kind constant the package
+// DECLARES, independent of All()'s hand-maintained inventory. The declared
+// set is the ground truth: a new Kind added to neither All() nor exitCodes
+// is still caught here, which is the whole point — the old test compared the
+// two manual lists against each other and both could omit the same Kind.
+func declaredKinds(t *testing.T) []declaredKind {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fault.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse fault.go: %v", err)
 	}
-	for _, k := range all {
-		if _, ok := exitCodes[k]; !ok {
-			t.Errorf("kind %q has no exit-code mapping", k)
+	var kinds []declaredKind
+	for _, d := range file.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
 			continue
 		}
-		if code := k.ExitCode(); code != 1 && code != 2 {
-			t.Errorf("kind %q exit code = %d, want 1 or 2 (ADR-0008)", k, code)
+		// A const group may carry its type on the first spec only; later
+		// specs inherit it. Track the last seen type name across the group.
+		lastType := ""
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			typ := ""
+			if vs.Type != nil {
+				if id, ok := vs.Type.(*ast.Ident); ok {
+					typ = id.Name
+				}
+			}
+			if typ == "" {
+				typ = lastType
+			}
+			lastType = typ
+			if typ != "Kind" {
+				continue
+			}
+			for i, name := range vs.Names {
+				value := ""
+				if i < len(vs.Values) {
+					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						value, _ = strconv.Unquote(lit.Value)
+					}
+				}
+				if value == "" {
+					t.Fatalf("Kind constant %s has no string literal value; the vocabulary is a literal enum, not iota-derived", name.Name)
+				}
+				kinds = append(kinds, declaredKind{name: name.Name, value: value})
+			}
+		}
+	}
+	if len(kinds) == 0 {
+		t.Fatal("parsed fault.go but found no Kind constants — the parser drifted from the source layout")
+	}
+	return kinds
+}
+
+// The exit-code table must cover EVERY kind the package declares — not merely
+// every kind All() remembered to list. Both used to be hand-maintained, so a
+// Kind added to neither passed the test while ExitCode()'s fallback silently
+// reclassified its usage errors as retryable (exit 1 instead of the required
+// 2, ADR-0008). The declared-constant set is parsed from the source, so the
+// only way to add a Kind without an exit code is to also break this test.
+func TestEveryKindHasAnExitCode(t *testing.T) {
+	declared := declaredKinds(t)
+	byValue := make(map[string]string, len(declared))
+	for _, k := range declared {
+		byValue[k.value] = k.name
+	}
+
+	// Every DECLARED Kind must be in the table with a valid exit code.
+	for _, k := range declared {
+		kind := Kind(k.value)
+		if _, ok := exitCodes[kind]; !ok {
+			t.Errorf("declared %s (value %q) has no exit-code mapping — ExitCode() would fall back to 1", k.name, k.value)
+			continue
+		}
+		if code := kind.ExitCode(); code != 1 && code != 2 {
+			t.Errorf("kind %q exit code = %d, want 1 or 2 (ADR-0008)", k.value, code)
+		}
+	}
+
+	// All() must agree with the declared set exactly: no Kind forgotten, and
+	// no entry in All() that is not a declared constant.
+	all := All()
+	if len(all) != len(declared) {
+		t.Fatalf("All() has %d kinds, fault.go declares %d — one was added without the other", len(all), len(declared))
+	}
+	for _, k := range all {
+		name, ok := byValue[string(k)]
+		if !ok {
+			t.Errorf("All() lists %q, which fault.go does not declare", string(k))
+			continue
+		}
+		if _, ok := exitCodes[k]; !ok {
+			t.Errorf("kind %q (declared as %s) has no exit-code mapping", string(k), name)
 		}
 	}
 }

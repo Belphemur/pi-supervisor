@@ -96,8 +96,13 @@ func TestRestartFreshDoesNotReAdoptQuarantined(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Discovery must find nothing: the only .jsonl is inside _archived-stale/.
-	if got := job.FindSession("t", job.MungedSessionsDir(dir), time.Time{}); got != "" && got == sess {
-		t.Fatal("FindSession re-adopted the quarantined transcript")
+	// FindSession takes the WORKTREE and munges the sessions dir itself — the
+	// old MungedSessionsDir(dir) argument double-munged, scanned a directory
+	// that cannot exist, and the `got != "" && got == sess` assertion was
+	// satisfiable by any empty result, so the ADR-0010 guard was never
+	// actually exercised. Assert the strong form: nothing discoverable.
+	if got := job.FindSession("t", dir, time.Time{}); got != "" {
+		t.Fatalf("FindSession re-adopted a transcript after quarantine: %q", got)
 	}
 }
 

@@ -7,16 +7,20 @@ import (
 	"time"
 )
 
+// The watcher tests are hermetic: tempHome(t) points MungedSessionsDir at a
+// temp $HOME and the worktree string (which only feeds the munged dir name)
+// comes from t.TempDir(). The old hardcoded /home/balor/workspace/eink/wt-*
+// paths wrote into the REAL ~/.pi/agent/sessions tree, where leftover
+// transcripts from a live campaign could be adopted by the floor-window check
+// and make these tests flaky — or pollute a real campaign's discovery.
+
 // TestSessionWatcherAdoptsOnCreate is the event-driven case the watcher
 // exists for: the transcript appears AFTER the watcher is armed, and must be
 // adopted without waiting for a poll interval.
 func TestSessionWatcherAdoptsOnCreate(t *testing.T) {
-	wt := "/home/balor/workspace/eink/wt-watch1"
+	tempHome(t)
+	wt := t.TempDir()
 	dir := MungedSessionsDir(wt)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	_ = os.RemoveAll(dir)
 
 	w, err := NewSessionWatcher(wt, time.Now())
 	if err != nil {
@@ -52,7 +56,8 @@ func TestSessionWatcherAdoptsOnCreate(t *testing.T) {
 // motivated this whole change: a transcript that predates the launch must
 // never be adopted, even though it is the newest file present.
 func TestSessionWatcherIgnoresStale(t *testing.T) {
-	wt := "/home/balor/workspace/eink/wt-watch2"
+	tempHome(t)
+	wt := t.TempDir()
 	dir := MungedSessionsDir(wt)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -96,8 +101,8 @@ func TestSessionWatcherIgnoresStale(t *testing.T) {
 // under _archived-stale/ are never adoption candidates, even when they are the
 // newest thing in the tree and fsnotify reports them.
 func TestSessionWatcherIgnoresQuarantine(t *testing.T) {
-	wt := "/home/balor/workspace/eink/wt-watch3"
-	dir := MungedSessionsDir(wt)
+	tempHome(t)
+	wt := t.TempDir()
 	w, err := NewSessionWatcher(wt, time.Now())
 	if err != nil {
 		t.Fatalf("NewSessionWatcher: %v", err)
@@ -106,7 +111,7 @@ func TestSessionWatcherIgnoresQuarantine(t *testing.T) {
 
 	// NewSessionWatcher creates the dir, so the subdir must be made AFTER it
 	// is armed — otherwise the watcher's own MkdirAll wipes it.
-	arch := filepath.Join(dir, "_archived-stale")
+	arch := filepath.Join(MungedSessionsDir(wt), "_archived-stale")
 	if err := os.MkdirAll(arch, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +130,8 @@ func TestSessionWatcherIgnoresQuarantine(t *testing.T) {
 // watched and polled selection rules are the same function, so they can never
 // disagree about which file is newest.
 func TestSessionWatcherTryPathMatchesFindSession(t *testing.T) {
-	wt := "/home/balor/workspace/eink/wt-watch4"
+	tempHome(t)
+	wt := t.TempDir()
 	dir := MungedSessionsDir(wt)
 
 	w, err := NewSessionWatcher(wt, time.Now().Add(-time.Minute))
@@ -159,7 +165,8 @@ func TestSessionWatcherTryPathMatchesFindSession(t *testing.T) {
 // TestSessionWatcherCloseIsIdempotent: Close runs from defer plus explicit
 // cleanup on several paths, and a double close must not panic.
 func TestSessionWatcherCloseIsIdempotent(t *testing.T) {
-	w, err := NewSessionWatcher("/home/balor/workspace/eink/wt-watch5", time.Now())
+	tempHome(t)
+	w, err := NewSessionWatcher(t.TempDir(), time.Now())
 	if err != nil {
 		t.Fatalf("NewSessionWatcher: %v", err)
 	}

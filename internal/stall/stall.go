@@ -5,6 +5,7 @@
 package stall
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"regexp"
@@ -87,8 +88,15 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 		return false, ""
 	}
 	if fi.Size() < d.offset {
-		// Rotated/truncated: restart from the new end, disarmed.
+		// Rotated/truncated: restart from the new end, disarmed. The tool
+		// counters reset WITH the rest: they describe the file that was
+		// being tailed, and after a rotation the detector is reading a
+		// different file — carrying toolCalls/toolsInFlight across would
+		// leave a call seen in flight just before the rotation pinning the
+		// counter above zero forever, muting EmptyTurn for the whole round
+		// (the ADR-0010 failure mode the detector exists to catch).
 		d.offset, d.size, d.ciMode, d.marker = fi.Size(), fi.Size(), false, ""
+		d.toolCalls, d.toolsInFlight = 0, 0
 	}
 	if fi.Size() > d.size {
 		d.lastGrowth = time.Now()
@@ -113,8 +121,10 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 				// STILL RUNNING leaves toolsInFlight > 0 — a long `go test` or CI
 				// poll freezes the transcript exactly like a hang, and only the
 				// outstanding count tells the two apart.
-				d.toolCalls += len(toolUseRe.FindAll(buf, -1))
-				d.toolsInFlight += len(toolUseRe.FindAll(buf, -1)) - len(toolResultRe.FindAll(buf, -1))
+				uses := len(toolUseRe.FindAll(buf, -1))
+				results := countResultLines(buf)
+				d.toolCalls += uses
+				d.toolsInFlight += uses - results
 				if d.toolsInFlight < 0 {
 					// A result can be observed for a call issued before this
 					// detector started (New begins mid-file). Never let the
@@ -160,11 +170,28 @@ type EmptyTurnWindow struct {
 // told apart from one that has already come back.
 var toolUseRe = regexp.MustCompile(`"tool_use"`)
 
-// toolResultRe matches the RETURN of a tool call. pi writes
-// `"role":"toolResult"` with a `toolCallId`; the `tool_use_id` spelling is the
-// Anthropic-shaped equivalent and is matched too, so the pairing survives
-// either schema.
-var toolResultRe = regexp.MustCompile(`"toolResult"|"toolCallId"|"tool_use_id"`)
+// toolResultRe matches the RETURN of a tool call. pi writes each result as
+// its own JSONL line — `"role":"toolResult"` (with a toolCallId) — and the
+// `"tool_use_id"` spelling is the Anthropic-shaped equivalent, so the pairing
+// survives either schema. Both markers live on the SAME result line, which is
+// why matching must be per LINE (countResultLines), never a raw substring
+// count over the buffer: the old alternation ("toolResult"|"toolCallId"|
+// "tool_use_id") hit a real result line TWICE and drained toolsInFlight at
+// double rate, re-arming the very abort-a-live-tool bug the counter exists to
+// prevent (commit 18d48d4).
+var toolResultRe = regexp.MustCompile(`"toolResult"|"tool_use_id"`)
+
+// countResultLines counts tool-result LINES, not substring occurrences: one
+// JSONL line is one tool result, however many of its fields mention it.
+func countResultLines(buf []byte) int {
+	n := 0
+	for line := range bytes.SplitSeq(buf, []byte{'\n'}) {
+		if len(line) != 0 && toolResultRe.Match(line) {
+			n++
+		}
+	}
+	return n
+}
 
 // EmptyTurn reports whether the round is stalled on an empty turn: the
 // transcript has not grown by MinGrowth bytes for Idle, AND no tool_use has

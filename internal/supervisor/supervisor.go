@@ -99,6 +99,10 @@ type runner struct {
 	// round's session, so FindSession must not adopt it. Zero on a RESUME
 	// round, where the path is already pinned.
 	launchedAt time.Time
+	// sessWatch is the fsnotify session watcher armed for a LAUNCH round
+	// (nil on RESUME). Round-scoped: armed in round() before the spawn, closed
+	// when the round's client returns, so every exit path reaps it.
+	sessWatch sessionResolver
 }
 
 func New() *Supervisor {
@@ -321,6 +325,7 @@ func (s *Supervisor) Stop(name string) error {
 		return fault.New(fault.KindNotRunning, fmt.Errorf("job %q not running", name))
 	}
 	r.persistState()
+	r.closeSessWatch() // an operator stop must not leave the round's watcher armed
 	// The loop emits `stopped` from its own exit path, but Stop() can win the
 	// race before the loop's first stopCh check — in which case no event is ever
 	// emitted and a `watch` client blocks until its timeout on a job that is
@@ -743,20 +748,12 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// Adopt the transcript a fresh LAUNCH just created, so the gate below
 		// has a surface to read on the very round that started the session.
 		if sess == "" {
-			r.mu.Lock()
-			sess = r.job.SessionPath
-			r.mu.Unlock()
-			if sess == "" {
+			if found := s.captureSession(r); found != "" {
+				sess = found
 				r.mu.Lock()
-				floor := r.launchedAt
+				r.job.SessionPath = found
 				r.mu.Unlock()
-				if found := job.FindSession(j.SessionName, j.Worktree, floor); found != "" {
-					sess = found
-					r.mu.Lock()
-					r.job.SessionPath = found
-					r.mu.Unlock()
-					_ = job.Save(r.job)
-				}
+				_ = job.Save(r.job)
 			}
 		}
 		select {
@@ -766,6 +763,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			name := r.job.Name
 			r.mu.Unlock()
 			r.persistState()
+			r.closeSessWatch()
 			s.logf(name, "loop stopped at round %d (client rc=%d)", round, rc)
 			s.emit(name, "stopped", round, rc, dur, "", "operator stop")
 			return
@@ -904,10 +902,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		pinned := r.job.SessionPath != ""
 		r.mu.Unlock()
 		if !pinned {
-			r.mu.Lock()
-			floor := r.launchedAt
-			r.mu.Unlock()
-			p := job.FindSession(j.SessionName, j.Worktree, floor)
+			p := s.captureSession(r)
 			if p == "" {
 				r.finish("fatal", "could not capture session path after LAUNCH — refusing to fork a new session")
 				s.logf(name, "FATAL: could not capture session path after LAUNCH — aborting instead of forking")
@@ -950,6 +945,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			r.state.State, r.active = "stopped", false
 			r.mu.Unlock()
 			r.persistState()
+			r.closeSessWatch()
 			s.emit(name, "stopped", round, rc, dur, "", "operator stop during backoff")
 			return
 		case <-time.After(sleep):
@@ -964,6 +960,23 @@ func (r *runner) stateSnapshot() job.State {
 }
 
 // live reports whether a round is currently polling the control file.
+// sessionResolver is the fresh-LAUNCH transcript source: internal/job's
+// fsnotify SessionWatcher. An interface, not the concrete type, so the wiring
+// test can observe the supervisor ARM and CONSULT the watcher — the watcher
+// was once shipped fully unit-tested and never called, and only an assertion
+// about the wiring (not the component) catches that.
+type sessionResolver interface {
+	TryPath() string
+	Close() error
+}
+
+// newSessionResolver arms the watcher for a LAUNCH round. Package variable so
+// supervisor_test can wrap the real constructor and count its uses; production
+// code never reassigns it.
+var newSessionResolver = func(worktree string, notBefore time.Time) (sessionResolver, error) {
+	return job.NewSessionWatcher(worktree, notBefore)
+}
+
 func (r *runner) live() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -977,6 +990,7 @@ func (r *runner) finish(state, diag string) {
 	r.mu.Unlock()
 	r.persistState()
 	_ = name
+	r.closeSessWatch() // a job that never adopted a transcript must not leak its watcher
 }
 
 // round runs one pi RPC round via the daemon-native client (internal/client);
@@ -998,7 +1012,25 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	if !resume {
 		r.mu.Lock()
 		r.launchedAt = time.Now()
+		floor := r.launchedAt
 		r.mu.Unlock()
+		// Arm the fsnotify session watcher BEFORE the spawn: pi writes its
+		// JSONL asynchronously, so a directory scan issued right after the
+		// spawn can beat the file into existence (the stale-adoption bug),
+		// and polling for the file leaves the marker gate blind for a whole
+		// poll interval after the transcript lands. The watcher adopts the
+		// file the moment the kernel reports it. A failed arm is not fatal:
+		// captureSession falls back to the FindSession poll, which is exactly
+		// the pre-watcher behavior.
+		if w, err := newSessionResolver(j.Worktree, floor); err != nil {
+			s.logf(j.Name, "round %d: session watcher unavailable (%v); falling back to FindSession polling", round, err)
+		} else {
+			r.mu.Lock()
+			r.sessWatch = w
+			r.mu.Unlock()
+		} // Reaped by closeSessWatch once the path is pinned or the job turns
+		// terminal — the adoption sites run AFTER round() returns, so the
+		// watcher must outlive the round's client.
 	}
 
 	_, runlog, _, _ := job.Paths(j.Name)
@@ -1154,6 +1186,52 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 // records it on the runner so `status` is truthful mid-round and the gate can
 // read it at the round boundary. It never interrupts pi: the agent still has
 // to end its turn cleanly, and `done` additionally requires final_report.
+// closeSessWatch reaps the round's session watcher. Idempotent: the watcher
+// is closed exactly once even when several paths race to reap it (Session-
+// Watcher.Close is mutex-guarded), and a nil slot is a no-op.
+func (r *runner) closeSessWatch() {
+	r.mu.Lock()
+	w := r.sessWatch
+	r.sessWatch = nil
+	r.mu.Unlock()
+	if w != nil {
+		_ = w.Close()
+	}
+}
+
+// captureSession resolves the session transcript for a fresh LAUNCH. The
+// armed SessionWatcher answers first — fsnotify adopts the file the moment
+// pi creates it, which is the poll-interval gap the polling path cannot
+// remove — and the FindSession poll stays as the fallback for a watcher that
+// failed to arm or missed its events (fsnotify can coalesce under load; the
+// watcher's own Wait re-scans for the same reason). Both apply the same
+// notBefore floor and defer to the same dirScan selection rule, so watched
+// and polled adoption can never disagree about which file is newest.
+// Returns "" when nothing is discoverable yet.
+func (s *Supervisor) captureSession(r *runner) string {
+	r.mu.Lock()
+	if p := r.job.SessionPath; p != "" {
+		r.mu.Unlock()
+		r.closeSessWatch() // already pinned: the watcher's job is done
+		return p
+	}
+	w := r.sessWatch
+	name, wt := r.job.SessionName, r.job.Worktree
+	floor := r.launchedAt
+	r.mu.Unlock()
+	if w != nil {
+		if p := w.TryPath(); p != "" {
+			r.closeSessWatch()
+			return p
+		}
+	}
+	if p := job.FindSession(name, wt, floor); p != "" {
+		r.closeSessWatch() // the poll won the race: stop watching
+		return p
+	}
+	return ""
+}
+
 func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watchStop, stopCh chan struct{}) {
 	if marker == "" {
 		return // no marker configured: nothing to detect (and the gate refuses)
@@ -1182,10 +1260,7 @@ func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watc
 			r.mu.Unlock()
 		}
 		if path == "" {
-			r.mu.Lock()
-			floor := r.launchedAt
-			r.mu.Unlock()
-			path = job.FindSession(r.job.SessionName, r.job.Worktree, floor)
+			path = s.captureSession(r)
 			if path == "" {
 				return nil
 			}
