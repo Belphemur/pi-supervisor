@@ -94,6 +94,11 @@ type runner struct {
 	// autoReview is the one-shot intent to arm a review when the completion
 	// gate closes on an open PR.
 	autoReview *autoReviewSpec
+	// launchedAt is when the current round spawned pi. It is the floor for
+	// session discovery: a transcript that predates the spawn cannot be this
+	// round's session, so FindSession must not adopt it. Zero on a RESUME
+	// round, where the path is already pinned.
+	launchedAt time.Time
 }
 
 func New() *Supervisor {
@@ -742,7 +747,10 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			sess = r.job.SessionPath
 			r.mu.Unlock()
 			if sess == "" {
-				if found := job.FindSession(j.SessionName, j.Worktree); found != "" {
+				r.mu.Lock()
+				floor := r.launchedAt
+				r.mu.Unlock()
+				if found := job.FindSession(j.SessionName, j.Worktree, floor); found != "" {
 					sess = found
 					r.mu.Lock()
 					r.job.SessionPath = found
@@ -896,7 +904,10 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		pinned := r.job.SessionPath != ""
 		r.mu.Unlock()
 		if !pinned {
-			p := job.FindSession(j.SessionName, j.Worktree)
+			r.mu.Lock()
+			floor := r.launchedAt
+			r.mu.Unlock()
+			p := job.FindSession(j.SessionName, j.Worktree, floor)
 			if p == "" {
 				r.finish("fatal", "could not capture session path after LAUNCH — refusing to fork a new session")
 				s.logf(name, "FATAL: could not capture session path after LAUNCH — aborting instead of forking")
@@ -975,6 +986,20 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	j := r.job
 	resume := j.SessionPath != ""
 	r.mu.Unlock()
+
+	// Stamp the launch time BEFORE spawning. Session discovery (below, and in
+	// the marker watcher) must only ever adopt a transcript created at or after
+	// this instant: pi writes its JSONL asynchronously, so a scan issued right
+	// after the spawn can beat the file into existence and otherwise return
+	// some older run's transcript. Pinning that stale path breaks the round in
+	// a way that looks like a hung agent — no transcript growth, no completion
+	// marker (ADR-0011), and the empty-turn detector aborts a healthy session.
+	// Only meaningful for a LAUNCH; a RESUME already has its path pinned.
+	if !resume {
+		r.mu.Lock()
+		r.launchedAt = time.Now()
+		r.mu.Unlock()
+	}
 
 	_, runlog, _, _ := job.Paths(j.Name)
 	_ = os.Truncate(runlog, 0)
@@ -1157,7 +1182,10 @@ func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watc
 			r.mu.Unlock()
 		}
 		if path == "" {
-			path = job.FindSession(r.job.SessionName, r.job.Worktree)
+			r.mu.Lock()
+			floor := r.launchedAt
+			r.mu.Unlock()
+			path = job.FindSession(r.job.SessionName, r.job.Worktree, floor)
 			if path == "" {
 				return nil
 			}

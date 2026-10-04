@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"pi-supervisor/internal/job"
 )
@@ -95,7 +96,7 @@ func TestRestartFreshDoesNotReAdoptQuarantined(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Discovery must find nothing: the only .jsonl is inside _archived-stale/.
-	if got := job.FindSession("t", job.MungedSessionsDir(dir)); got != "" && got == sess {
+	if got := job.FindSession("t", job.MungedSessionsDir(dir), time.Time{}); got != "" && got == sess {
 		t.Fatal("FindSession re-adopted the quarantined transcript")
 	}
 }

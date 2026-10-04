@@ -359,11 +359,11 @@ func TestFindSessionNewestWins(t *testing.T) {
 	if err := os.Chtimes(old, past, past); err != nil {
 		t.Fatal(err)
 	}
-	if got := FindSession("s", wt); got != newer {
+	if got := FindSession("s", wt, time.Time{}); got != newer {
 		t.Fatalf("FindSession = %q, want %q", got, newer)
 	}
 	// A missing session dir is "no session yet", not an error.
-	if got := FindSession("s", "/nowhere"); got != "" {
+	if got := FindSession("s", "/nowhere", time.Time{}); got != "" {
 		t.Fatalf("missing dir = %q, want empty", got)
 	}
 }

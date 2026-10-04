@@ -414,9 +414,26 @@ func LastLines(path string, n int) ([]string, error) {
 	return all, nil
 }
 
-// FindSession resolves a session JSONL for a job: the newest .jsonl in the
-// worktree's munged session dir. Pure Go — no pi_session.py subprocess.
-func FindSession(name, worktree string) string {
+// FindSession returns the most recently modified session transcript in the
+// worktree's session directory, or "" if there is none. Pure Go — no
+// pi_session.py subprocess.
+//
+// notBefore is a LAUNCH-time floor: only files modified at or after it are
+// eligible. Pass the zero time to accept any file.
+//
+// The floor exists because the supervisor discovers a fresh LAUNCH's transcript
+// by scanning the directory, and pi creates that file asynchronously — the scan
+// routinely runs BEFORE the new file exists. Without a floor the scan returns
+// the newest PRE-EXISTING transcript instead, and the caller pins that stale
+// path to the job. The job is then welded to a dead transcript: it never grows,
+// the completion marker can never appear (ADR-0011), and the empty-turn
+// detector aborts a perfectly healthy agent. Observed live on `restart --fresh`,
+// which quarantines the old transcript and then re-adopted a different stale
+// one from an earlier run, wasting all 5 rounds.
+//
+// The floor is the structural fix: a file that existed before this round
+// launched cannot be this round's session, so it is not a candidate at all.
+func FindSession(name, worktree string, notBefore time.Time) string {
 	dir := MungedSessionsDir(worktree)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -432,6 +449,13 @@ func FindSession(name, worktree string) string {
 		if err != nil {
 			continue
 		}
+		// Reject anything that predates the launch. Allow a small clock/
+		// filesystem-granularity slack: pi may create the file in the same
+		// filesystem tick as the spawn, and an exact comparison would reject
+		// the very transcript we are looking for.
+		if !notBefore.IsZero() && fi.ModTime().Before(notBefore.Add(-sessionScanSlack)) {
+			continue
+		}
 		if best == "" || fi.ModTime().After(bestMod) {
 			best = filepath.Join(dir, e.Name())
 			bestMod = fi.ModTime()
@@ -439,6 +463,12 @@ func FindSession(name, worktree string) string {
 	}
 	return best
 }
+
+// sessionScanSlack absorbs filesystem timestamp granularity and clock skew
+// between the spawn and the transcript's creation. It is deliberately small:
+// large enough to tolerate a same-tick create, far too small to admit a
+// transcript from a previous run.
+const sessionScanSlack = 2 * time.Second
 
 // Quarantine moves a session JSONL into a _archived-stale/ subdirectory of its
 // munged sessions dir, renaming it with a timestamp suffix so it is never
