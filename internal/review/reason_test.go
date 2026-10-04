@@ -11,14 +11,27 @@ import (
 // the same wire field (Response.Reason). It is now an alias of fault.Kind.
 // If someone reintroduces a distinct type this stops compiling — which is the
 // point: the duplicate vocabulary must not be representable, not merely unused.
+// Aliasing proofs. These stop compiling if review ever grows its own type
+// again, which is the point: the duplicate vocabulary must not be
+// representable, not merely unused. They are function calls rather than
+// `var _ T = …` declarations because the linter (rightly) asks for the type
+// to be omitted there — and omitting it would delete the proof.
+var (
+	takesFaultKind  = func(fault.Kind) {}
+	takesReviewKind = func(Reason) {}
+	takesEither     = func(Reason) int { return 0 }
+)
+
 func TestReasonIsFaultKind(t *testing.T) {
-	var a fault.Kind = ReasonUsage
-	var b Reason = fault.KindUsage
-	if a != b {
-		t.Fatalf("aliasing broken: %q != %q", a, b)
+	takesFaultKind(ReasonUsage)
+	takesReviewKind(fault.KindUsage)
+	takesEither(fault.KindUsage)
+
+	if ReasonNoLiveRound != fault.KindNoLiveRound || ReasonUsage != fault.KindUsage {
+		t.Fatal("review constants must BE the fault constants, not copies")
 	}
-	var fn func(Reason) int = Reason.ExitCode
-	if fn(ReasonRoundMismatch) != 2 {
+	exit := func(r Reason) int { return r.ExitCode() }
+	if exit(ReasonRoundMismatch) != 2 || exit(ReasonGitHubError) != 1 {
 		t.Fatal("ExitCode must ride the alias from fault.Kind")
 	}
 }

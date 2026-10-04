@@ -136,6 +136,20 @@ parsing, no matching on message text.
 | `auth-unavailable` | 1 | operator action; do not retry |
 | `rate-limited` | 1 | retry with backoff |
 | `github-error` | 1 | retry; the message carries the typed GH error |
+| `usage` | 2 | the call itself is malformed; fix the call |
+
+`usage` is emitted whenever the request cannot be parsed or a verb does not
+apply, so the closed set really is closed for a consumer that branches only on
+`reason`.
+
+**Single vocabulary (ADR-0013 follow-up 1b).** These strings are not a private
+review enum: they are a subset of `internal/fault.Kind`, the one vocabulary the
+whole `Response.Reason` field draws from (the journal's `reason=` values are the
+same set). `review.Reason` is a type *alias* of `fault.Kind`, so a reason cannot
+be spelled two ways, and `Kind.ExitCode()` is the single implementation of the
+exit column above — a second table would drift. The journal-only kinds
+(`unknown_job`, `bad_json`, …) keep their underscore spellings; the ones a shim
+can see use the hyphen spellings published here.
 
 `--json` is available on every verb for structured consumption. `review`,
 `ack`, and `status` accept it at the CLI too (ADR-0008's exit contract — 2 =
