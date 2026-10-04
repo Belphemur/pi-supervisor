@@ -865,10 +865,12 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				s.emit(name, "reviewing", round, 0, dur, "",
 					"marker %q reached — build job done, entering the review campaign (ADR-0012 §4.1)",
 					j.Marker)
+				r.closeSessWatch() // terminal from the loop's perspective; reap the watcher
 				return
 			}
 			s.emit(name, "done", round, 0, dur, "",
 				"marker %q detected in session transcript — run is over", j.Marker)
+			r.closeSessWatch() // terminal: reap the watcher (a run-log-only marker may never have pinned a transcript)
 			return
 		}
 
@@ -877,6 +879,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// a finished report to done; otherwise the fatal stands.
 		if r.stateSnapshot().State == "fatal" {
 			s.logf(name, "round %d: run closed by CI-stall intervention", round)
+			r.closeSessWatch()
 			return
 		}
 
@@ -967,6 +970,7 @@ func (r *runner) stateSnapshot() job.State {
 // about the wiring (not the component) catches that.
 type sessionResolver interface {
 	TryPath() string
+	Wait(timeout time.Duration) string
 	Close() error
 }
 
@@ -1027,7 +1031,34 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		} else {
 			r.mu.Lock()
 			r.sessWatch = w
+			startWait := w
 			r.mu.Unlock()
+			// Adopt from the EVENT side, not only from the scan: a goroutine
+			// parks in Wait until the kernel reports the transcript and pins
+			// it at once, so no tick boundary sits between the file landing
+			// and its adoption (TryPath alone would leave the inotify watch
+			// opened and unused, making the watcher equivalent to the poll it
+			// replaced). Close unblocks Wait — its events channel closes and
+			// it answers from its final scan — so this goroutine always exits
+			// once the watcher is reaped.
+			go func() {
+				p := startWait.Wait(0)
+				if p == "" {
+					return
+				}
+				r.mu.Lock()
+				fresh := r.job.SessionPath == ""
+				var adopted job.Job
+				if fresh {
+					r.job.SessionPath = p
+					adopted = r.job
+				}
+				r.mu.Unlock()
+				if fresh {
+					_ = job.Save(adopted)
+					s.logf(j.Name, "round %d: adopted session transcript %s (fsnotify)", round, p)
+				}
+			}()
 		} // Reaped by closeSessWatch once the path is pinned or the job turns
 		// terminal — the adoption sites run AFTER round() returns, so the
 		// watcher must outlive the round's client.

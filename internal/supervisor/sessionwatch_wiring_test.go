@@ -10,31 +10,33 @@ import (
 	"pi-supervisor/internal/job"
 )
 
-// seamResolver wraps the real SessionWatcher and counts TryPath calls, so a
-// test can prove the supervisor CONSULTS the watcher, not merely constructs
-// it. This is the assertion a unit test cannot make: the watcher was once
-// shipped with five passing unit tests while nothing in production ever
-// called it — the component worked, the wiring did not exist.
+// seamResolver wraps the real SessionWatcher and counts Wait calls, so a
+// test can prove the supervisor drives adoption from the EVENT side, not
+// merely from a directory scan. This is the assertion a unit test cannot
+// make: the watcher was once shipped with five passing unit tests while
+// nothing in production ever called it — and a later revision used only the
+// scan side, leaving the inotify watch opened and unused.
 type seamResolver struct {
 	sessionResolver
-	tryPaths *atomic.Int64
+	waits *atomic.Int64
 }
 
-func (s seamResolver) TryPath() string {
-	s.tryPaths.Add(1)
-	return s.sessionResolver.TryPath()
+func (s seamResolver) Wait(timeout time.Duration) string {
+	s.waits.Add(1)
+	return s.sessionResolver.Wait(timeout)
 }
 
 // TestFreshLaunchAdoptsSessionViaWatcher runs a full LAUNCH round against the
 // fake pi and proves the wiring, not the component:
 //
 //   - the round loop ARMS a SessionWatcher for the fresh-LAUNCH case
-//     (sess == ""), and
-//   - transcript resolution CONSULTS it (TryPath > 0) rather than only
-//     polling FindSession.
+//     (sess == "") and drives adoption from the EVENT side (Wait > 0), and
+//   - the transcript is pinned WHILE THE ROUND IS STILL LIVE — with a round
+//     far shorter than the 2s resolution tick, only the fsnotify Wait
+//     goroutine can do that; a scan-only or post-round-only supervisor fails.
 //
 // If the supervisor ever reverts to pure FindSession polling — the exact
-// regression commit 670771e claimed to fix — both counters drop to zero and
+// regression commit 670771e claimed to fix — the counters drop to zero and
 // this test fails.
 func TestFreshLaunchAdoptsSessionViaWatcher(t *testing.T) {
 	testEnv(t)
@@ -56,7 +58,7 @@ func TestFreshLaunchAdoptsSessionViaWatcher(t *testing.T) {
 	}
 	writeJob(t, j)
 
-	var armed, tryPaths atomic.Int64
+	var armed, waits atomic.Int64
 	orig := newSessionResolver
 	newSessionResolver = func(wt string, notBefore time.Time) (sessionResolver, error) {
 		w, err := orig(wt, notBefore)
@@ -64,7 +66,7 @@ func TestFreshLaunchAdoptsSessionViaWatcher(t *testing.T) {
 			return nil, err
 		}
 		armed.Add(1)
-		return seamResolver{sessionResolver: w, tryPaths: &tryPaths}, nil
+		return seamResolver{sessionResolver: w, waits: &waits}, nil
 	}
 	defer func() { newSessionResolver = orig }()
 
@@ -78,6 +80,25 @@ func TestFreshLaunchAdoptsSessionViaWatcher(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The transcript must be pinned WHILE THE ROUND IS STILL LIVE. The fake
+	// pi's round is far shorter than the marker watcher's 2s tick, so no
+	// captureSession tick can pin mid-round: only the event-driven Wait
+	// goroutine can. A tick-only or post-round-only wiring fails here.
+	pinnedLive := false
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		r := s.jobs["watchwire"]
+		r.mu.Lock()
+		pinned := r.job.SessionPath != ""
+		active := r.active
+		r.mu.Unlock()
+		if pinned {
+			pinnedLive = active
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
 	waitFor(t, 30*time.Second, func() bool {
 		st, err := job.LoadState("watchwire")
 		return err == nil && st.State == "done"
@@ -86,8 +107,11 @@ func TestFreshLaunchAdoptsSessionViaWatcher(t *testing.T) {
 	if got := armed.Load(); got != 1 {
 		t.Fatalf("fresh LAUNCH armed %d session watchers, want 1 — the supervisor stopped using the watcher", got)
 	}
-	if got := tryPaths.Load(); got < 1 {
-		t.Fatalf("session resolution consulted the watcher %d times, want >= 1 — the supervisor is polling instead", got)
+	if got := waits.Load(); got < 1 {
+		t.Fatalf("nothing ever called Wait (%d) — the inotify watch is opened and unused, adoption is scan-only", got)
+	}
+	if !pinnedLive {
+		t.Fatal("session transcript was not pinned while the round was live — adoption is not event-driven (Wait never ran or fired only post-round)")
 	}
 
 	// And the adopted transcript is the one the fake pi created in the
