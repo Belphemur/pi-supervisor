@@ -94,7 +94,18 @@ type Response struct {
 
 // Serve accepts JSON-line requests until stop closes.
 func Serve(sockPath string, h Handler, stop chan struct{}) {
-	_ = os.Remove(sockPath)
+	// Refuse to steal the socket. A stale path is safe to remove, but a path a
+	// LIVE daemon is answering on is not ours to unlink: doing so orphans that
+	// daemon's listener and every client gets "connection refused" while
+	// `systemctl is-active` still says active. That exact confusion happened
+	// here when a second daemon was started by hand against the same socket.
+	if alive(sockPath) {
+		fmt.Fprintf(os.Stderr,
+			"control socket: %s is already served by a live daemon; refusing to take it over\n",
+			sockPath)
+		os.Exit(1)
+	}
+	_ = os.Remove(sockPath) // stale or absent: safe to replace
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "control socket: %v\n", err)
@@ -176,6 +187,18 @@ func truncate(s string, limit int) string {
 		return s[:limit] + "…"
 	}
 	return s
+}
+
+// alive reports whether something is already accepting on sockPath. A
+// successful dial is the only proof; a failed one (missing file, ECONNREFUSED
+// on a stale inode) means the path is free for us to take.
+func alive(sockPath string) bool {
+	c, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
 }
 
 // writeOne writes one Response line; false = the client is gone.

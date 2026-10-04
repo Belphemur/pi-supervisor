@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -560,5 +561,30 @@ func TestRefusalIsLoggedWithReason(t *testing.T) {
 	logResponse("status", "", Response{OK: true})
 	if sink.Len() != 0 {
 		t.Fatalf("successful request was logged: %q", sink.String())
+	}
+}
+
+// A second daemon must NOT unlink a socket a live daemon is answering on: the
+// old Remove-then-Listen left the running daemon holding an orphaned inode, so
+// every client got "connection refused" while systemd still reported active.
+func TestServeRefusesToStealALiveSocket(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "live.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	if !alive(sock) {
+		t.Fatal("a socket with a live listener must read as alive")
+	}
+	_ = os.Remove(sock) // t.TempDir cleanup would do it anyway
+	if alive(sock) {
+		t.Fatal("an absent socket must not read as alive")
+	}
+	// A stale inode — file present, nobody listening — is ours to take.
+	_ = os.WriteFile(sock, nil, 0o600)
+	if alive(sock) {
+		t.Fatal("a stale socket file must not read as alive (it must be replaceable)")
 	}
 }
