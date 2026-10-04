@@ -304,3 +304,33 @@ func TestMessageCannotForgeALine(t *testing.T) {
 		t.Fatalf("message was not quoted/escaped: %q", got)
 	}
 }
+
+// The split sink is the daemon's real shape and the ONLY place the level
+// word and the stream are decided, so it gets its own test: INFO must land on
+// stdout, WARN and ERROR on stderr, and they must keep their own words.
+// Regression guard for a collapse that turned every refusal into ERROR.
+func TestSplitSinkRoutesByLevel(t *testing.T) {
+	var out, errb bytes.Buffer
+	h := &writerHandler{level: levelVar, sink: newSplitSink(&out, &errb)}
+	lg := slog.New(h)
+
+	lg.With(SubsystemKey, "job").Info("probe_info")
+	lg.With(SubsystemKey, "control").Warn("probe_warn")
+	lg.With(SubsystemKey, "job").Error("probe_error")
+
+	oLines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	eLines := strings.Split(strings.TrimSuffix(errb.String(), "\n"), "\n")
+	if len(oLines) != 1 || !strings.Contains(oLines[0], " INFO ") ||
+		!strings.Contains(oLines[0], "job event=probe_info") {
+		t.Fatalf("stdout stream = %q", out.String())
+	}
+	if len(eLines) != 2 {
+		t.Fatalf("stderr stream = %q", errb.String())
+	}
+	if !strings.Contains(eLines[0], " WARN ") || !strings.Contains(eLines[0], "control event=probe_warn") {
+		t.Fatalf("WARN line = %q", eLines[0])
+	}
+	if !strings.Contains(eLines[1], " ERROR ") || !strings.Contains(eLines[1], "event=probe_error") {
+		t.Fatalf("ERROR line = %q", eLines[1])
+	}
+}

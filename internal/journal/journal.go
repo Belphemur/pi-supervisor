@@ -78,7 +78,7 @@ var (
 	writeMu  sync.Mutex
 	out      io.Writer = os.Stdout
 	sink               = newSink(os.Stdout)
-	logger             = slog.New(newLineHandler(&writeMu, sink))
+	logger             = slog.New(newLineHandler(sink))
 )
 
 // sinkSet is the zerolog writer set. A redirected sink (SetOutput) is a
@@ -98,7 +98,14 @@ func newSink(w io.Writer) *sinkSet {
 		zl := zerolog.New(newConsole(w))
 		return &sinkSet{zl: &zl}
 	}
-	o, e := zerolog.New(newConsole(os.Stdout)), zerolog.New(newConsole(os.Stderr))
+	return newSplitSink(os.Stdout, os.Stderr)
+}
+
+// newSplitSink is the daemon's real shape: two streams so journald can read a
+// priority off them. Split out from newSink so the routing is testable without
+// capturing the process's own stdout.
+func newSplitSink(out, errw io.Writer) *sinkSet {
+	o, e := zerolog.New(newConsole(out)), zerolog.New(newConsole(errw))
 	return &sinkSet{out: &o, err: &e, split: true}
 }
 
@@ -157,7 +164,7 @@ func SetOutput(w io.Writer) (prev io.Writer) {
 	defer outMu.Unlock()
 	prev, out = out, w
 	sink = newSink(w)
-	logger = slog.New(newLineHandler(&writeMu, sink))
+	logger = slog.New(newLineHandler(sink))
 	return prev
 }
 
@@ -197,19 +204,19 @@ type lineHandler struct {
 	groups []string
 }
 
-func newLineHandler(mu *sync.Mutex, s *sinkSet) slog.Handler {
-	return &writerHandler{level: levelVar, sink: s, mu: mu}
+func newLineHandler(s *sinkSet) slog.Handler {
+	return &writerHandler{level: levelVar, sink: s}
 }
 
-// writerHandler owns the destination and the single mutex that keeps
-// concurrent emitters (one per job loop plus the control server) from
-// interleaving halves of a line. Every handler in the process shares that one
-// mutex: a per-handler mutex would leave distinct subsystems (daemon, job,
-// control) racing into the same sink.
+// writerHandler owns the destination. There is deliberately NO mutex FIELD
+// here: a handler field would be copied by every WithAttrs clone and would
+// silently become "one lock per root logger", which is exactly the hole the
+// concurrency test could not see. Handle takes the package-global writeMu, so
+// every handler in the process — cloned, rebuilt by SetOutput, or built
+// directly in a test — serializes on the same lock.
 type writerHandler struct {
 	lineHandler
 	sink *sinkSet
-	mu   *sync.Mutex
 }
 
 func (h *writerHandler) WithAttrs(as []slog.Attr) slog.Handler {
@@ -272,8 +279,8 @@ func (h *writerHandler) Handle(_ context.Context, r slog.Record) error {
 		return true
 	})
 
-	h.mu.Lock()
-	defer h.mu.Unlock() // one whole-line write at a time
+	writeMu.Lock()
+	defer writeMu.Unlock() // one whole-line write at a time
 	// Msg() is what actually writes the record, so it belongs inside the lock.
 	e.Msg(msg)
 	return nil
@@ -300,9 +307,14 @@ func (s *sinkSet) event(l slog.Level) *zerolog.Event {
 			return s.zl.Error()
 		}
 	}
+	// WARN and ERROR share a stream but NOT a word: collapsing them here
+	// would print every refusal as ERROR, and the level token is what an
+	// operator greps for.
 	switch {
 	case l < slog.LevelWarn:
 		return s.out.Info()
+	case l < slog.LevelError:
+		return s.err.Warn()
 	default:
 		return s.err.Error()
 	}
