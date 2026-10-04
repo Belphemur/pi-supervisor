@@ -65,6 +65,16 @@ type Supervisor struct {
 	wg   sync.WaitGroup
 	// steerWait overrides the ack-wait budget; 0 = poll interval + margin.
 	steerWait time.Duration
+	// ghClients caches one GitHub client per owner/repo (ADR-0012). Lazy, so a
+	// daemon that never reviews never touches GitHub credentials.
+	ghClients *reviewClients
+	// reviewRounds is the default campaign budget (ADR-0012 §5); 0 = 5.
+	reviewRounds int
+	// reviewAckTimeoutDur bounds a pending bulk_resolve; 0 = 30m.
+	reviewAckTimeoutDur time.Duration
+	// reviewWarmupDur is how long the auto-trigger waits for CodeRabbit to
+	// produce threads before counting; 0 = 5m.
+	reviewWarmupDur time.Duration
 }
 
 type runner struct {
@@ -76,10 +86,20 @@ type runner struct {
 	runlogB int64
 	stopCh  chan struct{}
 	active  bool
+	// review is the live review campaign, if any (ADR-0012 §4). Separate from
+	// state so a review round never resets the build job's accounting.
+	review *reviewCampaign
+	// autoReview is the one-shot intent to arm a review when the completion
+	// gate closes on an open PR.
+	autoReview *autoReviewSpec
 }
 
 func New() *Supervisor {
-	return &Supervisor{jobs: map[string]*runner{}, stop: make(chan struct{})}
+	return &Supervisor{
+		jobs:      map[string]*runner{},
+		stop:      make(chan struct{}),
+		ghClients: newReviewClients(),
+	}
 }
 
 func (s *Supervisor) logf(name, format string, args ...any) {
@@ -155,6 +175,17 @@ func (r *runner) snapshot() job.Status {
 	}
 	if r.job.FinalReport != "" {
 		st.FinalReportOK = job.Exists(r.job.FinalReport)
+	}
+	// Review snapshot is built INLINE: reviewStatus takes r.mu, which this
+	// method already holds — calling it here would self-deadlock.
+	if c := r.review; c != nil {
+		c.mu.Lock()
+		st.Review = &job.ReviewStatus{
+			Active: r.active, Owner: c.owner, Repo: c.repo, PR: c.pr,
+			Round: c.round, MaxRound: c.maxRound, Type: c.kind,
+			PendingAcks: len(c.pendingAcks),
+		}
+		c.mu.Unlock()
 	}
 	if r.job.SessionPath != "" {
 		if fi, err := os.Stat(r.job.SessionPath); err == nil {
@@ -720,12 +751,35 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			markerSeen = job.RunlogContains(job.Runlog(name), j.Marker)
 		}
 		if j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {
+			// ADR-0012 §4.1: the auto-trigger runs HERE, in the gate's tail —
+			// not "mid-round". There is no live round to fire from: the gate
+			// clears `active` below and Start refuses a done job. So the
+			// handoff is explicit: the build job closes as done, and if an
+			// auto_review stanza is armed against an OPEN PR, the job
+			// transitions done -> reviewing and keeps looping on the SAME
+			// session (never re-LAUNCHing).
+			autoArmed := s.autoReviewHandoff(name, r)
+
 			r.mu.Lock()
-			r.state.State, r.active = "done", false
+			if autoArmed {
+				// reviewing: the campaign owns the loop from here. The build
+				// job's done verdict is preserved on state for the final
+				// report; only the live verdict changes.
+				r.state.State = "reviewing"
+				r.active = true
+				r.review.round = r.state.Round
+			} else {
+				r.state.State, r.active = "done", false
+			}
 			r.mu.Unlock()
 			r.persistState()
 			s.logf(name, "round %d: marker %q detected in session transcript — done", round, j.Marker)
 			s.emit(name, "done", round, 0, dur, "", "marker %q detected in session transcript — run is over", j.Marker)
+			if autoArmed {
+				s.emit(name, "reviewing", round, 0, 0, "",
+					"review campaign entered after the completion gate (ADR-0012 §4.1)")
+				return
+			}
 			return
 		}
 

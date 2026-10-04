@@ -4,6 +4,7 @@ package control
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -35,6 +36,30 @@ type Watcher interface {
 	Watch(job string) (<-chan events.Event, func(), *events.Event)
 }
 
+// Reviewer is the optional review surface (ADR-0012): the daemon-owned
+// GitHub review loop pi drives through the `_pi-supervisor-review` shim.
+// Implemented by Supervisor. Kept separate from Handler so the control
+// package never imports the supervisor or review packages.
+type Reviewer interface {
+	// HandleReview serves the campaign verbs (review/ack) and the shim's
+	// per-action calls over one protocol.
+	HandleReview(ctx context.Context, req ReviewRequest) any
+}
+
+// ReviewRequest is the control-socket payload for a review call. The shape is
+// declared here (consumer-defined) so internal/review stays out of the wire
+// types; the supervisor decodes it into its own struct.
+type ReviewRequest struct {
+	Cmd    string          `json:"cmd"`
+	Job    string          `json:"job,omitempty"`
+	PR     int             `json:"pr,omitempty"`
+	Rounds int             `json:"rounds,omitempty"`
+	Type   string          `json:"type,omitempty"`
+	Auto   bool            `json:"auto,omitempty"`
+	Event  string          `json:"event,omitempty"`
+	Raw    json.RawMessage `json:"-"`
+}
+
 // Request is one control command (one JSON line per connection).
 type Request struct {
 	Cmd  string `json:"cmd"`            // status|start|stop|steer|logs|reload
@@ -59,7 +84,10 @@ type Request struct {
 type Response struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
-	Data  any    `json:"data,omitempty"`
+	// Reason is the machine-readable refusal symbol for review calls
+	// (ADR-0012 §2.4). A caller branches on this, never on Error prose.
+	Reason string `json:"reason,omitempty"`
+	Data   any    `json:"data,omitempty"`
 }
 
 // Serve accepts JSON-line requests until stop closes.
@@ -222,7 +250,65 @@ func dispatch(h Handler, raw []byte) Response {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true}
+	case "review", "review_action", "ack":
+		return dispatchReview(h, raw)
 	default:
 		return Response{OK: false, Error: "unknown cmd " + req.Cmd}
 	}
+}
+
+// dispatchReview routes the review surface. The supervisor owns the protocol
+// shape (it must, to enforce the live-round guard), so the raw request is
+// forwarded verbatim and the typed reply is re-wrapped for the wire.
+//
+// A review refusal carries its reason as DATA (`data.reason`), not just as the
+// error string: the consumer is an LLM that must branch on a symbol rather
+// than parse prose (ADR-0012 §2.4).
+func dispatchReview(h Handler, raw []byte) Response {
+	rv, ok := h.(Reviewer)
+	if !ok {
+		return Response{OK: false, Error: "review unsupported", Reason: "usage"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	var req ReviewRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		// A malformed review call still gets a reason: the consumer branches on
+		// the symbol, so returning reason-less prose here would be a gap in the
+		// closed enum.
+		return Response{
+			OK:     false,
+			Error:  "bad review json: " + err.Error(),
+			Reason: "usage",
+		}
+	}
+	// The full payload (threads, replies, ids) lives in the raw body; the
+	// envelope only needs the routing fields, so hand both over.
+	req.Raw = append(json.RawMessage(nil), raw...)
+	out := rv.HandleReview(ctx, req)
+	resp, isResp := out.(Response)
+	if isResp {
+		return resp
+	}
+	// Anything else is a typed reply struct the supervisor owns; round-trip
+	// it through JSON so internal types never leak into the wire format.
+	data, err := json.Marshal(out)
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	var generic any
+	if err := json.Unmarshal(data, &generic); err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	m, isMap := generic.(map[string]any)
+	if !isMap {
+		return Response{OK: true, Data: generic}
+	}
+	okFlag, _ := m["ok"].(bool)
+	reason, _ := m["reason"].(string)
+	message, _ := m["message"].(string)
+	delete(m, "ok")
+	delete(m, "reason")
+	delete(m, "message")
+	return Response{OK: okFlag, Error: message, Data: m, Reason: reason}
 }

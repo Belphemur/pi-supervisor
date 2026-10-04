@@ -23,6 +23,9 @@ Unix socket.
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
 | `internal/job/transcript.go` | completion surface: `TranscriptContains`, `TranscriptWatcher` (ADR-0011) |
 | `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap. Same tail scrapes the round's GitHub PR URL (ADR-0006) |
+| `internal/review/` | GitHub client for ADR-0012: GraphQL for review threads (the only surface with thread identity/`isResolved`/author), REST for PR + CI metadata, one shared token source (ghinstallation for the App, `gh auth token` fallback). Holds the closed `Reason` enum that maps to exit codes |
+| `internal/supervisor/review_*.go` | The review surface: campaign state + answer-before-resolve guard (`review_campaign.go`), the six verbs (`review_action.go`), campaign arming + client cache (`review_start.go`), the `done → reviewing` auto-trigger (`review_auto.go`), ack expiry (`ExpireAcks`) |
+| `doc/skill/pi_supervisor_review/` | The injected review-round skill + the `_pi-supervisor-review` shim pi calls (ADR-0012) |
 | `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
 | `install/install.sh` | Build + systemd unit + Hermes skill symlink + verification |
 | `install/pi-supervisor.service` | `Type=notify` user unit (`WatchdogSec=120`) |
@@ -116,6 +119,39 @@ Unix socket.
    `consumed` ack derived from the ctrl reader's offset would be true by
    construction — exactly the false-delivery signal ADR-0005 exists to kill. Use
    `steer --interrupt` instead. Don't add one.
+16. **Review thread ids are `PRRT_` GraphQL node ids, end to end (ADR-0012).**
+    A numeric id from `GET /pulls/<n>/comments` is a *comment* node and both
+    mutations reject it. `internal/review.ValidThreadID` is the only gate, and
+    the daemon is the only producer of ids on this surface — never add a path
+    that accepts a comment id, and never let the shim derive one.
+17. **The daemon stamps `job`/`round` for every review call.** A client-supplied
+    round is CHECKED, never used, and a mismatch is refused (`round-mismatch`).
+    If the shim could name its own round the answer-before-resolve guard would be
+    self-certifying — the ADR-0005 false-delivery class. Authorization
+    (is a round live?) is checked BEFORE input validation or any GitHub call, so
+    an out-of-round caller learns nothing about id validity or PR existence.
+18. **Answer-before-resolve is enforced per ROUND, not per campaign.**
+    `answeredInRound(round, id)` is the guard; a reply from round N-1 must not
+    authorize a close in round N. `markAnswered` runs only AFTER every reply in
+    the batch actually landed, so a failed batch never authorizes a close.
+19. **Bulk close is ack-gated and EXPIRES (ADR-0012 §2.3).** `bulk_resolve` posts
+    the audit comment and returns an `ack_id`; it applies nothing until
+    `pi-supervisor ack`. Unacked requests are dropped by `ExpireAcks` after
+    `review.ack_timeout` and the threads stay open — fail closed, never a
+    deadlock, never silent. There is no human ACK: every consumer is an LLM, so
+    an interactive gate would block forever.
+20. **Review errors are a closed `Reason` enum, never prose.** `ExitCode()` on
+    the reason is what maps to ADR-0008's contract (2 = change the call, 1 =
+    retry). Adding a failure path that returns a bare `fmt.Errorf` breaks the
+    shim's ability to branch — including the control-socket bad-JSON path, which
+    must set `Reason: "usage"`.
+21. **go-github v90 renamed its services.** `Pulls` → `PullRequests`,
+    `Apps.FindRepositoryInstallation` → `GetRepositoryInstallation`, and
+    `AppsTransport`/`InstallationTokenSource` were REMOVED — App auth now goes
+    through `github.com/bradleyfalzon/ghinstallation/v2` (`NewAppsTransport` then
+    `NewFromAppsTransport`), which is what go-github's own docs recommend. Do not
+    reintroduce the v69-era App helpers; there is no hand-rolled JWT or refresh
+    loop in this tree.
 
 ## Build / test / install
 

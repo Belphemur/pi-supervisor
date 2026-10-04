@@ -293,9 +293,20 @@ Chosen per `Start`, in priority order:
    login' or set GITHUB_APP_ID`.
 
 Deps, current as of 2026: `github.com/google/go-github/v90` (REST) +
-`github.com/shurcooL/githubv4` (GraphQL). `githubv4` wraps a plain
-`http.Client`, so both clients share one authenticated transport and therefore
-one token source — two SDKs, one auth path to keep in sync (DRY).
+`github.com/shurcooL/githubv4` (GraphQL) + `github.com/bradleyfalzon/ghinstallation/v2`
+(App JWT + installation-token refresh). `githubv4` wraps a plain
+`http.Client`, so both API clients share one authenticated transport and
+therefore one token source — two SDKs, one auth path to keep in sync (DRY).
+
+> **Correction, found at implementation time.** This section originally named
+> `go-github`'s `InstallationTokenSource` as the App-token refresher.
+> **go-github v90 removed `AppsTransport` and `InstallationTokenSource`** — its
+> own package docs now point at `ghinstallation/v2`, so that is what the daemon
+> uses (`NewAppsTransport` for the App JWT, then `NewFromAppsTransport` for the
+> installation-scoped, auto-renewing token). v90 additionally renamed `Pulls` →
+> `PullRequests` and `Apps.FindRepositoryInstallation` →
+> `GetRepositoryInstallation`. The intent is unchanged — no hand-rolled JWT or
+> refresh loop — but the named helpers no longer exist.
 
 The daemon enforces the *budget* and the *loop*; pi triages and authors replies.
 What carries over from `answer-code-review` is its **triage vocabulary** (fix /

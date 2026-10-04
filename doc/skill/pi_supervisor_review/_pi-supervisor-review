@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# _pi-supervisor-review — the shim pi calls for every GitHub review action
+# during a review round (ADR-0012 §2).
+#
+# A thin, non-interactive wrapper over `pi-supervisor review-action`, which
+# speaks the daemon's JSON control protocol over the unix socket. There is NO
+# GitHub logic here and no `gh` / `reply_review.py`: the daemon owns the
+# credentials and performs every API call, so pi never holds a token.
+#
+# Every subcommand is scriptable and every failure is a non-zero exit plus a
+# machine-readable reason on stderr — the caller is an LLM, not a human.
+#
+# Usage:
+#   _pi-supervisor-review list_threads  [--job J] [--pr N]
+#   _pi-supervisor-review thread_detail  --thread-id PRRT_... [--job J]
+#   _pi-supervisor-review post_replies   --pr N '[{"thread_id":"PRRT_…",
+#                                         "type":"acceptance","body":"…"}]'
+#   _pi-supervisor-review resolve_thread --thread-id PRRT_...
+#   _pi-supervisor-review bulk_resolve   --pr N --reason "…" '[PRRT_…, …]'
+#   _pi-supervisor-review check_ci       [--pr N]
+#
+# Exit codes (ADR-0008 + ADR-0012 §2.4):
+#   0  success
+#   2  the call must change: usage, no-live-round, round-mismatch,
+#      not-answered-this-round, unknown-thread
+#   1  refused at runtime, retryable: auth-unavailable, rate-limited, github-error
+set -uo pipefail
+
+PI_SUPERVISOR="${PI_SUPERVISOR_BIN:-pi-supervisor}"
+SOCKET="${PI_SUPERVISOR_SOCKET:-${PI_SUPERVISOR_SOCK:-}}"
+
+die() { printf '%s\n' "$1" >&2; exit "${2:-2}"; }
+
+[ -n "$SOCKET" ] || \
+  die "_pi-supervisor-review: set PI_SUPERVISOR_SOCKET to the daemon's control socket" 2
+command -v "$PI_SUPERVISOR" >/dev/null 2>&1 || \
+  die "_pi-supervisor-review: '$PI_SUPERVISOR' not on PATH" 2
+
+# json_str escapes a string into a JSON string literal. Only the bulk_resolve
+# audit reason needs this: it is operator prose, and hand-splicing it into the
+# request is exactly how a quote in the reason turns into invalid JSON. Reply
+# bodies are never passed through here — they arrive as an already-encoded
+# JSON array from the caller.
+json_str() {
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g')"
+}
+
+[ $# -ge 1 ] || die "usage: _pi-supervisor-review <verb> [flags]" 2
+verb="$1"; shift
+
+job="${PI_SUPERVISOR_REVIEW_JOB:-}"
+pr="${PI_SUPERVISOR_REVIEW_PR:-0}"
+thread_id=""
+reason=""
+payload=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --job)       job="${2:-}"; shift 2 ;;
+    --pr)        pr="${2:-0}"; shift 2 ;;
+    --thread-id) thread_id="${2:-}"; shift 2 ;;
+    --reason)    reason="${2:-}"; shift 2 ;;
+    --json)      shift ;;
+    --)          shift; break ;;
+    -*)          die "_pi-supervisor-review: unknown flag $1" 2 ;;
+    *)           payload="$1"; shift ;;
+  esac
+done
+
+[ -n "$job" ] || \
+  die "_pi-supervisor-review: --job (or PI_SUPERVISOR_REVIEW_JOB) is required" 2
+
+# Per-verb fields are merged into a JSON object WITHOUT re-quoting the
+# caller's payload: a reply body with quotes and newlines must never be
+# re-encoded by hand. The payload is passed through verbatim and merged with a
+# JSON-aware merge, so no shell-quoting bug is possible.
+case "$verb" in
+  list_threads)  req="{\"pr\":$pr}" ;;
+  check_ci)      req="{\"pr\":$pr}" ;;
+  thread_detail)
+    [ -n "$thread_id" ] || die "_pi-supervisor-review: thread_detail needs --thread-id" 2
+    req="{\"thread_id\":$(json_str "$thread_id")}"
+    ;;
+  resolve_thread)
+    [ -n "$thread_id" ] || die "_pi-supervisor-review: resolve_thread needs --thread-id" 2
+    req="{\"thread_id\":$(json_str "$thread_id")}"
+    ;;
+  post_replies)
+    [ -n "$payload" ] || die "_pi-supervisor-review: post_replies needs a JSON array of replies" 2
+    req="{\"pr\":$pr,\"replies\":$payload}"
+    ;;
+  bulk_resolve)
+    [ -n "$reason" ] || die "_pi-supervisor-review: bulk_resolve needs --reason (it is posted as the audit trail)" 2
+    [ -n "$payload" ] || die "_pi-supervisor-review: bulk_resolve needs a JSON array of thread ids" 2
+    req="{\"pr\":$pr,\"reason\":$(json_str "$reason"),\"thread_ids\":$payload}"
+    ;;
+  *)
+    die "_pi-supervisor-review: unknown verb '$verb' (list_threads|thread_detail|post_replies|resolve_thread|bulk_resolve|check_ci)" 2
+    ;;
+esac
+
+# The socket must actually be listening; a missing daemon is a usage-class
+# failure (exit 2), matching `pi-supervisor`'s own contract.
+[ -S "$SOCKET" ] || die "_pi-supervisor-review: no daemon socket at $SOCKET" 2
+
+exec "$PI_SUPERVISOR" review-action "$verb" --job "$job" --pr "$pr" "$req"

@@ -96,6 +96,9 @@ func runDaemon() {
 	stop := make(chan struct{})
 	go control.Serve(socketPath(), sup, stop)
 	go sup.Monitor(stop)
+	// Sweep unacked bulk_resolve requests: an unattended campaign must never
+	// wedge on a gate nobody will visit (ADR-0012 §2.3).
+	go sup.ExpireAcks(stop)
 	// One sd_notify beat carries both the watchdog ping and STATUS=<n>
 	// parallel pi session(s) running, visible in `systemctl status`.
 	go notify.Beat(stop, sup.RunningCount)
@@ -410,6 +413,9 @@ func newRootCmd() *cobra.Command {
 		newLogsCmd(),
 		newReloadCmd(),
 		newWatchCmd(),
+		newReviewCmd(),
+		newAckCmd(),
+		newReviewActionCmd(),
 		newVersionCmd(),
 		newCompletionCmd(root),
 	)
@@ -613,6 +619,14 @@ func main() {
 	case errors.Is(err, errUsage), errors.Is(err, errUnreachable), isCobraUsageError(err):
 		os.Exit(exitUsage)
 	default:
+		// A review refusal carries its own exit class: 2 when the caller must
+		// change the call (usage / no live round / not-answered), 1 when it may
+		// retry (auth / rate limit / GitHub error). Branching on the reason
+		// keeps that decision out of the message text (ADR-0012 §2.4).
+		var rf *reviewFailure
+		if errors.As(err, &rf) {
+			os.Exit(rf.ExitCode())
+		}
 		os.Exit(exitRuntime)
 	}
 	_ = bufio.NewReader // silence if unused after refactors

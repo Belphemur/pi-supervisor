@@ -157,6 +157,21 @@ type State struct {
 	PRURL string `json:"pr_url,omitempty"`
 }
 
+// ReviewStatus is the review slice of a job's status (ADR-0012). It lives in
+// this package because job.Status is the wire shape and the supervisor
+// imports job, never the reverse.
+type ReviewStatus struct {
+	Active   bool   `json:"active"`
+	Owner    string `json:"owner,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	PR       int    `json:"pr,omitempty"`
+	Round    int    `json:"round"`
+	MaxRound int    `json:"max_rounds"`
+	Type     string `json:"type,omitempty"`
+	// PendingAcks is how many bulk_resolve requests await an ack.
+	PendingAcks int `json:"pending_acks"`
+}
+
 // Status is the live snapshot served over the socket / written to disk.
 type Status struct {
 	Name         string  `json:"name"`
@@ -172,6 +187,9 @@ type Status struct {
 	LastRunlogB  int64   `json:"last_runlog_bytes"`
 	InstantExits int     `json:"instant_exits"`
 	CIStalls     int     `json:"ci_stalls"`
+	// Review is the live review campaign's snapshot (ADR-0012), nil when the
+	// job is not in a review phase.
+	Review *ReviewStatus `json:"review,omitempty"`
 	// MarkerSeen latches true once the completion marker has been observed in
 	// the session transcript (ADR-0011). It is deliberately sticky: the run
 	// log is truncated at the start of every round, so a marker seen in ANY
