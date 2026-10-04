@@ -284,7 +284,11 @@ func dispatch(h Handler, raw []byte) Response {
 		// write" are exactly the facts the operator needs to see.
 		rep, err := h.Steer(req.Job, req.Text, req.NoWait, req.Interrupt)
 		if err != nil {
-			return Response{OK: false, Error: err.Error(), Data: rep}
+			// refuse() keeps the reason; the report travels as DATA either
+			// way, which is what the steer contract requires.
+			r := refuse(err)
+			r.Data = rep
+			return r
 		}
 		return Response{OK: true, Data: rep}
 	case "logs":
