@@ -142,9 +142,14 @@ pi-supervisor review <job> --auto           # arm auto-trigger (§4)
   manual review campaign. `--auto` writes an `auto_review` stanza to the job
   def so the completion gate triggers one (§4).
 - `--rounds N` — your "how many turns". Becomes this run's `MaxRounds`.
-  **Default 2** (per the request), not the derived heuristic I floated earlier
-  — an operator-set count beats a bot-computed one, and 2 matches the
-  observed pattern (reply round + verification round).
+  **Default 5** (review rounds are hours-long). `--rounds 0` = auto-derive
+  from the thread count at arm time (`ceil(open / 12)`, capped by
+  `MAX_ROUNDS_DEFAULT`); the operator-set default wins for explicit calls.
+- `--type acceptance|rebuttal` — declares the round's character. An
+  `acceptance` round is handed threads treated as accepted findings to fix;
+  a `rebuttal` round is where the agent pushes back with evidence. Recorded
+  per round in `round_done` so stats surface `#acceptance` vs `#rebuttal`
+  in `watch`/`status`.
 - `--skill <path>` — the skill injected into pi's brief for the review
   rounds. **Defaults to `answer-code-review`** so the triage rules are
   unchanged; only the *orchestration* moves into the daemon. The brief also
@@ -170,9 +175,9 @@ supervisor:
    threads").
 2. Waits 5 minutes (`review.coderabbit_warmup`, configurable; default
    `5m`).
-3. After warmup: resolves the open-thread count via `gh`.
+3. After warmup: resolves the open-thread count via `go-github`.
    - If > 0: arms a `review <job> --pr <N>` campaign with the stanza's
-     `rounds` (default 2) and `skill`, emitting `review_armed`.
+     `rounds` (default 5 — review rounds are hours-long) and `skill`, emitting `review_armed`.
    - If still 0: emits `review_skipped` with `reason:"no open threads
      after CodeRabbit warmup"` — does not arm.
 
@@ -191,19 +196,19 @@ Q1. **CodeRabbit trigger comment.** Hardcoded to `@coderabbitai review`?
 Configurable via `review.trigger_comment` (default `@coderabbitai review`)
 so a different bot / org convention is a one-line change, not a rebuild.
 
-Q2. `--rounds 0` semantics. `0` = auto-derive from the thread count at arm
-time (`ceil(open / 12)`, capped) as a convenience for large PRs. The default
-remains 2. Worth keeping, or should 0 be an error to force an explicit count?
+Q2. **`--rounds 0`** now resolved: auto-derive (`ceil(open/12)`, capped).
+Default stays 5 on explicit calls. No further decision needed.
 
 Q3. **Who enforces "answer every thread before resolve"?** Today the skill
-does it by convention. With the daemon owning the loop, do you want the
-daemon to *refuse* a `resolve_thread` request via the shim whose thread has no
-agent-authored reply in the last N minutes (a cheap server-side guard), or
-keep it as a skill/prompt rule only?
+does it by convention. With the daemon owning the loop and now using
+`go-githubv4` typed errors, do you want the daemon to *refuse* a
+`resolve_thread` request via the shim whose thread has no agent-authored
+reply in the last N minutes (a cheap server-side guard), or keep it as a
+skill/prompt rule only?
 
-Q4. **Push detection.** If a round replied but did not push, the head SHA is
-unchanged and the next round re-handles stale threads. Is that the policy you
-want, or should a "no push" round count against the `MaxRounds` budget?
+Q4. **Push detection** now resolved: a no-push round is free (does NOT count
+against `MaxRounds`) — only pi-execution rounds consume budget. No further
+decision needed.
 
 Q5. **Pre-merge gate.** This only gates *on* `pre-merge --pr` (ADR-pre-merge),
 never executes it — confirming that matches your mental model.
@@ -211,14 +216,16 @@ never executes it — confirming that matches your mental model.
 ## Consequences
 
 - Review campaigns get the same bounded-budget discipline as every other job:
-  `MaxRounds` is set at `Start`, visible in `status`, enforced by the loop.
-  No free-running review.
-- `watch <job>` becomes a real review dashboard: per-round open-thread count
-  + head SHA + the remaining thread list, driven by the `round_done` event
-  payload.
-- No new daemon process model, no new credential surface — one read-only
-  polling path (`gh api` reads) plus one mutation path (`gh api` writes, only
-  on demand from the shim).
+  `MaxRounds` is set at `Start`, visible in `status`, enforced by the loop, and
+  only pi-execution rounds consume it (a no-push answer round is free). No
+  free-running review.
+- `watch <job>` becomes a real review dashboard: per-round `round_done` lines
+  (round type `#acceptance`/`#rebuttal`, open-thread count, head SHA, rc,
+  pushed?) + the remaining thread list, driven by the event payload. Stats
+  surface `#accepted` / `#overridden` (rebuttal) counts.
+- No new daemon process model, no new credential surface — one GitHub SDK
+  client (`go-github` + `go-githubv4`, shared token source) plus one
+  `gh auth token` fallback for token acquisition only.
 - `answer-code-review` skill is **retired for review jobs only**: replaced by
   `pi-supervisor review` + the `pi_supervisor_review` skill + the
   `_pi-supervisor-review` shim for the review shape. Non-review jobs are
