@@ -1,0 +1,140 @@
+# CI for pi-supervisor.
+#
+# The gates here are the SAME ones AGENTS.md documents as mandatory. Keeping them
+# in one workflow is what makes the local gates and the PR gate agree: a change
+# that passes locally must pass here, or one of the two is lying.
+#
+# `-race` is not optional — the round loop, the control socket and the review
+# client are all concurrent, and two of the bugs found while building ADR-0012
+# were only visible under the race detector.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# A superseded run on the same ref is pointless: cancel it so a force-push or a
+# rapid iteration does not burn minutes on commits nobody will merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: build / vet / test / lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The module declares `go 1.27`; setup-go must agree or the toolchain
+          # silently differs from the one the author built with.
+          go-version: '1.27'
+          check-latest: true
+
+      # go.mod pins go 1.27 and the repo has no vendor/ directory, so the
+      # module cache is the only dependency source. Restore it to keep repeat
+      # runs fast without weakening the gate.
+      - name: Cache module downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Modernizers (errors.AsType, strings.SplitSeq, for-range-N). Catches
+      # code that is correct but written the pre-1.24 way.
+      - name: go fix
+        run: |
+          out=$(go fix -diff ./...)
+          if [ -n "$out" ]; then
+            echo "go fix has suggestions:"; echo "$out"; exit 1
+          fi
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"; echo "$out"; exit 1
+          fi
+
+      - name: Test (race)
+        run: go test ./... -race
+
+      # golangci-lint must be built against the same major Go as the module:
+      # a binary built with an older toolchain REFUSES to run here and only
+      # says "language version used to build golangci-lint is lower than the
+      # targeted Go version". Do not downgrade the version to dodge that — the
+      # bundled staticcheck panics on newer IR instead.
+      - name: golangci-lint
+        run: |
+          curl -sSfL \
+            https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.14.0
+          "$(go env GOPATH)/bin/golangci-lint" run ./...
+
+      # The installer is shell code that ships with every release; a syntax error
+      # in it is invisible to every other gate.
+      - name: Shell syntax
+        run: bash -n install/install.sh
+
+      # The review shim is executed by pi inside every review round. A syntax
+      # error breaks the campaign at its first verb, so it is gated like code.
+      - name: Shim syntax
+        run: bash -n doc/skill/pi_supervisor_review/_pi-supervisor-review
+
+  live-shim:
+    name: shim contract (no daemon, no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+      - name: Build the CLI
+        run: go build -o ./bin/pi-supervisor ./cmd/pi-supervisor
+      # The shim must refuse loudly rather than half-work when the socket or the
+      # daemon is missing: a silent success here would let a review round
+      # believe it had posted a reply when it had not (the ADR-0005 failure
+      # class). Every guard exits 2.
+      - name: Shim refuses without a socket
+        env:
+          PI_SUPERVISOR_BIN: ${{ github.workspace }}/bin/pi-supervisor
+        run: |
+          chmod +x doc/skill/pi_supervisor_review/_pi-supervisor-review
+          shim=doc/skill/pi_supervisor_review/_pi-supervisor-review
+          fail=0
+          check() { # desc, expected_exit, args...
+            desc="$1"; want="$2"; shift 2
+            set +e
+            out=$("$shim" "$@" 2>&1); got=$?
+            set -e
+            if [ "$got" -ne "$want" ]; then
+              echo "FAIL: $desc (exit $got, want $want)"; echo "$out"; fail=1
+            else
+              echo "ok: $desc"
+            fi
+          }
+          # No PI_SUPERVISOR_SOCKET at all.
+          check "no socket env" 2 list_threads --job j
+          # Socket env set, but nothing listening.
+          check "dead socket" 2 list_threads --job j --pr 1
+          # Unknown verb.
+          check "unknown verb" 2 bogus --job j
+          # Missing required flag.
+          check "resolve without --thread-id" 2 resolve_thread --job j
+          check "bulk_resolve without --reason" 2 bulk_resolve --job j --pr 1 '[]'
+          exit $fail

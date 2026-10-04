@@ -1,0 +1,40 @@
+{
+  "name": "master gate",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/master"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "required_status_checks": [
+          {
+            "context": "build / vet / test / lint"
+          },
+          {
+            "context": "shim contract (no daemon, no network)"
+          }
+        ],
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": true
+      }
+    },
+    {
+      "type": "non_fast_forward"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# pre-push — refuse a push when the local gates fail.
+#
+# WHY THIS EXISTS. The repo's ruleset (.github/rulesets/master-gate.json) is
+# committed but NOT applied: GitHub gates both branch protection and rulesets
+# behind Pro for private repositories. CI therefore *runs* on every push but does
+# not *block* a merge. This hook is the compensating control — the same gates,
+# run locally, failing the push instead of the merge.
+#
+# It mirrors .github/workflows/ci.yml exactly on purpose: a gate that differs
+# between the two is a gate nobody can trust. Anything added to one belongs in
+# the other.
+#
+# Install:  git config core.hooksPath .githooks
+# Bypass:   git push --no-verify      (the escape hatch, deliberately explicit)
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$repo_root" || exit 0
+
+# Remote-only refs on the first push of a branch have no upstream to compare
+# against; the gates still run, so nothing is skipped here.
+
+fail=0
+step() { printf '\n── %s\n' "$1"; }
+
+step "build"
+go build ./... || fail=1
+
+step "vet"
+go vet ./... || fail=1
+
+step "gofmt"
+out="$(gofmt -l .)"
+if [ -n "$out" ]; then
+    echo "gofmt needed on:"; echo "$out"; fail=1
+fi
+
+step "go fix"
+out="$(go fix -diff ./... 2>/dev/null)"
+if [ -n "$out" ]; then
+    echo "go fix has suggestions:"; echo "$out"; fail=1
+fi
+
+step "shell syntax"
+bash -n install/install.sh || fail=1
+bash -n doc/skill/pi_supervisor_review/_pi-supervisor-review || fail=1
+
+step "test -race"
+# Skippable for a fast push when the tree is unchanged; -race is the default
+# because two ADR-0012 bugs were only visible under it.
+if [ "${PI_SUPERVISOR_SKIP_TESTS:-0}" = "1" ]; then
+    echo "skipped (PI_SUPERVISOR_SKIP_TESTS=1)"
+else
+    go test ./... -race || fail=1
+fi
+
+if command -v golangci-lint >/dev/null 2>&1; then
+    step "golangci-lint"
+    golangci-lint run ./... || fail=1
+else
+    echo "── golangci-lint not on PATH; skipping (CI runs it)"
+fi
+
+printf '\n'
+if [ "$fail" -ne 0 ]; then
+    echo "PUSH REFUSED — a gate failed above."
+    echo "Fix, or bypass deliberately with: git push --no-verify"
+    exit 1
+fi
+echo "pre-push: all gates pass"
