@@ -29,7 +29,26 @@ if [ -e "${SKILL_LINK_DIR}/pi-supervisor" ] && [ ! -L "${SKILL_LINK_DIR}/pi-supe
   echo "    existing real dir ${SKILL_LINK_DIR}/pi-supervisor found; replacing with symlink"
   rm -rf "${SKILL_LINK_DIR}/pi-supervisor"
 fi
-ln -sfn "${SKILL_SRC}/pi-supervisor" "${SKILL_LINK_DIR}/pi-supervisor"
+ln -sfn "${SKILL_SRC}/pi-supervisor" "$SKILL_LINK_DIR/pi-supervisor"
+
+# The review shim (ADR-0012) is the ONLY way a pi review round reaches GitHub,
+# so it is part of the install, not an optional extra: a review round whose
+# transport is missing fails at the first verb. Installed as a symlink to the
+# canonical copy in doc/skill/pi_supervisor_review/, so edits land in one place.
+echo "==> review shim"
+install -d "$BIN_DIR"
+if [ -e "${BIN_DIR}/_pi-supervisor-review" ] && [ ! -L "${BIN_DIR}/_pi-supervisor-review" ]; then
+  echo "    existing real file ${BIN_DIR}/_pi-supervisor-review found; replacing with symlink"
+  rm -f "${BIN_DIR}/_pi-supervisor-review"
+fi
+ln -sfn "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review" "$BIN_DIR/_pi-supervisor-review"
+chmod +x "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review"
+# The shim resolves pi-supervisor from PATH; if the user's PATH misses BIN_DIR
+# the shim would fail at exec time rather than at install time, so check here.
+if ! command -v pi-supervisor >/dev/null 2>&1; then
+  echo "    note: ${BIN_DIR} is not on PATH — the review shim will not resolve pi-supervisor."
+  echo "          add it, or export PI_SUPERVISOR_BIN=${BIN_DIR}/pi-supervisor"
+fi
 
 echo "==> enabling service"
 systemctl --user daemon-reload

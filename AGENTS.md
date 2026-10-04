@@ -145,7 +145,22 @@ Unix socket.
     retry). Adding a failure path that returns a bare `fmt.Errorf` breaks the
     shim's ability to branch — including the control-socket bad-JSON path, which
     must set `Reason: "usage"`.
-21. **go-github v90 renamed its services.** `Pulls` → `PullRequests`,
+21. **Only REQUIRED CI checks block a review campaign.** `check_ci` asks GraphQL
+    `isRequired(pullRequestId:)` because the Actions `/jobs` endpoint carries no
+    required-ness flag. A failing OPTIONAL check is reported in `non_blocking`
+    and must NOT block — one flaky non-gating check would otherwise burn the
+    whole round budget and end `review_exhausted` with real findings untouched.
+    When required-ness is undeterminable, fail CLOSED (treat all as required) and
+    set `required_unknown`; never guess permissively.
+22. **`reviewing` is not a terminal event; `review_done`/`review_exhausted` are.**
+    The gate closes the build job and enters the review phase in ONE step, so
+    emitting terminal `done` there would make `watch` print "THE RUN IS OVER",
+    exit 0, and stop listening mid-campaign. `internal/events.Terminal` and the
+    `watchCtl` exit list must stay in sync with that decision.
+23. **A live campaign owns its round budget.** `loop` reads the campaign's
+    `MaxRounds` while `state == "reviewing"`, not the build job's — otherwise a
+    5-round campaign runs to the job's default 200.
+24. **go-github v90 renamed its services.** `Pulls` → `PullRequests`,
     `Apps.FindRepositoryInstallation` → `GetRepositoryInstallation`, and
     `AppsTransport`/`InstallationTokenSource` were REMOVED — App auth now goes
     through `github.com/bradleyfalzon/ghinstallation/v2` (`NewAppsTransport` then
@@ -157,6 +172,7 @@ Unix socket.
 
 ```bash
 GOTOOLCHAIN=auto go build ./... && go vet ./...   # both must be clean
+GOTOOLCHAIN=auto go fix -diff ./...                # must print nothing (modernizers)
 gofmt -l .                                         # must print nothing
 GOTOOLCHAIN=auto go test ./... -race              # -race is not optional
 /home/balor/go/bin/golangci-lint run ./...        # must exit 0 (v2.14.0)

@@ -44,9 +44,19 @@ type Event struct {
 	PRURL string `json:"pr_url,omitempty"`
 }
 
-// Terminal reports whether the event ends the watch (and the job's run).
+// Terminal reports whether an event ends the job's run: `watch` closes the
+// stream on it, and `watch -t` exits.
+//
+// `reviewing` is deliberately NOT terminal (ADR-0012 §4.1): the build job is
+// done but the review campaign still owns the round loop, so treating it as
+// terminal would stop the watch mid-campaign. `review_done` and
+// `review_exhausted` ARE terminal — they are how a campaign ends.
 func (e Event) Terminal() bool {
-	return e.Event == "done" || e.Event == "fatal" || e.Event == "stopped"
+	switch e.Event {
+	case "done", "fatal", "stopped", "review_done", "review_exhausted":
+		return true
+	}
+	return false
 }
 
 // broker fans events out to watch subscribers. Subscribers get a buffered

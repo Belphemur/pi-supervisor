@@ -99,7 +99,7 @@ func (c *Client) PostComment(ctx context.Context, owner, repo string, pr int, bo
 		return refuse(ReasonUsage, "comment body is empty")
 	}
 	_, _, err := c.rest.Issues.CreateComment(ctx, owner, repo, pr, &github.IssueComment{
-		Body: github.Ptr(body),
+		Body: new(body),
 	})
 	if err != nil {
 		return classifyGH(restErr(err))
@@ -143,8 +143,7 @@ func restErr(err error) error {
 			rerr.Response.Header.Get("x-ratelimit-remaining") == "0"
 		return &GHError{Status: status, Message: rerr.Message, RateLimited: limited}
 	}
-	var abuse *github.AbuseRateLimitError
-	if errors.As(err, &abuse) {
+	if abuse, ok := errors.AsType[*github.AbuseRateLimitError](err); ok {
 		return &GHError{Status: http.StatusForbidden, Message: abuse.Message, RateLimited: true}
 	}
 	return err
@@ -169,93 +168,15 @@ func (c *Client) PROpen(ctx context.Context, owner, repo string, pr int) (bool, 
 	return p.GetState() == "open", nil
 }
 
-// CICheck is one job's verdict within an Actions run.
-type CICheck struct {
-	Name   string `json:"name"`
-	Status string `json:"status"` // queued|in_progress|completed
-	// Conclusion mirrors GitHub's own job-conclusion vocabulary verbatim,
-	// including its British spelling — matching the wire format is the point.
-	Conclusion string `json:"conclusion"` //nolint:misspell // GitHub's own spelling, not ours
-}
-
-// CIRollup is the CI verdict for one head sha.
-type CIRollup struct {
-	Verdict string    `json:"verdict"` // pass|pending|fail
-	HeadSHA string    `json:"head_sha,omitempty"`
-	Checks  []CICheck `json:"checks,omitempty"`
-}
-
-// CheckCI returns the CI verdict for the PR's CURRENT head sha.
-//
-// It reads the Actions run's /jobs endpoint, NOT a `gh pr checks` rollup: that
-// rollup races state transitions right after a push and transiently reads
-// green with jobs still queued (ADR-0012 §3.3). Scoping to the head sha
-// observed at poll time also prevents a verdict for the wrong commit when a
-// push lands mid-poll.
-func (c *Client) CheckCI(ctx context.Context, owner, repo string, pr int) (*CIRollup, error) {
-	head, err := c.PRHeadSHA(ctx, owner, repo, pr)
-	if err != nil {
-		return nil, err
-	}
-	runs, _, err := c.rest.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, &github.ListWorkflowRunsOptions{
-		HeadSHA: head,
-		ListOptions: github.ListOptions{
-			PerPage: 10,
-		},
-	})
-	if err != nil {
-		return nil, classifyGH(restErr(err))
-	}
-	out := &CIRollup{HeadSHA: head, Verdict: "pass"}
-	// No run yet: not "green", it is "nothing has run". Report pending so the
-	// campaign keeps waiting instead of falsely declaring readiness.
-	if runs == nil || len(runs.WorkflowRuns) == 0 {
-		out.Verdict = "pending"
-		return out, nil
-	}
-	fail, pending := false, false
-	for _, run := range runs.WorkflowRuns {
-		jobs, _, err := c.rest.Actions.ListWorkflowJobs(ctx, owner, repo, run.GetID(), &github.ListWorkflowJobsOptions{
-			ListOptions: github.ListOptions{PerPage: 100},
-		})
-		if err != nil {
-			return nil, classifyGH(restErr(err))
-		}
-		if jobs == nil || len(jobs.Jobs) == 0 {
-			pending = true
-			continue
-		}
-		for _, j := range jobs.Jobs {
-			chk := CICheck{Name: j.GetName(), Status: j.GetStatus(), Conclusion: j.GetConclusion()}
-			out.Checks = append(out.Checks, chk)
-			switch j.GetConclusion() {
-			case "success", "neutral", "skipped", "":
-				if j.GetStatus() != "completed" {
-					pending = true
-				}
-			default:
-				fail = true
-			}
-		}
-	}
-	switch {
-	case fail:
-		out.Verdict = "fail"
-	case pending:
-		out.Verdict = "pending"
-	}
-	return out, nil
-}
-
 // parsePRURL extracts owner, repo and number from a github PR URL. Used to
 // derive the review target from the already-scraped pr_url (ADR-0006) rather
 // than a second scrape.
 func parsePRURL(raw string) (owner, repo string, pr int, ok bool) {
-	i := strings.Index(raw, "github.com/")
-	if i < 0 {
+	_, after, ok := strings.Cut(raw, "github.com/")
+	if !ok {
 		return "", "", 0, false
 	}
-	rest := strings.Trim(raw[i+len("github.com/"):], "/")
+	rest := strings.Trim(after, "/")
 	parts := strings.Split(rest, "/")
 	if len(parts) < 4 || parts[2] != "pull" {
 		return "", "", 0, false

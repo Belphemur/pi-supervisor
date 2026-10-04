@@ -123,8 +123,7 @@ func classifyGH(err error) *Refusal {
 	if err == nil {
 		return nil
 	}
-	var ghErr *GHError
-	if errors.As(err, &ghErr) {
+	if ghErr, ok := errors.AsType[*GHError](err); ok {
 		switch {
 		case ghErr.Status == http.StatusForbidden && ghErr.RateLimited:
 			return refuse(ReasonRateLimited, "github rate limited: %s", ghErr.Message)

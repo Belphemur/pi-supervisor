@@ -68,7 +68,7 @@ func TestActivityResetsIdle(t *testing.T) {
 	app(`{"content":"gh pr checks — waiting for CI"}`)
 	_, _ = d.Poll()
 	// Keep the transcript alive through the idle window.
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		time.Sleep(80 * time.Millisecond)
 		app(`{"content":"tool output still streaming"}`)
 		_, _ = d.Poll()

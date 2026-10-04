@@ -292,6 +292,57 @@ func watchFooter(ev map[string]any) {
 			fmt.Printf("      `pi-supervisor steer --interrupt %s \"...\"` to stop mid-turn. Then proceed\n", name)
 		}
 		fmt.Printf("  re-arm: pi-supervisor watch %s   (background+notify=true)\n", name)
+	case "reviewing":
+		// NOT terminal (ADR-0012 §4.1): the build job is done but the review
+		// campaign owns the loop. Saying "the run is over" here would be a lie
+		// and would make the LLM stop watching a live campaign.
+		fmt.Printf("BUILD DONE — %s entered its review campaign. The job is NOT over.\n", name)
+		fmt.Printf("LLM: the daemon now owns the outer loop (poll threads -> decide -> enforce\n")
+		fmt.Printf("rounds); pi fixes one round's findings at a time. Nothing to do but watch:\n")
+		fmt.Printf("  re-arm: pi-supervisor watch %s   (background+notify=true)\n", name)
+	case "review_round_done":
+		fmt.Printf("Review round progress for %s — %s\n", name, info)
+		fmt.Printf("  LLM: no action; the daemon decides the next round. Read progress with\n")
+		fmt.Printf("  `pi-supervisor status %s` (the `review` block) or the shim's list_threads.\n", name)
+		fmt.Printf("  re-arm: pi-supervisor watch %s\n", name)
+	case "review_done":
+		fmt.Printf("REVIEW CAMPAIGN COMPLETE — %s: 0 open threads and CI passing.\n", name)
+		fmt.Printf("LLM: verify, then hand off — `git -C %s diff --stat origin/HEAD`, and check\n", wt)
+		fmt.Printf("that every thread got an inline reply. THE OWNER MERGES: do not merge.\n")
+		fmt.Println("No re-arm: the campaign is finished.")
+	case "review_exhausted":
+		fmt.Printf("REVIEW BUDGET EXHAUSTED — %s: %s\n", name, info)
+		fmt.Printf("LLM: threads are still open. Check the shim's list_threads for what is left,\n")
+		fmt.Printf("then re-arm with more budget: pi-supervisor review %s --pr N --rounds N\n", name)
+	case "review_gate_error":
+		fmt.Printf("Review state unreadable — %s: %s\n", name, info)
+		fmt.Printf("LLM: the campaign is still running; this is a read failure, not a verdict.\n")
+		fmt.Printf("If it repeats, check GitHub auth, then `pi-supervisor status %s`.\n", name)
+	case "review_armed":
+		fmt.Printf("Review armed for %s — %s\n", name, info)
+		fmt.Printf("Monitor: pi-supervisor watch %s   | status: pi-supervisor status %s\n", name, name)
+	case "review_auto_armed":
+		fmt.Printf("Auto-review armed for %s. It fires once when the completion gate closes on\n", name)
+		fmt.Printf("an open PR, then posts the CodeRabbit trigger and waits out the warmup.\n")
+		fmt.Printf("Nothing to do until then: pi-supervisor watch %s\n", name)
+	case "review_skipped":
+		fmt.Printf("Review skipped — %s: %s\n", name, info)
+		fmt.Printf("LLM: no campaign was armed. Common causes: no PR was linked in the\n")
+		fmt.Printf("transcript, the PR is merged/closed, or CodeRabbit produced no threads\n")
+		fmt.Printf("after the warmup. Start one manually with:\n")
+		fmt.Printf("  pi-supervisor review %s --pr N\n", name)
+	case "bulk_resolve_requested":
+		fmt.Printf("Bulk resolve requested for %s — %s\n", name, info)
+		fmt.Printf("LLM: nothing was closed yet. An audit comment is on the PR. Apply it with\n")
+		fmt.Printf("  pi-supervisor ack %s --event <ack_id>\n", name)
+		fmt.Printf("or let it expire (unacked requests close nothing — the safe default).\n")
+	case "bulk_resolve_applied":
+		fmt.Printf("Bulk resolve applied for %s — %s\n", name, info)
+		fmt.Printf("  re-arm: pi-supervisor watch %s\n", name)
+	case "bulk_resolve_expired":
+		fmt.Printf("Bulk resolve EXPIRED unacked for %s — %s\n", name, info)
+		fmt.Printf("LLM: those threads are still OPEN and were not closed. Re-request if the\n")
+		fmt.Printf("call is still right: _pi-supervisor-review bulk_resolve --job %s --pr N --reason \"...\"\n", name)
 	case "instant_exit":
 		fmt.Printf("LLM: context-exhaustion strike (%s). Check provider errors in\n", info)
 		fmt.Printf("`/tmp/pi_%s_run.log`; `pi-supervisor steer %s \"...\"` or `--set-model`,\n", name, name)
@@ -363,7 +414,7 @@ func watchCtl(req control.Request, terminal bool) {
 		kind, _ := ev["event"].(string)
 		watchFooter(ev)
 		switch kind {
-		case "done", "fatal", "stopped":
+		case "done", "fatal", "stopped", "review_done", "review_exhausted":
 			os.Exit(0)
 		default:
 			if !terminal {
@@ -623,8 +674,7 @@ func main() {
 		// change the call (usage / no live round / not-answered), 1 when it may
 		// retry (auth / rate limit / GitHub error). Branching on the reason
 		// keeps that decision out of the message text (ADR-0012 §2.4).
-		var rf *reviewFailure
-		if errors.As(err, &rf) {
+		if rf, ok := errors.AsType[*reviewFailure](err); ok {
 			os.Exit(rf.ExitCode())
 		}
 		os.Exit(exitRuntime)

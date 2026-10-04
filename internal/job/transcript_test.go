@@ -127,7 +127,7 @@ func TestTranscriptContainsFindsMarkerReEmittedEveryRound(t *testing.T) {
 	dir := t.TempDir()
 	sess := filepath.Join(dir, "s.jsonl")
 	var lines []string
-	for i := 0; i < 14; i++ {
+	for range 14 {
 		lines = append(lines,
 			asstText("round work"),
 			asstText("still complete: ALL_MEALIME_ROOMUX_DONE"),
@@ -256,7 +256,7 @@ func TestTranscriptWatcherConsumesEachByteOnce(t *testing.T) {
 	w := NewTranscriptWatcher(sess, "NEVER_EMITTED", 0)
 
 	prev := w.Offset()
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		appendTL(t, sess, asstText(strings.Repeat("z", 200)))
 		w.Poll()
 		if w.Offset() < prev {

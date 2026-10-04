@@ -96,7 +96,7 @@ func (c *Client) ListThreads(ctx context.Context, owner, repo string, pr int) ([
 	)
 	// Bounded so a misbehaving server cannot spin us forever; 100 pages of
 	// 100 threads is far past any real PR.
-	for page := 0; page < 100; page++ {
+	for range 100 {
 		vars := map[string]any{
 			"owner": githubv4.String(owner),
 			"name":  githubv4.String(repo),

@@ -337,8 +337,7 @@ func asRefusal(err error) *review.Refusal {
 	if err == nil {
 		return nil
 	}
-	var r *review.Refusal
-	if errors.As(err, &r) {
+	if r, ok := errors.AsType[*review.Refusal](err); ok {
 		return r
 	}
 	return &review.Refusal{Reason: review.ReasonGitHubError, Message: err.Error()}

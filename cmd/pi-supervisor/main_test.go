@@ -64,8 +64,7 @@ func runCLI(t *testing.T, sock string, args ...string) runResult {
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
 	code := 0
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 		code = ee.ExitCode()
 	} else if err != nil {
 		t.Fatalf("run %v: %v", args, err)

@@ -521,7 +521,7 @@ func acksSince(path string, off int64) []job.AckRecord {
 		return nil
 	}
 	var out []job.AckRecord
-	for _, line := range strings.Split(string(raw), "\n") {
+	for line := range strings.SplitSeq(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -596,11 +596,37 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		r.mu.Lock()
 		round := r.state.Round + 1
 		maxRounds := r.job.MaxRounds
+		// reviewing is read in two places below (the round cap and the
+		// campaign gate), so it is computed once here.
+		var reviewing bool
+		// While a review campaign is live it owns the budget (ADR-0012 §4.2):
+		// the build job's MaxRounds is a different, larger number, and using it
+		// would let a review campaign run ~200 rounds instead of its own 5.
+		if c := r.review; c != nil && r.state.State == "reviewing" {
+			reviewing = true
+			c.mu.Lock()
+			if c.maxRound > 0 {
+				maxRounds = c.maxRound
+			}
+			c.mu.Unlock()
+		}
 		r.mu.Unlock()
 		if round > maxRounds {
 			r.mu.Lock()
 			name := r.job.Name
 			r.mu.Unlock()
+			// A campaign that exhausts its budget is a distinct failure from a
+			// build job that never reached its marker, and the message has to
+			// say which: "round cap reached without marker" would be a lie for
+			// a review round (there is no marker in a review round).
+			if reviewing {
+				r.finish("fatal", "review round cap reached with threads still open")
+				s.logf(name, "FATAL: review round cap %d reached without a clean review", maxRounds)
+				s.emit(name, "review_exhausted", round, 0, 0, "",
+					"review round cap %d reached with threads still open — re-arm with `pi-supervisor review %s --pr N`",
+					maxRounds, name)
+				return
+			}
 			r.finish("fatal", "round cap reached without marker")
 			s.logf(name, "FATAL: round cap %d reached without marker", maxRounds)
 			s.emit(name, "fatal", round, 0, 0, "", "round cap %d reached without marker", maxRounds)
@@ -774,12 +800,20 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			r.mu.Unlock()
 			r.persistState()
 			s.logf(name, "round %d: marker %q detected in session transcript — done", round, j.Marker)
-			s.emit(name, "done", round, 0, dur, "", "marker %q detected in session transcript — run is over", j.Marker)
 			if autoArmed {
-				s.emit(name, "reviewing", round, 0, 0, "",
-					"review campaign entered after the completion gate (ADR-0012 §4.1)")
+				// Emit `reviewing`, NOT `done`. `done` is a TERMINAL event
+				// (events.Event.Terminal), so a `watch` client would print
+				// "THE RUN IS OVER", exit 0, and stop listening while the
+				// campaign is still running. The build verdict is preserved
+				// on state for the final report; the LIVE verdict is the
+				// campaign's.
+				s.emit(name, "reviewing", round, 0, dur, "",
+					"marker %q reached — build job done, entering the review campaign (ADR-0012 §4.1)",
+					j.Marker)
 				return
 			}
+			s.emit(name, "done", round, 0, dur, "",
+				"marker %q detected in session transcript — run is over", j.Marker)
 			return
 		}
 
@@ -788,6 +822,15 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// a finished report to done; otherwise the fatal stands.
 		if r.stateSnapshot().State == "fatal" {
 			s.logf(name, "round %d: run closed by CI-stall intervention", round)
+			return
+		}
+
+		// Review campaign gate (ADR-0012 §4.2): the campaign's exit condition
+		// is "0 open threads AND CI pass", checked between rounds. It replaces
+		// the old trailing `pre-merge --pr N` — the daemon holds that state, so
+		// re-deriving it on demand was redundant. Runs ONLY in the reviewing
+		// phase, so a build job never takes this path.
+		if reviewing && s.reviewGate(r, round) {
 			return
 		}
 
@@ -1136,13 +1179,7 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 		idleS = 300
 	}
 	d := stall.New(sess, time.Duration(idleS)*time.Second)
-	tick := time.Duration(idleS) / 10
-	if tick < 200*time.Millisecond {
-		tick = 200 * time.Millisecond
-	}
-	if tick > 15*time.Second {
-		tick = 15 * time.Second
-	}
+	tick := min(max(time.Duration(idleS)/10, 200*time.Millisecond), 15*time.Second)
 	t := time.NewTicker(tick)
 	defer t.Stop()
 	// Final scan on every exit path: the last lines of a round's transcript
@@ -1224,13 +1261,7 @@ func (s *Supervisor) watchEmptyTurn(r *runner, sess string, round int, watchStop
 		idleS = 60
 	}
 	d := stall.New(sess, time.Duration(idleS)*time.Second)
-	tick := time.Duration(idleS) * time.Second / 5
-	if tick < time.Second {
-		tick = time.Second
-	}
-	if tick > 15*time.Second {
-		tick = 15 * time.Second
-	}
+	tick := min(max(time.Duration(idleS)*time.Second/5, time.Second), 15*time.Second)
 	t := time.NewTicker(tick)
 	defer t.Stop()
 	reported := false

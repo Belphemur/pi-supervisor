@@ -203,12 +203,42 @@ The two mutations are asymmetric, which is its own silent failure:
 `resolveReviewThread` takes **`threadId`**. Same `PRRT_…` value, different field
 name.
 
-#### 3.3 CI verdicts come from the Actions jobs endpoint
+#### 3.3 CI verdicts: required checks only are blocking
 
 `check_ci` reads the run's `/jobs` for the head sha observed at poll time — not
 a `gh pr checks` rollup, which races state transitions right after a push and
-transiently reads green with jobs still queued. `success`/`neutral`/`skipped`
-pass; `pending` does not; `failure`/`cancelled`/`error` fail.
+transiently reads green with jobs still queued.
+
+**Only checks the PR's protection rules REQUIRE block the campaign.** The
+`/jobs` endpoint carries no required-ness flag, so the daemon asks GraphQL for
+`checkRun.isRequired(pullRequestId:)` on the same head sha — the only
+authoritative source. Inferring required-ness from a job name would be
+guesswork, and guessing wrong in the permissive direction ships a red required
+check.
+
+| Situation | Verdict | Effect |
+|---|---|---|
+| required check `success`/`neutral`/`skipped` | `pass` | — |
+| required check failing | `fail` | **blocks** |
+| required check queued/in-progress | `pending` | **blocks** |
+| optional check failing | `pass` | reported in `non_blocking`, ignored |
+| optional check queued | `pass` | ignored |
+| required-ness undeterminable | per-check, treating **all** as required | **blocks** |
+
+Two properties matter here:
+
+- **Optional failures are surfaced, not swallowed.** They appear in
+  `non_blocking` and in the round message, so an operator sees them — they just
+  cannot hold a campaign open. Without the split, one flaky non-required check
+  would burn a 5-round budget and end `review_exhausted` with the real
+  findings untouched.
+- **Unknown required-ness fails closed.** If GitHub will not answer (missing
+  permission, a non-PR ref), the rollup treats every check as required and sets
+  `required_unknown`. A spurious "not done" costs rounds; a missed red check
+  costs a broken merge. The strictness is visible rather than silent.
+
+`neutral`/`skipped` count as passing (inherited from the `pre-merge` gate: they
+are deliberate opt-outs, not failures).
 
 ### 4. Campaign lifecycle
 
@@ -246,15 +276,31 @@ consumed when it fires; re-arming is an explicit `review <job> --auto`.
 
 #### 4.2 Exit condition and round economics
 
-The daemon polls threads and CI each round; `0 open threads && CI pass` is the
-campaign's `done`. That is the whole of the old `pre-merge` gate — steps 1 and
-3 inherited, its wall-clock `wait` replaced by `MaxRounds`. The daemon reports
-readiness and **never merges** (the owner does).
+The daemon evaluates the campaign's exit condition between rounds:
+`0 open threads && CI pass` (§3.3) closes it as `review_done`. That is the
+whole of the old `pre-merge` gate — steps 1 and 3 inherited, its wall-clock
+`wait` replaced by the campaign's own `MaxRounds`. The daemon reports readiness
+and **never merges** (the owner does).
+
+Both conditions must hold: threads open with green CI is not done, and zero
+threads with red required CI is not done. When it is not done, the round message
+names the ONE blocking condition, because "not done" without a reason is what
+makes an LLM re-arm blindly.
+
+While a campaign is live it **owns the round budget** — the loop reads the
+campaign's `MaxRounds`, not the build job's (a different, much larger number).
+Otherwise a 5-round campaign would run to the job's default 200.
 
 **No-push rounds are free.** Only pi-execution rounds consume `MaxRounds`. A
 round that replied to threads but pushed no commit leaves `head_sha` unchanged,
 so the next round re-handles the stale threads without burning budget —
 including a rebuttal round whose evidence *is* the answer.
+
+A campaign that exhausts its budget is a **distinct failure** from a build job
+that never reached its marker: it emits `review_exhausted` with a message that
+says threads are still open and how to re-arm with more budget. Reusing
+"round cap reached without marker" would be a lie — there is no marker in a
+review round.
 
 ### 5. Command surface
 
@@ -315,9 +361,34 @@ names, and its proven query shapes (§3.1, §3.2) — inherited, not re-derived.
 
 ### 7. `watch` as the review dashboard
 
-Each `round_done` carries round type, open-thread count, `head_sha`, `pushed`,
-and rc, plus the remaining-thread list. Stats surface `#acceptance` /
-`#rebuttal` so a campaign's shape is legible mid-flight.
+Each `review_round_done` carries round type, open-thread count, CI verdict (with
+the failing **required** checks named), and the round budget, so a campaign's
+shape is legible mid-flight.
+
+**Terminality is part of the contract.** `watch` closes its stream on a terminal
+event, and `watch -t` exits on one, so getting this wrong either truncates a live
+campaign or hangs a finished one:
+
+| Event | Terminal? | Why |
+|---|---|---|
+| `reviewing` | **no** | the build job is done but the campaign still owns the loop |
+| `review_round_done` | no | progress, not an outcome |
+| `review_armed`, `review_auto_armed`, `review_skipped` | no | setup/skip, the job still runs |
+| `bulk_resolve_requested` / `_applied` / `_expired` | no | a sub-event of a running round |
+| `review_done` | **yes** | the campaign closed clean |
+| `review_exhausted` | **yes** | the campaign closed on budget |
+
+`reviewing` is the load-bearing one. The completion gate closes the *build* job
+and enters the review phase in the same step, so emitting `done` there — which
+is terminal — would print "THE RUN IS OVER", exit 0, and stop listening while the
+campaign was still running. The gate therefore emits `reviewing`, never `done`,
+on the handoff path.
+
+Every review event gets an LLM-facing footer that says what to do next, and the
+messages avoid the traps that cost rounds: `reviewing` explicitly says the job
+is NOT over; `bulk_resolve_requested` says nothing was closed yet and names the
+ack command; `bulk_resolve_expired` says the threads are still open;
+`review_exhausted` gives the re-arm command with more budget.
 
 ### 8. Decision log
 
@@ -360,10 +431,13 @@ what the loser would have cost.
   closed):* nothing closes without an ack, and an unacked request expires to
   "threads stay open" — the safe direction. *KISS:* no prompt, no modal, one
   `ack` verb.
-- **Q8 — CI from the Actions jobs endpoint, head-sha scoped** (§3.3). *SOLID:*
-  the `gh pr checks` rollup races state transitions, so a verdict can be green
-  for a commit whose jobs have not run — a false pass on the only gate that
-  guards a merge.
+- **Q8 — CI from the Actions jobs endpoint, head-sha scoped, and only
+  REQUIRED checks block** (§3.3). *SOLID:* the `gh pr checks` rollup races state
+  transitions, so a verdict can be green for a commit whose jobs have not run — a
+  false pass on the only gate that guards a merge. Required-ness comes from
+  `isRequired(pullRequestId:)`, not from a job-name guess, and unknown
+  required-ness fails closed: a spurious "not done" costs rounds, a missed red
+  required check costs a broken merge.
 - **Q9 — The verb set is closed at six, with a stable `reason` enum** (§2.1,
   §2.4). *KISS:* an LLM cannot reliably branch on prose; a closed enum can be
   exhaustive-checked and unit-tested.

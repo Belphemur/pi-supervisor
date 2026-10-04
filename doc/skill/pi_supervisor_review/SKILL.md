@@ -1,6 +1,6 @@
 ---
 name: pi_supervisor_review
-description: "Review-campaign contract for pi: route every GitHub action through the pi-supervisor shim."
+description: "Route PR review actions through the supervisor shim."
 version: 1.0.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
@@ -21,6 +21,27 @@ the fixes, and answer every thread you touch.
 **Every GitHub action goes through the shim.** Never run `gh`, never run
 `reply_review.py`, never call the GitHub API yourself. The shim is the only
 path, and the daemon holds the credentials — you never see a token.
+
+## When to Use
+
+Load this only when a `pi-supervisor review <job>` campaign put you here, i.e.
+your prompt carries a review brief and `$PI_SUPERVISOR_SOCKET` is set.
+
+**Don't use for:**
+
+- Ordinary build jobs — those have no PR to review yet; use the job's own brief.
+- Answering a review outside a supervised round. Without a live round every verb
+  is refused with `no-live-round`; that guard is deliberate, so do not work
+  around it.
+- Merging. The owner merges once the threads read zero. You never merge.
+
+## Prerequisites
+
+- `$PI_SUPERVISOR_SOCKET` — the daemon's control socket, set for you.
+- `$PI_SUPERVISOR_REVIEW_JOB` — usually set too; `--job` overrides it.
+- `_pi-supervisor-review` on PATH (installed by `install.sh`).
+- No GitHub token: the daemon holds the credentials. If a verb answers
+  `auth-unavailable`, that is an operator problem, not something to work around.
 
 ## The transport
 
@@ -166,3 +187,69 @@ Check where you stand at any time:
 _pi-supervisor-review list_threads --job <job> --pr <N>
 _pi-supervisor-review check_ci --job <job> --pr <N>
 ```
+
+### CI: only REQUIRED checks block
+
+`check_ci` reports a verdict over the checks the PR's protection rules
+**require** — not every check that ran:
+
+- `verdict=pass` — every required check is `success`, `neutral`, or `skipped`.
+- `verdict=fail` — a **required** check failed. The response names it in
+  `blocking`.
+- `verdict=pending` — a **required** check is still queued or running.
+
+A failing **optional** check (a spellchecker, a flaky non-gating job) appears
+in `non_blocking` and does NOT hold the campaign open. So a red
+`non_blocking` entry is information, not your problem to fix — fixing it anyway
+wastes the round. `required_unknown: true` means GitHub would not report
+required-ness, so everything is being treated as required: that is the safe
+direction, and it is worth telling the operator rather than working around.
+
+## Pitfalls
+
+- **A numeric thread id is a comment, not a thread.** If you hold
+  `3904873498`, you read the wrong API's field. Re-run `list_threads`; do not
+  adapt it.
+- **Closing before replying is the default mistake.** `resolve_thread` before
+  `post_replies` is refused with `not-answered-this-round`.
+- **A snippet is not the finding.** `list_threads` returns 120 chars, which for
+  CodeRabbit is just the title. Always `thread_detail` before deciding.
+- **Threads describe an EARLIER push than your HEAD.** Verify with
+  `git show HEAD:<file>` before "fixing" a type or format finding — if HEAD
+  already satisfies it, that is a `rebuttal` with evidence, not a churn commit.
+- **The open-thread count is per-commit.** Reviewers re-review every push and
+  open new threads, so a count taken before your final push is not
+  authoritative. Re-read after pushing.
+- **`bulk_resolve` did NOT close anything.** It returns an `ack_id` and applies
+  nothing until a peer acks it; unacked, it expires after 30 minutes. Report
+  the `ack_id` — never claim the threads are closed.
+- **`no-live-round` means the round ended.** Do not retry; re-orient instead.
+- **Zero open threads right after a push is not a clean review.** It can be the
+  reviewer still working. The daemon's warmup exists for exactly this.
+- **Zero open threads is not the same as done.** The campaign also needs
+  `check_ci` to pass on its required checks. Red required CI keeps it open.
+- **A red optional check is not your round's work.** Read `non_blocking`, note it
+  in your reply if relevant, and move on.
+
+## Verification
+
+Before you consider the round's work done:
+
+```bash
+# 1. Every thread you answered is answered and closed.
+_pi-supervisor-review list_threads --job <job> --pr <N>
+#    → open count should be 0, or only threads you deliberately left open
+#      (tracked follow-ups) with a reply explaining why.
+
+# 2. CI is reporting for the CURRENT head sha, not a stale one.
+_pi-supervisor-review check_ci --job <job> --pr <N>
+#    → verdict=pass (pending means still running — not a failure, not a pass)
+
+# 3. Your fixes are actually pushed, and HEAD is what you reviewed against.
+git -C <worktree> log --oneline -3
+git -C <worktree> status --short   # → clean tree, no uncommitted fixes
+```
+
+Completion criterion: **every open thread has an inline reply from this round,
+and anything you pushed is on the remote.** If `check_ci` says `pending`, the
+round is not finished — a green CI you have not observed yet is not a pass.

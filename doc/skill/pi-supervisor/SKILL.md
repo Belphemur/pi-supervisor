@@ -4,7 +4,7 @@ version: 1.5.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
-description: "Supervise long-running pi delegations via a systemd Go daemon with a queryable control socket."
+description: "Supervise long-running pi delegations via a systemd daemon."
 metadata:
   hermes:
     tags: [Coding-Agent, Pi, Orchestrator, Long-Running, Supervision, systemd]
@@ -363,7 +363,8 @@ plus a machine-readable `reason` from a closed enum.
 - **The verb set is closed at six**, and it is the only way a review round
   reaches GitHub: `list_threads` | `thread_detail` | `post_replies` |
   `resolve_thread` | `bulk_resolve` | `check_ci`. The shim
-  (`/home/balor/.local/bin/_pi-supervisor-review`) is a CLI speaking the
+  (`_pi-supervisor-review`, installed on PATH by `install.sh` as a symlink to
+  the canonical copy in `doc/skill/pi_supervisor_review/`) is a CLI speaking the
   daemon's JSON control protocol directly over the unix socket — not an MCP
   plugin process. New endpoint, additive: `POST /review/action`.
 - **Call order is load-bearing: `post_replies` → `resolve_thread`, always.** The
@@ -431,7 +432,33 @@ plus a machine-readable `reason` from a closed enum.
   without burning budget — including a rebuttal round that pushes back with
   evidence but no fix commit (the answer itself is the round's work; only the
   no-push-answer case is free).
-- **`watch` is the review dashboard.** Arm it after `start`; each `round_done` carries round type, open-thread count, `head_sha`, `pushed` (bool), rc, + the remaining-thread list (threads whose latest reply is not by this job's `gh` user). Stats surface `#acceptance` / `#rebuttal` counts — so you can see, mid-campaign, how many rounds were pure fixes vs how many defended a "this finding is out of scope / not-a-real-issue."
+- **`watch` is the review dashboard, and its terminal events matter.** Arm it
+  after `review`/`start`. `review_round_done` carries round N/M, round type,
+  open-thread count, and the CI verdict — naming the failing **required** checks,
+  never just "fail". Terminal events are `review_done` (clean) and
+  `review_exhausted` (budget spent); **`reviewing` is deliberately NOT terminal**,
+  because the build job is done while the campaign still owns the loop, so a
+  watch that closed there would stop listening mid-campaign. The gate emits
+  `reviewing` (never `done`) on the handoff. Every review event prints an
+  LLM-facing footer: `reviewing` says the job is NOT over,
+  `bulk_resolve_requested` says nothing was closed yet and names the ack
+  command, `bulk_resolve_expired` says the threads are still open, and
+  `review_exhausted` gives the re-arm command with more budget.
+- **Only REQUIRED checks block the campaign.** `check_ci` reads the Actions
+  run's `/jobs` for the current head sha (never a `gh pr checks` rollup, which
+  races state transitions right after a push) and asks GraphQL
+  `isRequired(pullRequestId:)` which of them the PR's protection rules demand —
+  the `/jobs` endpoint has no such flag, and guessing from a job name would ship
+  a red required check. A failing **optional** check is reported in
+  `non_blocking` and in the round message but never blocks; `neutral`/`skipped`
+  count as passing. If GitHub will not report required-ness, the rollup treats
+  every check as required and flags `required_unknown` — failing closed, since a
+  spurious "not done" costs rounds while a missed red check costs a merge.
+- **The campaign owns its round budget.** While a campaign is live the loop reads
+  the campaign's `MaxRounds`, not the build job's, so a 5-round campaign cannot
+  run to the job's default 200. Exhausting it emits `review_exhausted` — a
+  distinct failure from a build job's "round cap reached without marker",
+  because there is no marker in a review round.
 - **Pre-merge is a gate; bulk-close is ack-gated, never human-gated.** The
   campaign *reports* readiness — the owner merges once threads read zero, and
   the daemon never merges. Bulk close is a `bulk_resolve` action the LLM may

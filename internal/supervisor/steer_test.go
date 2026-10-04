@@ -97,7 +97,7 @@ func lastFrameID(t *testing.T, path string) (string, bool) {
 		return "", false
 	}
 	id := ""
-	for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+	for ln := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
 			continue
@@ -177,7 +177,7 @@ func TestSteerProseReachesPiStdin(t *testing.T) {
 		t.Fatal(err)
 	}
 	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
 		var f map[string]any
 		if json.Unmarshal([]byte(line), &f) != nil {
 			continue

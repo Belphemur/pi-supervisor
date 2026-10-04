@@ -18,7 +18,7 @@ func readAcks(t *testing.T, path string) []job.AckRecord {
 		t.Fatal(err)
 	}
 	var out []job.AckRecord
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
