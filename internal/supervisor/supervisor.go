@@ -679,9 +679,58 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 					maxRounds, name)
 				return
 			}
-			r.finish("fatal", "round cap reached without marker")
-			s.logf(name, "FATAL: round cap %d reached without marker", maxRounds)
-			s.emit(name, "fatal", round, 0, 0, "", "round cap %d reached without marker", maxRounds)
+			// Same honesty requirement for the build job. `done` requires BOTH
+			// the marker AND the final report (ADR-0011), so "without marker"
+			// is only true in one of three cases. Reporting it unconditionally
+			// sent an operator hunting a marker that had in fact been found:
+			// mealime-extracats3 sat at fatal/14 with marker_seen=true and
+			// last_diag="round cap reached without marker", because the brief
+			// told pi to write /tmp/mealime_extracats_final_report.md while the
+			// job's final_report was /tmp/mealime_extracats3_final_report.md.
+			// Thirteen rounds were burned re-running finished work, and the
+			// diagnostic pointed at the wrong cause the whole time.
+			//
+			// Name the ACTUAL missing artifact so the next run is one copy-paste
+			// instead of a diagnosis.
+			r.mu.Lock()
+			markerSeen := r.state.MarkerSeen
+			report := r.job.FinalReport
+			r.mu.Unlock()
+			switch {
+			case !markerSeen && report != "" && !job.Exists(report):
+				msg := fmt.Sprintf("round cap %d reached: marker NOT seen AND final report missing (%s)", maxRounds, report)
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			case !markerSeen:
+				msg := fmt.Sprintf("round cap %d reached without marker", maxRounds)
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			case report == "":
+				// Marker found and no report was ever configured: `done` is
+				// reachable, so the cap with the marker latched means the gate
+				// could not close — say that rather than blaming the marker.
+				msg := fmt.Sprintf("round cap %d reached with marker seen but no final_report configured — check the job's final_report path", maxRounds)
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			default:
+				// The expensive one: the agent DID its job and said so, and the
+				// report is simply somewhere else. Look for it, so the remedy is
+				// a copy-paste of a path we PRINT rather than a hunt through
+				// /tmp. mealime-extracats3 burned 13 rounds to an operator
+				// guess that took one `ls`.
+				msg := fmt.Sprintf("round cap %d reached: marker WAS seen but final report is missing at %s", maxRounds, report)
+				if near := job.FindReportNearby(report, r.startedAt()); near != "" {
+					msg += fmt.Sprintf(" — FOUND at %s instead; the brief and the job's final_report disagree. Copy it to %s (or fix the brief) and re-arm", near, report)
+				} else {
+					msg += " — the agent may have written it elsewhere; check the brief's stated path"
+				}
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			}
 			return
 		}
 		r.mu.Lock()
@@ -960,6 +1009,15 @@ func (r *runner) stateSnapshot() job.State {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.state
+}
+
+// startedAt is when this job's first round launched, used to scope
+// "recently written" lookups so a stale file from a previous run is never
+// proposed as this run's report.
+func (r *runner) startedAt() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.started
 }
 
 // live reports whether a round is currently polling the control file.
