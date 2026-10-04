@@ -190,7 +190,7 @@ The `pr_url` the marker-gate already scrapes (ADR-0006) is what the
 auto-trigger reads — no second scrape. The PR number is derived by parsing the
 linked `pull/<N>` out of that URL.
 
-### 5. Open questions (decide before code)
+### 5. Open questions (Q1 and Q5)
 
 Q1. **CodeRabbit trigger comment.** Hardcoded to `@coderabbitai review`?
 Configurable via `review.trigger_comment` (default `@coderabbitai review`)
@@ -199,12 +199,14 @@ so a different bot / org convention is a one-line change, not a rebuild.
 Q2. **`--rounds 0`** now resolved: auto-derive (`ceil(open/12)`, capped).
 Default stays 5 on explicit calls. No further decision needed.
 
-Q3. **Who enforces "answer every thread before resolve"?** Today the skill
-does it by convention. With the daemon owning the loop and now using
-`go-githubv4` typed errors, do you want the daemon to *refuse* a
-`resolve_thread` request via the shim whose thread has no agent-authored
-reply in the last N minutes (a cheap server-side guard), or keep it as a
-skill/prompt rule only?
+Q3. **Who enforces "answer every thread before resolve"?** now resolved:
+**server-side guard (option A)**. Both round types
+(`acceptance` and `rebuttal`) answer-and-resolve, so the daemon's
+`resolve_thread` RPC refuses with `409 already-resolved-without-reply`
+unless the daemon recorded a `post_reply` on that `thread_id` from this
+job's `gh` user in the current round. Typed `go-githubv4` errors make the
+guard ~12 lines and inescapable — no LLM can bypass it by issuing a raw
+resolve. No further decision needed.
 
 Q4. **Push detection** now resolved: a no-push round is free (does NOT count
 against `MaxRounds`) — only pi-execution rounds consume budget. No further
@@ -226,6 +228,10 @@ never executes it — confirming that matches your mental model.
 - No new daemon process model, no new credential surface — one GitHub SDK
   client (`go-github` + `go-githubv4`, shared token source) plus one
   `gh auth token` fallback for token acquisition only.
+- Per-round `--type acceptance|rebuttal`; both answer-and-resolve, so the
+  daemon enforces a server-side guard: `resolve_thread` returns `409`
+  unless the daemon recorded a `post_reply` on that thread from this job's
+  `gh` user in the current round — inescapable, typed via `go-githubv4`.
 - `answer-code-review` skill is **retired for review jobs only**: replaced by
   `pi-supervisor review` + the `pi_supervisor_review` skill + the
   `_pi-supervisor-review` shim for the review shape. Non-review jobs are
