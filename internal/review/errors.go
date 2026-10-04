@@ -10,50 +10,48 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"pi-supervisor/internal/fault"
 )
 
 // Reason is the closed set of refusal codes the review surface returns
 // (ADR-0012 §2.4). The consumer is an LLM, so it must be able to branch on a
 // stable symbol instead of parsing prose: a closed enum can be
 // exhaustively checked and unit-tested, a sentence cannot.
-type Reason string
+//
+// It is an ALIAS of fault.Kind, not a second enum (ADR-0013 follow-up 1). Both
+// reach the client in the same field — `Response.Reason` — and two closed
+// enums for one field mean two spellings of the same condition, which an LLM
+// shim matches on one of. fault imports nothing, so review importing it
+// keeps the dependency graph acyclic; ExitCode() rides along as a method on
+// the alias, and the strings are unchanged, so every published reason
+// (ADR-0012 §2.4, doc/skill/pi_supervisor_review/SKILL.md) still arrives
+// byte-identical.
+type Reason = fault.Kind
 
 const (
 	// ReasonNoLiveRound: no `review <job>` round is live, so the shim is not
-	// inside the round it was armed for. Retrying cannot help.
-	ReasonNoLiveRound Reason = "no-live-round"
+	// inside the round it was armed for. Retrying cannot help. Shared with
+	// the steer path — same condition, same symbol.
+	ReasonNoLiveRound = fault.KindNoLiveRound
 	// ReasonRoundMismatch: the request named a round other than the daemon's
 	// live one. Refused, never silently corrected (ADR-0012 §8, Q6).
-	ReasonRoundMismatch Reason = "round-mismatch"
+	ReasonRoundMismatch = fault.KindRoundMismatch
 	// ReasonNotAnswered: resolve without a same-round reply. The whole point
 	// of the guard: a bare close discards why the finding was handled.
-	ReasonNotAnswered Reason = "not-answered-this-round"
+	ReasonNotAnswered = fault.KindNotAnswered
 	// ReasonUnknownThread: the thread id is not a PRRT_ node id on this PR.
-	ReasonUnknownThread Reason = "unknown-thread"
+	ReasonUnknownThread = fault.KindUnknownThread
 	// ReasonAuthUnavailable: no usable GitHub credential. Operator action.
-	ReasonAuthUnavailable Reason = "auth-unavailable"
+	ReasonAuthUnavailable = fault.KindAuthUnavailable
 	// ReasonRateLimited: GitHub throttled us. Retry with backoff.
-	ReasonRateLimited Reason = "rate-limited"
+	ReasonRateLimited = fault.KindRateLimited
 	// ReasonGitHubError: anything else from the API. The message carries the
 	// typed GitHub error.
-	ReasonGitHubError Reason = "github-error"
+	ReasonGitHubError = fault.KindGitHubError
 	// ReasonUsage: the request itself is malformed (missing pr, bad id shape).
-	ReasonUsage Reason = "usage"
+	ReasonUsage = fault.KindUsage
 )
-
-// ExitCode maps a reason onto the CLI's exit contract (ADR-0008):
-// 2 = usage/validation — the caller must change the call; 1 = refused at
-// runtime — the caller may retry. Keeping this on the reason (not on the
-// message) is what lets a shim branch without reading English.
-func (r Reason) ExitCode() int {
-	switch r {
-	case ReasonUsage, ReasonNoLiveRound, ReasonRoundMismatch,
-		ReasonNotAnswered, ReasonUnknownThread:
-		return 2
-	default:
-		return 1
-	}
-}
 
 // Refusal is a review-surface error carrying a machine-readable reason. It is
 // the only error type that crosses the control socket for a review action.
