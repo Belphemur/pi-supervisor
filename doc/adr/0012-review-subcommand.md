@@ -96,29 +96,40 @@ internal detail that never reaches pi or the system prompt.
 The daemon authenticates to GitHub in one of two ways, chosen per `Start`,
 in priority order:
 
-1. **GitHub App (preferred).** If `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`
-   are set, the daemon signs a JWT (std-lib `crypto/ecdsa` or the 60-LOC
-   `/golang-jwt`; no app-specific SDK), exchanges it for an
-   installation token per request (1-hour TTL, rotated by the daemon), and
-   uses that token for all `gh api` calls. The App is installed on the repos
-   the daemon may review; the token is ephemeral, so it never rests on disk.
-2. **`gh` token fallback.** If the App env is absent, the daemon runs
-   `gh auth status` at `Start`; if authenticated, it execs
-   `gh api ... --hostname github.com` (which inherits `$GH_TOKEN` / the
-   cached host token) for every GH call. Unauthenticated → `Start`
-   refuses (exit 1) with `GitHub auth unavailable: run 'gh auth login'`
-   or set `GITHUB_APP_ID`.
+1. **GitHub App (preferred).** `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`
+   (a path or inline PEM) → the daemon signs a JWT with
+   `golang-jwt/jwt/v5` (`github.com/golang-jwt/jwt/v5`, the maintained
+   v4+ successor) and exchanges it for an installation token via
+   `go-github`'s `Apps.GetInstallationToken`. The token (1h TTL) is cached
+   and refreshed by `go-github`'s `InstallationTokenSource`, so there is no
+   hand-rolled refresh loop. The App is installed on the reviewed repos.
+2. **`gh` token fallback.** If the App env is absent, `Start` runs
+   `gh auth token` to obtain the active token (the *only* `gh` call in the
+   daemon's lifecycle — used purely for token acquisition); that token is
+   then passed to `go-github`/`githubv4` as a static token source. If
+   `gh auth token` fails, `Start` refuses (exit 1) with `GitHub auth
+   unavailable: run 'gh auth login' or set GITHUB_APP_ID`.
 
-No PAT is ever read from config. A `GITHUB_TOKEN` env, if set by the shell,
-is used by `gh` under the fallback path — the daemon does not parse it
-directly, so there is no token-parsing code in the daemon and no second
-auth code path to keep in sync.
+Two SDK deps, both current as of 2026:
+`github.com/google/go-github/v90` (REST) + `github.com/shurcooL/githubv4`
+(GraphQL). `go-github`'s `InstallationTokenSource` covers App-token refresh;
+`go-githubv4`'s client wraps a plain `http.Client`, so both share one
+authenticated transport and therefore one token source — the daemon never
+holds two auth code paths to keep in sync.
+
+The mutation API the daemon exposes over the control socket (`post_reply`,
+`resolve_thread`, the CodeRabbit trigger comment) calls the GraphQL mutations
+through `go-githubv4`, so the Q3 resolve-guard gets typed GraphQL errors
+(`422 Resource not usable for resolve`, `43 Forbidden`) instead of parsed
+strings.
+
+This is an internal detail that never reaches pi or the system prompt.
 
 The daemon does **not** re-implement the inline-answer-before-resolve rule from
 the `answer-code-review` skill, nor its REST-reply-then-GraphQL-resolve path —
 those live in the skill/`_pi-supervisor-review` shim, which is a thin adapter
-over `gh`. The daemon enforces the *budget* and the *loop*; it does not triage
-or author replies.
+over the GitHub SDKs. The daemon enforces the *budget* and the *loop*; it
+does not triage or author replies.
 
 ### 3. Command surface
 
