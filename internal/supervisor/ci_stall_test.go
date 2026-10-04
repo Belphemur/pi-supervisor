@@ -174,6 +174,37 @@ func TestCIStallBelowCapOnlyObserves(t *testing.T) {
 		default:
 			st, err := job.LoadState("cistall2")
 			if err == nil && (st.State == "fatal" || st.State == "done") {
+				// The terminal state can be persisted BEFORE the ci_stall
+				// event is drained from the channel: select takes `default`
+				// whenever the channel is momentarily empty, and a loaded
+				// runner widens that window enough to observe "fatal" while
+				// the stall event is still queued. Asserting on sawStall
+				// here failed ~1 run in 5 on CI with "ci_stall events = 0,
+				// want 1" — a test race, not a product bug.
+				//
+				// Give the broker a moment to deliver, then drain
+				// everything already queued before deciding. The state
+				// file is the authority on COUNT (st2.CIStalls below); the
+				// channel is only used to prove the event was published.
+				drainDeadline := time.After(2 * time.Second)
+			drain:
+				for {
+					select {
+					case e := <-ch:
+						switch e.Event {
+						case "ci_stall":
+							sawStall++
+						case "fatal":
+							if strings.Contains(e.Info, "CI review retry cap") {
+								sawCIFatal = true
+							}
+						}
+					case <-drainDeadline:
+						break drain
+					default:
+						break drain
+					}
+				}
 				if sawCIFatal {
 					t.Fatal("CI-cap fatal fired below the cap")
 				}

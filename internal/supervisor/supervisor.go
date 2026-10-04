@@ -94,6 +94,15 @@ type runner struct {
 	// autoReview is the one-shot intent to arm a review when the completion
 	// gate closes on an open PR.
 	autoReview *autoReviewSpec
+	// launchedAt is when the current round spawned pi. It is the floor for
+	// session discovery: a transcript that predates the spawn cannot be this
+	// round's session, so FindSession must not adopt it. Zero on a RESUME
+	// round, where the path is already pinned.
+	launchedAt time.Time
+	// sessWatch is the fsnotify session watcher armed for a LAUNCH round
+	// (nil on RESUME). Round-scoped: armed in round() before the spawn, closed
+	// when the round's client returns, so every exit path reaps it.
+	sessWatch sessionResolver
 }
 
 func New() *Supervisor {
@@ -316,6 +325,7 @@ func (s *Supervisor) Stop(name string) error {
 		return fault.New(fault.KindNotRunning, fmt.Errorf("job %q not running", name))
 	}
 	r.persistState()
+	r.closeSessWatch() // an operator stop must not leave the round's watcher armed
 	// The loop emits `stopped` from its own exit path, but Stop() can win the
 	// race before the loop's first stopCh check — in which case no event is ever
 	// emitted and a `watch` client blocks until its timeout on a job that is
@@ -669,9 +679,74 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 					maxRounds, name)
 				return
 			}
-			r.finish("fatal", "round cap reached without marker")
-			s.logf(name, "FATAL: round cap %d reached without marker", maxRounds)
-			s.emit(name, "fatal", round, 0, 0, "", "round cap %d reached without marker", maxRounds)
+			// Same honesty requirement for the build job. `done` requires BOTH
+			// the marker AND the final report (ADR-0011), so "without marker"
+			// is only true in one of three cases. Reporting it unconditionally
+			// sent an operator hunting a marker that had in fact been found:
+			// mealime-extracats3 sat at fatal/14 with marker_seen=true and
+			// last_diag="round cap reached without marker", because the brief
+			// told pi to write /tmp/mealime_extracats_final_report.md while the
+			// job's final_report was /tmp/mealime_extracats3_final_report.md.
+			// Thirteen rounds were burned re-running finished work, and the
+			// diagnostic pointed at the wrong cause the whole time.
+			//
+			// Name the ACTUAL missing artifact so the next run is one copy-paste
+			// instead of a diagnosis.
+			r.mu.Lock()
+			latched := r.state.MarkerSeen
+			report := r.job.FinalReport
+			sess := r.job.SessionPath
+			marker := r.job.Marker
+			r.mu.Unlock()
+			// Use the SAME marker surfaces the completion gate uses, not just
+			// the streaming latch. The gate (below) accepts a marker found by a
+			// cumulative transcript scan or by the current round's run log
+			// WITHOUT writing either result back to r.state.MarkerSeen. Reading
+			// only the latch therefore reports "marker NOT seen" for a marker
+			// the gate accepted via stdout — reintroducing exactly the
+			// wrong-cause diagnosis this switch exists to eliminate.
+			markerSeen := latched
+			if !markerSeen && marker != "" && sess != "" {
+				markerSeen = job.TranscriptContains(sess, marker)
+			}
+			if !markerSeen && marker != "" {
+				markerSeen = job.RunlogContains(job.Runlog(name), marker)
+			}
+			switch {
+			case !markerSeen && report != "" && !job.Exists(report):
+				msg := fmt.Sprintf("round cap %d reached: marker NOT seen AND final report missing (%s)", maxRounds, report)
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			case !markerSeen:
+				msg := fmt.Sprintf("round cap %d reached without marker", maxRounds)
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			case report == "":
+				// Marker found and no report was ever configured: `done` is
+				// reachable, so the cap with the marker latched means the gate
+				// could not close — say that rather than blaming the marker.
+				msg := fmt.Sprintf("round cap %d reached with marker seen but no final_report configured — check the job's final_report path", maxRounds)
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			default:
+				// The expensive one: the agent DID its job and said so, and the
+				// report is simply somewhere else. Look for it, so the remedy is
+				// a copy-paste of a path we PRINT rather than a hunt through
+				// /tmp. mealime-extracats3 burned 13 rounds to an operator
+				// guess that took one `ls`.
+				msg := fmt.Sprintf("round cap %d reached: marker WAS seen but final report is missing at %s", maxRounds, report)
+				if near := job.FindReportNearby(report, r.startedAt()); near != "" {
+					msg += fmt.Sprintf(" — FOUND at %s instead; the brief and the job's final_report disagree. Copy it to %s (or fix the brief) and re-arm", near, report)
+				} else {
+					msg += " — the agent may have written it elsewhere; check the brief's stated path"
+				}
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+			}
 			return
 		}
 		r.mu.Lock()
@@ -738,17 +813,12 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// Adopt the transcript a fresh LAUNCH just created, so the gate below
 		// has a surface to read on the very round that started the session.
 		if sess == "" {
-			r.mu.Lock()
-			sess = r.job.SessionPath
-			r.mu.Unlock()
-			if sess == "" {
-				if found := job.FindSession(j.SessionName, j.Worktree); found != "" {
-					sess = found
-					r.mu.Lock()
-					r.job.SessionPath = found
-					r.mu.Unlock()
-					_ = job.Save(r.job)
-				}
+			if found := s.captureSession(r); found != "" {
+				sess = found
+				r.mu.Lock()
+				r.job.SessionPath = found
+				r.mu.Unlock()
+				_ = job.Save(r.job)
 			}
 		}
 		select {
@@ -758,6 +828,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			name := r.job.Name
 			r.mu.Unlock()
 			r.persistState()
+			r.closeSessWatch()
 			s.logf(name, "loop stopped at round %d (client rc=%d)", round, rc)
 			s.emit(name, "stopped", round, rc, dur, "", "operator stop")
 			return
@@ -859,10 +930,12 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				s.emit(name, "reviewing", round, 0, dur, "",
 					"marker %q reached — build job done, entering the review campaign (ADR-0012 §4.1)",
 					j.Marker)
+				r.closeSessWatch() // terminal from the loop's perspective; reap the watcher
 				return
 			}
 			s.emit(name, "done", round, 0, dur, "",
 				"marker %q detected in session transcript — run is over", j.Marker)
+			r.closeSessWatch() // terminal: reap the watcher (a run-log-only marker may never have pinned a transcript)
 			return
 		}
 
@@ -871,6 +944,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// a finished report to done; otherwise the fatal stands.
 		if r.stateSnapshot().State == "fatal" {
 			s.logf(name, "round %d: run closed by CI-stall intervention", round)
+			r.closeSessWatch()
 			return
 		}
 
@@ -896,7 +970,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		pinned := r.job.SessionPath != ""
 		r.mu.Unlock()
 		if !pinned {
-			p := job.FindSession(j.SessionName, j.Worktree)
+			p := s.captureSession(r)
 			if p == "" {
 				r.finish("fatal", "could not capture session path after LAUNCH — refusing to fork a new session")
 				s.logf(name, "FATAL: could not capture session path after LAUNCH — aborting instead of forking")
@@ -939,6 +1013,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			r.state.State, r.active = "stopped", false
 			r.mu.Unlock()
 			r.persistState()
+			r.closeSessWatch()
 			s.emit(name, "stopped", round, rc, dur, "", "operator stop during backoff")
 			return
 		case <-time.After(sleep):
@@ -952,7 +1027,34 @@ func (r *runner) stateSnapshot() job.State {
 	return r.state
 }
 
+// startedAt is when this job's first round launched, used to scope
+// "recently written" lookups so a stale file from a previous run is never
+// proposed as this run's report.
+func (r *runner) startedAt() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.started
+}
+
 // live reports whether a round is currently polling the control file.
+// sessionResolver is the fresh-LAUNCH transcript source: internal/job's
+// fsnotify SessionWatcher. An interface, not the concrete type, so the wiring
+// test can observe the supervisor ARM and CONSULT the watcher — the watcher
+// was once shipped fully unit-tested and never called, and only an assertion
+// about the wiring (not the component) catches that.
+type sessionResolver interface {
+	TryPath() string
+	Wait(timeout time.Duration) string
+	Close() error
+}
+
+// newSessionResolver arms the watcher for a LAUNCH round. Package variable so
+// supervisor_test can wrap the real constructor and count its uses; production
+// code never reassigns it.
+var newSessionResolver = func(worktree string, notBefore time.Time) (sessionResolver, error) {
+	return job.NewSessionWatcher(worktree, notBefore)
+}
+
 func (r *runner) live() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -966,6 +1068,7 @@ func (r *runner) finish(state, diag string) {
 	r.mu.Unlock()
 	r.persistState()
 	_ = name
+	r.closeSessWatch() // a job that never adopted a transcript must not leak its watcher
 }
 
 // round runs one pi RPC round via the daemon-native client (internal/client);
@@ -975,6 +1078,74 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	j := r.job
 	resume := j.SessionPath != ""
 	r.mu.Unlock()
+
+	// Stamp the launch time BEFORE spawning. Session discovery (below, and in
+	// the marker watcher) must only ever adopt a transcript created at or after
+	// this instant: pi writes its JSONL asynchronously, so a scan issued right
+	// after the spawn can beat the file into existence and otherwise return
+	// some older run's transcript. Pinning that stale path breaks the round in
+	// a way that looks like a hung agent — no transcript growth, no completion
+	// marker (ADR-0011), and the empty-turn detector aborts a healthy session.
+	// Only meaningful for a LAUNCH; a RESUME already has its path pinned.
+	if !resume {
+		r.mu.Lock()
+		r.launchedAt = time.Now()
+		floor := r.launchedAt
+		r.mu.Unlock()
+		// Arm the fsnotify session watcher BEFORE the spawn: pi writes its
+		// JSONL asynchronously, so a directory scan issued right after the
+		// spawn can beat the file into existence (the stale-adoption bug),
+		// and polling for the file leaves the marker gate blind for a whole
+		// poll interval after the transcript lands. The watcher adopts the
+		// file the moment the kernel reports it. A failed arm is not fatal:
+		// captureSession falls back to the FindSession poll, which is exactly
+		// the pre-watcher behavior.
+		if w, err := newSessionResolver(j.Worktree, floor); err != nil {
+			s.logf(j.Name, "round %d: session watcher unavailable (%v); falling back to FindSession polling", round, err)
+		} else {
+			r.mu.Lock()
+			r.sessWatch = w
+			startWait := w
+			r.mu.Unlock()
+			// Adopt from the EVENT side, not only from the scan: a goroutine
+			// parks in Wait until the kernel reports the transcript and pins
+			// it at once, so no tick boundary sits between the file landing
+			// and its adoption (TryPath alone would leave the inotify watch
+			// opened and unused, making the watcher equivalent to the poll it
+			// replaced). Close unblocks Wait — its events channel closes and
+			// it answers from its final scan — so this goroutine always exits
+			// once the watcher is reaped.
+			go func() {
+				p := startWait.Wait(0)
+				if p == "" {
+					return
+				}
+				r.mu.Lock()
+				// Gate on `active` as well as the empty path. Restart
+				// (ADR-0010) clears SessionPath and a concurrent Stop
+				// closes the watcher that unblocks Wait, so this
+				// goroutine can wake AFTER that reset and observe the
+				// cleared field. Pinning then would make the next
+				// round compute resume=true and RESUME the session
+				// `restart --fresh` just quarantined — resurrecting the
+				// exact stale-adoption bug the notBefore floor fixed.
+				// Only a still-live round may adopt.
+				fresh := r.active && r.job.SessionPath == ""
+				var adopted job.Job
+				if fresh {
+					r.job.SessionPath = p
+					adopted = r.job
+				}
+				r.mu.Unlock()
+				if fresh {
+					_ = job.Save(adopted)
+					s.logf(j.Name, "round %d: adopted session transcript %s (fsnotify)", round, p)
+				}
+			}()
+		} // Reaped by closeSessWatch once the path is pinned or the job turns
+		// terminal — the adoption sites run AFTER round() returns, so the
+		// watcher must outlive the round's client.
+	}
 
 	_, runlog, _, _ := job.Paths(j.Name)
 	_ = os.Truncate(runlog, 0)
@@ -1129,6 +1300,52 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 // records it on the runner so `status` is truthful mid-round and the gate can
 // read it at the round boundary. It never interrupts pi: the agent still has
 // to end its turn cleanly, and `done` additionally requires final_report.
+// closeSessWatch reaps the round's session watcher. Idempotent: the watcher
+// is closed exactly once even when several paths race to reap it (Session-
+// Watcher.Close is mutex-guarded), and a nil slot is a no-op.
+func (r *runner) closeSessWatch() {
+	r.mu.Lock()
+	w := r.sessWatch
+	r.sessWatch = nil
+	r.mu.Unlock()
+	if w != nil {
+		_ = w.Close()
+	}
+}
+
+// captureSession resolves the session transcript for a fresh LAUNCH. The
+// armed SessionWatcher answers first — fsnotify adopts the file the moment
+// pi creates it, which is the poll-interval gap the polling path cannot
+// remove — and the FindSession poll stays as the fallback for a watcher that
+// failed to arm or missed its events (fsnotify can coalesce under load; the
+// watcher's own Wait re-scans for the same reason). Both apply the same
+// notBefore floor and defer to the same dirScan selection rule, so watched
+// and polled adoption can never disagree about which file is newest.
+// Returns "" when nothing is discoverable yet.
+func (s *Supervisor) captureSession(r *runner) string {
+	r.mu.Lock()
+	if p := r.job.SessionPath; p != "" {
+		r.mu.Unlock()
+		r.closeSessWatch() // already pinned: the watcher's job is done
+		return p
+	}
+	w := r.sessWatch
+	name, wt := r.job.SessionName, r.job.Worktree
+	floor := r.launchedAt
+	r.mu.Unlock()
+	if w != nil {
+		if p := w.TryPath(); p != "" {
+			r.closeSessWatch()
+			return p
+		}
+	}
+	if p := job.FindSession(name, wt, floor); p != "" {
+		r.closeSessWatch() // the poll won the race: stop watching
+		return p
+	}
+	return ""
+}
+
 func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watchStop, stopCh chan struct{}) {
 	if marker == "" {
 		return // no marker configured: nothing to detect (and the gate refuses)
@@ -1157,7 +1374,7 @@ func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watc
 			r.mu.Unlock()
 		}
 		if path == "" {
-			path = job.FindSession(r.job.SessionName, r.job.Worktree)
+			path = s.captureSession(r)
 			if path == "" {
 				return nil
 			}

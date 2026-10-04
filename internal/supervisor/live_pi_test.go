@@ -110,7 +110,7 @@ func TestLiveRealPiDetectsMarker(t *testing.T) {
 	// so we read the session pi actually created for THIS worktree.
 	liveSess := ""
 	waitFor(t, 120*time.Second, func() bool {
-		liveSess = job.FindSession(j.SessionName, wt)
+		liveSess = job.FindSession(j.SessionName, wt, time.Time{})
 		return liveSess != "" && job.Size(liveSess) > 200
 	})
 	if liveSess == "" || job.Size(liveSess) <= 100 {

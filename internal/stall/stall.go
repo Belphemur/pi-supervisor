@@ -5,6 +5,7 @@
 package stall
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"regexp"
@@ -45,6 +46,13 @@ type Detector struct {
 	// Empty-turn stall bookkeeping (ADR-0010).
 	lastGrowthSize int64 // file size at the last empty-turn evaluation
 	toolCalls      int   // tool_use markers seen since the last empty-turn evaluation
+	// toolsInFlight is tool calls issued but not yet returned. A transcript is
+	// frozen while a long tool runs (`go test -race`, a CI poll, a push), and
+	// that freeze is indistinguishable from a hang by growth alone. An
+	// outstanding call is positive evidence of work in progress, so it must
+	// suppress the empty-turn stall instead of being consumed as a one-time
+	// reprieve.
+	toolsInFlight int
 }
 
 // New starts detection at the file's current end, so historical content (the
@@ -80,8 +88,15 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 		return false, ""
 	}
 	if fi.Size() < d.offset {
-		// Rotated/truncated: restart from the new end, disarmed.
+		// Rotated/truncated: restart from the new end, disarmed. The tool
+		// counters reset WITH the rest: they describe the file that was
+		// being tailed, and after a rotation the detector is reading a
+		// different file — carrying toolCalls/toolsInFlight across would
+		// leave a call seen in flight just before the rotation pinning the
+		// counter above zero forever, muting EmptyTurn for the whole round
+		// (the ADR-0010 failure mode the detector exists to catch).
 		d.offset, d.size, d.ciMode, d.marker = fi.Size(), fi.Size(), false, ""
+		d.toolCalls, d.toolsInFlight = 0, 0
 	}
 	if fi.Size() > d.size {
 		d.lastGrowth = time.Now()
@@ -102,7 +117,20 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 				}
 				// Count tool invocations in this slice so EmptyTurn can tell
 				// "streaming prose" from "wedged with no tool call" (ADR-0010).
-				d.toolCalls += len(toolUseRe.FindAll(buf, -1))
+				// Issued and returned are counted separately so a call that is
+				// STILL RUNNING leaves toolsInFlight > 0 — a long `go test` or CI
+				// poll freezes the transcript exactly like a hang, and only the
+				// outstanding count tells the two apart.
+				uses := len(toolUseRe.FindAll(buf, -1))
+				results := countResultLines(buf)
+				d.toolCalls += uses
+				d.toolsInFlight += uses - results
+				if d.toolsInFlight < 0 {
+					// A result can be observed for a call issued before this
+					// detector started (New begins mid-file). Never let the
+					// count go negative and mask a real in-flight call.
+					d.toolsInFlight = 0
+				}
 				if m := ciRe.Find(buf); len(m) > 0 {
 					d.ciMode = true
 					d.marker = string(m)
@@ -136,7 +164,34 @@ type EmptyTurnWindow struct {
 
 // toolUseRe matches a tool invocation in a transcript line. Counted over the
 // raw JSONL so it survives schema drift: any "tool_use" type marker counts.
-var toolUseRe = regexp.MustCompile(`"tool_use"|"toolu_` + "`" + `|tool_use_id`)
+//
+// This counts a call being REQUESTED, not a call returning. The two are
+// tracked separately (toolResultRe) so a call that is still in flight can be
+// told apart from one that has already come back.
+var toolUseRe = regexp.MustCompile(`"tool_use"`)
+
+// toolResultRe matches the RETURN of a tool call. pi writes each result as
+// its own JSONL line — `"role":"toolResult"` (with a toolCallId) — and the
+// `"tool_use_id"` spelling is the Anthropic-shaped equivalent, so the pairing
+// survives either schema. Both markers live on the SAME result line, which is
+// why matching must be per LINE (countResultLines), never a raw substring
+// count over the buffer: the old alternation ("toolResult"|"toolCallId"|
+// "tool_use_id") hit a real result line TWICE and drained toolsInFlight at
+// double rate, re-arming the very abort-a-live-tool bug the counter exists to
+// prevent (commit 18d48d4).
+var toolResultRe = regexp.MustCompile(`"toolResult"|"tool_use_id"`)
+
+// countResultLines counts tool-result LINES, not substring occurrences: one
+// JSONL line is one tool result, however many of its fields mention it.
+func countResultLines(buf []byte) int {
+	n := 0
+	for line := range bytes.SplitSeq(buf, []byte{'\n'}) {
+		if len(line) != 0 && toolResultRe.Match(line) {
+			n++
+		}
+	}
+	return n
+}
 
 // EmptyTurn reports whether the round is stalled on an empty turn: the
 // transcript has not grown by MinGrowth bytes for Idle, AND no tool_use has
@@ -163,6 +218,21 @@ func (d *Detector) EmptyTurn(w EmptyTurnWindow) (stalled bool, quietFor time.Dur
 	}
 	quiet := time.Since(d.lastGrowth)
 	if quiet < w.Idle {
+		return false, quiet
+	}
+	// A tool call that was issued and has not returned is ACTIVE WORK, not a
+	// stall. The transcript is frozen for the whole duration of a long tool
+	// (`go test -race` on a loaded box, a CI poll, a git push), so growth alone
+	// cannot tell a running tool from a dead agent — but an outstanding call
+	// can.
+	//
+	// This check must come BEFORE the toolCalls reset below. The old code
+	// treated "a tool call was seen" as a one-time reprieve and then zeroed the
+	// counter, so a tool still running at the next tick got its turn aborted
+	// mid-execution. That is not hypothetical: it killed the enum job's round 5
+	// while the agent was pushing its branch, and the aborted SIGINT surfaced
+	// as exit 130 with a healthy transcript.
+	if d.toolsInFlight > 0 {
 		return false, quiet
 	}
 	// Growth inside the window: the agent IS producing, whatever it is. Only a

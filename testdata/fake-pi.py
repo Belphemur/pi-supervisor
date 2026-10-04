@@ -9,6 +9,10 @@ Behavior is selected by the prompt text so one script covers every case:
   TEST_ABORTDRAIN  -> on abort, emit agent_end (aborted turn) then handle the
                       next prompt normally (drain-and-continue)
   TEST_SLOW        -> TEST_STREAM but sleeping SECS=<n> first
+  TEST_MKSESSION   -> create this run's session transcript in pi's
+                      cwd-keyed sessions dir (like real pi does), then
+                      TEST_STREAM; the supervisor's fsnotify session watcher
+                      must adopt it without a poll interval
   TEST_FRAMELOG    -> keep the turn open and quiet (steer tests need a round
                       that stays live while frames arrive)
 
@@ -47,7 +51,27 @@ def emit(prompt):
         # Deliberately silent and never agent_end: the round stays live so a
         # steer can be delivered into it.
         return
-    if "TEST_STREAM" in prompt:
+    if "TEST_MKSESSION" in prompt:
+        # pi writes its session transcript asynchronously into the
+        # cwd-keyed sessions dir: $HOME/.pi/agent/sessions/--<munged>--,
+        # munged exactly like job.MungedSessionsDir (leading / stripped,
+        # "/" -> "-"). Create it a beat AFTER the launch so the watcher
+        # (armed pre-spawn) sees the create event.
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        munged = "--" + os.getcwd().lstrip("/").replace("/", "-") + "--"
+        sdir = os.path.join(home, ".pi", "agent", "sessions", munged)
+        os.makedirs(sdir, exist_ok=True)
+        sess_path = os.path.join(sdir, "sess-%d.jsonl" % os.getpid())
+        with open(sess_path, "w") as fh:
+            fh.write('{"type":"session","id":"fake"}\n')
+            fh.write('{"type":"message","message":{"role":"assistant",'
+                     '"content":[{"type":"text","text":"TEST_MKSESSION_MARKER"}]}}\n')
+        time.sleep(0.3)
+        for w in ("hello ", "from ", "fake ", "pi"):
+            delta(w)
+            time.sleep(0.05)
+        out({"type": "agent_end"})
+    elif "TEST_STREAM" in prompt:
         # Echo any MARKER_ token so the supervisor's marker gate can see it
         # in the run log, exactly like a real agent would print the token.
         for tok in prompt.split():

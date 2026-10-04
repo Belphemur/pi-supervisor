@@ -342,7 +342,7 @@ func dispatch(h Handler, raw []byte) Response {
 func dispatchReview(h Handler, raw []byte) Response {
 	rv, ok := h.(Reviewer)
 	if !ok {
-		return Response{OK: false, Error: "review unsupported", Reason: "usage"}
+		return Response{OK: false, Error: "review unsupported", Reason: string(fault.KindUsage)}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -354,7 +354,7 @@ func dispatchReview(h Handler, raw []byte) Response {
 		return Response{
 			OK:     false,
 			Error:  "bad review json: " + err.Error(),
-			Reason: "usage",
+			Reason: string(fault.KindUsage),
 		}
 	}
 	// The full payload (threads, replies, ids) lives in the raw body; the

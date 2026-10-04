@@ -267,7 +267,24 @@ completion is the report file alone, or tell the agent to emit it. Never brief
 
 ## Follow-ups
 
-1. Wire `Status`, `Steer` and `Logs` refusals to `fault.New` — F4.
+1. ~~Wire `Status`, `Steer` and `Logs` refusals to `fault.New` — F4.~~
+   **DONE** (`fault` is wired since the journal ADR).
+1b. ~~One wire vocabulary for refusal reasons (DRY): `fault.Kind` vs
+   `review.Reason` for the same `Response.Reason` field.~~ **DONE** in
+   `04944d3` (PR "one refusal vocabulary"). `internal/fault.Kind` is the
+   single source of truth; `review.Reason` is a type **alias** of it, and
+   `ExitCode()` moved onto `fault.Kind` as a data table
+   (`exitCodes`), so a Kind added without a mapping fails a test instead of
+   inheriting the runtime-refusal fallback. Every value ADR-0012 §2.4
+   published is byte-identical. The one migration: `fault.KindNoLiveRound`
+   was `"no_live_round"` and the steer path really did emit it — it is now
+   `"no-live-round"`, the spelling the review shim already matched, so a
+   single condition has a single spelling everywhere. `bad_request` and
+   `usage` are kept distinct (both published, both "change the call") and
+   fault_test pins that they exit alike. Guards:
+   `TestNoDuplicateSpellings`, `TestLegacyNoLiveRoundSpellingIsRetired`,
+   `TestEveryKindHasAnExitCode`, `TestKindValuesAreStable`,
+   `internal/review/reason_test.go`.
 2. Emit `daemon_ready`; document the stream-split limit — F3.
 3. Replace the vacuous concurrency test with the three-handler shape — F5.
 4. Make `install.sh` part of the repo's own CI smoke test, so the install path is

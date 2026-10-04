@@ -21,7 +21,7 @@ Unix socket.
 | `cmd/pi-supervisor/version_cli_test.go` | `pi-supervisor version` offline CLI test |
 | `internal/supervisor/supervisor.go` | Round loops: drive `internal/client`, classify exits, adaptive backoff, marker gate, instant-exit strikes, never-fork guard, `Steer` (frame + ack wait, ADR-0005), `interruptPID` (SIGINT group, ADR-0007) |
 | `internal/journal/journal.go` | Structured stdout log for `journalctl`: one `<ts> <LEVEL> <subsystem> event=<name> key=value…` line per transition, custom `slog.Handler` (stdlib only, no third-party logger), shared write mutex so concurrent job loops never interleave a line |
-| `internal/fault/fault.go` | Machine-readable refusal kind carried alongside the error text (`unknown_job`, `not_running`, …), so `internal/control` logs `reason=` without matching prose and without importing the supervisor |
+| `internal/fault/fault.go` | The ONE machine-readable refusal vocabulary for both the journal's `reason=` and the socket's `Response.Reason` (`fault.Kind`, its `All()` inventory, the `exitCodes` exit table). `internal/review.Reason` is an alias of it, so the two closed enums can never drift into two spellings of one condition (ADR-0013 follow-up 1b). Pure-Go, imports nothing. |
 | `internal/events/events.go` | Lifecycle events: append-only audit JSONL per job + in-process fan-out broker (buffered, never blocks the round loop) |
 | `internal/job/transcript.go` | completion surface: `TranscriptContains`, `TranscriptWatcher` (ADR-0011) |
 | `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap. Same tail scrapes the round's GitHub PR URL (ADR-0006) |
@@ -142,11 +142,16 @@ Unix socket.
     `review.ack_timeout` and the threads stay open — fail closed, never a
     deadlock, never silent. There is no human ACK: every consumer is an LLM, so
     an interactive gate would block forever.
-20. **Review errors are a closed `Reason` enum, never prose.** `ExitCode()` on
-    the reason is what maps to ADR-0008's contract (2 = change the call, 1 =
-    retry). Adding a failure path that returns a bare `fmt.Errorf` breaks the
-    shim's ability to branch — including the control-socket bad-JSON path, which
-    must set `Reason: "usage"`.
+20. **Review errors are a closed `Reason` enum, never prose.** `review.Reason`
+    is a type ALIAS of `fault.Kind` (ADR-0013 follow-up 1b): one vocabulary for
+    the `Response.Reason` field, one spelling per condition, `ExitCode()` living
+    on `fault.Kind` as the `exitCodes` data table. Adding a Kind without an
+    exit-code entry, or re-adding a hyphen/underscore twin of an existing value,
+    fails a test (`TestEveryKindHasAnExitCode`, `TestNoDuplicateSpellings`) —
+    keep it that way. `ExitCode()` on the reason is what maps to ADR-0008's
+    contract (2 = change the call, 1 = retry). Adding a failure path that returns
+    a bare `fmt.Errorf` breaks the shim's ability to branch — including the
+    control-socket bad-JSON path, which must set `Reason: fault.KindUsage`.
 21. **Only REQUIRED CI checks block a review campaign.** `check_ci` asks GraphQL
     `isRequired(pullRequestId:)` because the Actions `/jobs` endpoint carries no
     required-ness flag. A failing OPTIONAL check is reported in `non_blocking`
