@@ -3,6 +3,7 @@ package journal
 import (
 	"bytes"
 	"log/slog"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -181,31 +182,109 @@ func TestSubsystemAppearsOnce(t *testing.T) {
 	}
 }
 
-// The write lock is shared by every handler: two jobs logging at once must
-// never produce a line that is a splice of both.
-func TestConcurrentLinesDoNotInterleave(t *testing.T) {
-	b := capture(t)
-	const workers, each = 8, 40
-	var wg sync.WaitGroup
-	for w := range workers {
-		wg.Go(func() {
-			log := Subsys("job")
-			for i := range each {
-				log.Info("round_end", "job", "w", "round", w, "i", i)
-			}
-		})
-	}
-	wg.Wait()
+// yieldSink is a destination whose Write is NOT atomic: it copies half the
+// bytes, yields the processor, then copies the rest — what a pipe, a tty or a
+// journald fd can do to a large write, and what two concurrent writers do to
+// each other in any case. It is the honest adversary for "one whole-line
+// write at a time": with the shared lock the two halves can never be split by
+// another handler; without it, they are.
+type yieldSink struct{ b bytes.Buffer }
 
-	lines := strings.Split(strings.TrimSuffix(b.String(), "\n"), "\n")
-	if len(lines) != workers*each {
-		t.Fatalf("want %d lines, got %d", workers*each, len(lines))
+func (y *yieldSink) Write(p []byte) (int, error) {
+	const minLen = 256
+	if len(p) < minLen {
+		return y.b.Write(p)
+	}
+	half := len(p) / 2
+	if _, err := y.b.Write(p[:half]); err != nil {
+		return 0, err
+	}
+	runtime.Gosched() // the tear window: a scheduling point, never a sleep
+	if _, err := y.b.Write(p[half:]); err != nil {
+		return half, err
+	}
+	return len(p), nil
+}
+
+// The write lock is shared by every handler, and that is the invariant: in
+// production three distinct subsystems (daemon, job, control) hold three
+// different handlers writing into ONE sink, so a per-handler mutex would let
+// them splice each other's lines. The test therefore logs from all three with
+// payloads far larger than one write, through a sink that can tear — deleting
+// the shared lock makes records merge/truncate and this fails. A test that used
+// one subsystem (one handler, which would still hold one lock even without the
+// shared one) passes with the lock deleted, which is exactly the hole this
+// replaces.
+//
+// No sleeps: a start barrier lines the goroutines up and the adversarial sink
+// supplies the tear window, so -race and -count=N are stable.
+func TestConcurrentLinesDoNotInterleave(t *testing.T) {
+	sink := &yieldSink{}
+	prev := SetOutput(sink)
+	t.Cleanup(func() { SetOutput(prev) })
+	const (
+		subsystems         = 3
+		workersPerSubsys   = 4
+		each               = 20
+		payloadRepeatBytes = 4096
+	)
+	seen := map[string]bool{}
+	subs := []string{"daemon", "job", "control"}
+	total := subsystems * workersPerSubsys * each
+
+	var start sync.WaitGroup // barrier: all goroutines leave together
+	var done sync.WaitGroup
+	start.Add(1)
+	for s := range subsystems {
+		for w := range workersPerSubsys {
+			done.Go(func() {
+				log := Subsys(subs[s])
+				tag := strconv.Itoa(s*100 + w)
+				// Every record carries its own marker at both ends plus a
+				// payload big enough that a torn write cannot resynchronize
+				// on a line boundary by luck.
+				blob := strings.Repeat("x", payloadRepeatBytes)
+				start.Wait()
+				for i := range each {
+					log.Info("round_end",
+						"subsys", subs[s], "tag", tag, "i", strconv.Itoa(i),
+						"head", tag+"-"+strconv.Itoa(i),
+						"blob", blob,
+						"tail", tag+"-"+strconv.Itoa(i)+"-end")
+				}
+			})
+		}
+	}
+	start.Done()
+	done.Wait()
+
+	lines := strings.Split(strings.TrimSuffix(sink.b.String(), "\n"), "\n")
+	if len(lines) != total {
+		t.Fatalf("want %d intact lines, got %d: records were merged or lost "+
+			"(the shared write lock is gone?)", total, len(lines))
 	}
 	for i, line := range lines {
 		a := attrs(t, line)
-		if a["event"] != "round_end" || a["job"] != "w" || a["round"] == "" || a["i"] == "" {
-			t.Fatalf("line %d is spliced: %q (attrs %v)", i, line, a)
+		if a["event"] != "round_end" {
+			t.Fatalf("line %d lost its event: %q (attrs %v)", i, line, a)
 		}
+		head, tail := a["head"], a["tail"]
+		if head == "" || head+"-end" != tail {
+			t.Fatalf("line %d is spliced: head %q tail %q", i, head, tail)
+		}
+		if got := strings.Count(a["blob"], "x"); got != payloadRepeatBytes {
+			t.Fatalf("line %d payload is %d bytes, want %d: torn write",
+				i, got, payloadRepeatBytes)
+		}
+		// The tag must be one this run issued, and each (tag,i) exactly once.
+		key := a["tag"] + "/" + a["i"]
+		if a["subsys"] == "" || seen[key] {
+			t.Fatalf("line %d has duplicate/unknown tag: %q (attrs %v)", i, key, a)
+		}
+		seen[key] = true
+	}
+	if len(seen) != total {
+		t.Fatalf("saw %d distinct records, want %d", len(seen), total)
 	}
 }
 

@@ -205,7 +205,7 @@ func (s *Supervisor) Status(name string) (any, error) {
 	r, ok := s.jobs[name]
 	s.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("unknown job %q", name)
+		return nil, fault.New(fault.KindUnknownJob, fmt.Errorf("unknown job %q", name))
 	}
 	return r.snapshot(), nil
 }
@@ -386,7 +386,7 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 	r, ok := s.jobs[name]
 	s.mu.Unlock()
 	if !ok {
-		return job.SteerReport{Job: name}, fmt.Errorf("unknown job %q", name)
+		return job.SteerReport{Job: name}, fault.New(fault.KindUnknownJob, fmt.Errorf("unknown job %q", name))
 	}
 	frame, id, err := steerFrame(text)
 	if err != nil {
@@ -416,7 +416,7 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 		rep.Outcome = job.AckNoRound
 		rep.Detail = fmt.Sprintf("job state %q, round %d: no round is reading %s, so nothing was written",
 			rep.JobState, rep.Round, rep.CtrlPath)
-		return rep, fmt.Errorf("%s", rep.Detail)
+		return rep, fault.New(fault.KindNoLiveRound, fmt.Errorf("%s", rep.Detail))
 	}
 
 	// Remember where the ack log ends so only records the client writes for

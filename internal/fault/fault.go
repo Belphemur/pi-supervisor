@@ -20,6 +20,7 @@ type Kind string
 const (
 	KindUnknownJob     Kind = "unknown_job"
 	KindNotRunning     Kind = "not_running"
+	KindNoLiveRound    Kind = "no_live_round"
 	KindAlreadyRunning Kind = "already_running"
 	KindAlreadyDone    Kind = "already_done"
 	KindBadRequest     Kind = "bad_request"

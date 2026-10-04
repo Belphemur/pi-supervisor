@@ -187,13 +187,22 @@ Unix socket.
     reintroduce the v69-era App helpers; there is no hand-rolled JWT or refresh
     loop in this tree.
 28. **The journal is ADDITIVE and one-line-per-transition.** `internal/journal`
-    writes `<ts> <LEVEL> <subsystem> event=<name> key=value…` to stdout for
-    `journalctl -u pi-supervisor`; it never replaces the `/tmp/pi_*` files
-    (invariant 5 still holds), it never logs streamed text, payloads or
-    credentials, and every handler shares ONE write mutex so concurrent job
-    loops cannot splice a line. Lifecycle lines come from the single `emit()`
-    funnel, so the log cannot drift from the event stream. Refusal lines carry
-    `reason=` from `internal/fault`, never from matching error prose.
+    writes `<ts> <LEVEL> <subsystem> event=<name> key=value…` for
+    `journalctl --user -u pi-supervisor -o cat`; it never replaces the
+    `/tmp/pi_*` files (invariant 5 still holds), it never logs streamed text,
+    payloads or credentials, and every handler shares ONE write mutex so
+    concurrent job loops cannot splice a line. Lifecycle lines come from the
+    single `emit()` funnel, so the log cannot drift from the event stream.
+    Refusal lines carry `reason=` from `internal/fault`, never from matching
+    error prose. **Level is a STREAM, not a journald priority:** INFO and below
+    go to stdout, WARN and above to stderr, because journald derives PRIORITY
+    from the stream and a ` WARN ` token in the text is just characters. The
+    residual limit, stated honestly: systemd still assigns the whole unit ONE
+    priority, so `journalctl -p warning` does NOT return our warnings. What
+    works today is
+    `journalctl --user -u pi-supervisor -o cat | grep ' WARN \| ERROR '`.
+    Genuine per-record priorities need a `/dev/log` datagram, which issue #1
+    lists under non-goals.
 
 ## State-durability invariants
 

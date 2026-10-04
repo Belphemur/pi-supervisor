@@ -124,8 +124,11 @@ func runDaemon() {
 		journal.L().Warn("notify_ready_failed", "err", err.Error())
 	}
 	// The human banner stays verbatim (external tooling and the lifecycle
-	// test key on its text); the journal line above is the queryable form.
+	// test key on its text); the journal line next to it is the queryable
+	// form: `journalctl --user -u pi-supervisor -o cat | grep daemon_ready`
+	// answers "did the daemon come up?" without scraping the banner.
 	fmt.Println("pi-supervisor ready at", socketPath())
+	journal.L().Info("daemon_ready", "socket", socketPath())
 	select {} // loops run in goroutines
 }
 
