@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.4.0
+version: 1.5.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -344,16 +344,87 @@ actually emits, not what the fixtures assume it emits):
 A review campaign is a job whose fix-rounds the daemon orchestrates rather
 than the agent: the daemon owns the outer loop (poll GitHub -> decide ->
 enforce budget), pi runs each round, and the two are joined by the completion
-gate from §3 — a round ends at its marker, and the gate's `pr_url` is what
-arms the next review phase.
+gate (ADR-0011) — a round ends at its marker, and the gate's `pr_url` is what
+arms the review phase. **Every command here is consumed by another LLM, not a
+human**: nothing prompts, nothing pages, and every failure is a non-zero exit
+plus a machine-readable `reason` from a closed enum.
 
-- **Surface.** `pi-supervisor review <job> --pr <N> [--rounds N=5] [--skill PATH] [--type acceptance|rebuttal]`. `--pr` starts a manual campaign; `--auto` writes an `auto_review` stanza so the completion gate arms one when the linked PR is open (§below). `--rounds` is the campaign's `MaxRounds` — **default 5** (a review round is hours-long, not minutes; an operator count beats a heuristic). `--type` declares the round's character: `acceptance` (threads treated as accepted findings) or `rebuttal` (agent pushes back with evidence); recorded per round so stats surface `#acceptance` vs `#rebuttal` in `watch`/`status`. `--skill` defaults to `answer-code-review` (triage rules unchanged); the brief *additionally* loads the `pi_supervisor_review` skill, whose system prompt tells pi to route every GitHub action through the `_pi-supervisor-review` shim at `$PI_SUPERVISOR_SOCKET` — never `gh` or `reply_review.py` from the shell.
-- **Two control planes, cleanly split.** Daemon = poll GitHub (read-only, via `go-github`) -> decide "one more pi round?" -> enforce `MaxRounds`. Pi = one round's fix + triage. The daemon never authors replies or decides to resolve; it only *serves* reads and *records* writes the shim asks for. The shim is **not** an MCP plugin process — it is a CLI (`/home/balor/.local/bin/_pi-supervisor-review`) that speaks the daemon's JSON control protocol directly over the unix socket. New endpoint, additive: `POST /review/action` with `list_threads` | `thread_detail` | `post_replies` (an array of `(thread_id, type{acceptance|rebuttal}, body)` tuples — one LLM turn answers N threads, each with its own comment and classification) | `resolve_thread` | `bulk_resolve` | `check_ci`. Per-thread `resolve_thread` returns `409` unless the daemon recorded a `post_replies` touching that thread in the current round (answer-before-resolve is enforced server-side via typed `go-githubv4` errors). `bulk_resolve` is LLM-invoked but human-gated: it posts a PR comment (thread IDs + reason), emits `bulk_resolve_requested`, and waits for a peer ACK (`pi-supervisor ack --event <id>`) before firing GraphQL mutations — the agent may bulk-close threads it judges collectively out-of-scope, but never silently.
-- **Auth (SDK, not shell-out).** The daemon uses `go-github/v90` (REST) + `shurcooL/githubv4` (GraphQL) with **one shared token source**:
+- **Surface.** `pi-supervisor review <job> --pr <N> [--rounds N=5] [--type acceptance|rebuttal] [--json]` / `review <job> --auto` / `ack --event <ack_id>`. `--pr` and `--auto` are mutually exclusive. `--rounds` is the campaign's `MaxRounds` — **default 5** (a review round is hours-long; an operator count beats a heuristic); `--rounds 0` auto-derives `ceil(open / review.per_round)` (`per_round` 12) capped by `review.max_rounds` (12). `--type` is the campaign's round character, uniform across its rounds and recorded per round so `watch`/`status` surface `#acceptance` vs `#rebuttal`; mixed campaigns are two campaigns.
+- **One instruction source, not two.** `--skill` defaults to
+  **`pi_supervisor_review`**, which carries the triage vocabulary (fix /
+  explain-non-issue / defer-out-of-scope) *and* the shim contract. It is NOT
+  `answer-code-review`: that skill's body is a set of instructions to run
+  `reply_review.py`, so injecting it alongside a contract that forbids the
+  agent from touching `reply_review.py` puts two contradictory directives in
+  one prompt, and the model follows whichever it reads last. `answer-code-review`
+  stays the default for **non**-review jobs and remains available here via an
+  explicit `--skill` for prose reference. Its proven GraphQL query shapes are
+  inherited by the daemon, not re-derived.
+- **The verb set is closed at six**, and it is the only way a review round
+  reaches GitHub: `list_threads` | `thread_detail` | `post_replies` |
+  `resolve_thread` | `bulk_resolve` | `check_ci`. The shim
+  (`/home/balor/.local/bin/_pi-supervisor-review`) is a CLI speaking the
+  daemon's JSON control protocol directly over the unix socket — not an MCP
+  plugin process. New endpoint, additive: `POST /review/action`.
+- **Call order is load-bearing: `post_replies` → `resolve_thread`, always.** The
+  model's instinct is to close a thread once it judges the work finished; here
+  that is the one thing that fails. `resolve_thread` is refused with
+  `not-answered-this-round` unless a `post_replies` in **this** round already
+  touched that thread — reply bodies are the record of *why* a finding was
+  fixed, rebutted, or deferred, and a bare close discards that. `post_replies`
+  takes a batch (`(thread_id, type{acceptance|rebuttal}, body)` tuples) so one
+  model turn answers every thread it triaged, each with its own body and
+  classification. The daemon stamps `job`/`round` itself — never from the
+  request payload — so the guard cannot be self-certified; a mismatch is refused
+  (`round-mismatch`), not silently corrected.
+- **Errors are a closed enum the caller branches on**, never prose: `no-live-round`,
+  `round-mismatch`, `not-answered-this-round`, `unknown-thread` (exit 2 — fix the
+  call), `auth-unavailable`, `rate-limited`, `github-error` (exit 1). `--json` is
+  on every verb; ADR-0008's exit contract (2 usage, 1 refused, 0 success) is unchanged.
+- **Two control planes, cleanly split.** Daemon = poll GitHub (read-only) -> decide "one more pi round?" -> enforce `MaxRounds`. Pi = one round's fix + triage. The daemon never authors replies or decides to resolve; it only *serves* reads and *records* writes the shim asks for. It refuses any review request when no `review <job>` round is live, so the shim is only valid inside the round it was armed for.
+- **Thread ids are `PRRT_…` GraphQL node ids, never numeric.** This is the
+  #1 way to waste a review turn: the numeric `id` from
+  `GET /pulls/<n>/comments` is a *comment* node, and both mutations reject it
+  with *"Could not resolve to a node with the global id"*. The daemon is the
+  only producer of thread ids and always hands out `PRRT_…`; the shim never
+  derives one from a URL or a REST payload. Two more inherited rules, both
+  silent when broken: `author` lives on the **comment** node (not the thread —
+  selecting it on the thread fails schema validation on every poll and reads as
+  "no threads yet"), and `reviewThreads` pagination must run to **exhaustion**
+  (it returns oldest-first, so page 1 is mostly resolved history and `--open`
+  reports `0` while dozens are open — hit on PR #184, 67 threads). A response
+  `cursor:null` means exhausted, not "first page".
+- **Reads: thread reads are GraphQL, PR/CI metadata is REST.** `list_threads` /
+  `thread_detail` use the GraphQL `reviewThreads` connection — the only surface
+  with thread identity, `isResolved`, and comment authors; REST
+  pulls-comments has none of the three. `head_sha`/PR state/CI verdicts use
+  `go-github` REST. `check_ci` reads the Actions run's **`/jobs`** endpoint for
+  the current head sha, never a `gh pr checks` rollup (that rollup races right
+  after a push and transiently reads green with work still queued);
+  `success`/`neutral`/`skipped` pass, `pending` does not.
+- **Mutation field asymmetry.** `addPullRequestReviewThreadReply` takes
+  `pullRequestReviewThreadId`; `resolveReviewThread` takes `threadId`. Same
+  `PRRT_…` value, different field name — getting it backwards fails silently.
+- **Auth (SDK, not shell-out).** `go-github/v90` (REST) + `shurcooL/githubv4` (GraphQL), **one shared token source** — `githubv4` wraps a plain `http.Client`, so both clients share one authenticated transport:
   - GitHub App (preferred): `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` (inline PEM or path) -> `golang-jwt` signs a JWT -> `go-github`'s `InstallationTokenSource` fetches + caches + auto-refreshes a 1h installation token. No PAT on disk.
   - fallback: if the App env is unset, the daemon runs `gh auth token` (the *only* `gh` call in its lifecycle — token acquisition, never an API call) and passes that token to the same `go-github`/`go-githubv4` clients. If `gh auth token` fails, `Start` refuses (exit 1) with `GitHub auth unavailable: run 'gh auth login' or set GITHUB_APP_ID`.
   - No `gh api` anywhere. No second credential surface. The daemon refuses a `/review/action` request when no `review <job>` round is live — the shim is only valid inside the round it was armed for.
-- **Auto-trigger on marker + open PR.** When a marked round links an OPEN PR (`pr_url` from §4 scrape) and the job def carries `auto_review`: (1) post the configured trigger comment (default `@coderabbitai review`), (2) wait the warmup (`review.coderabbit_warmup`, default 5m — a fresh PR has zero threads until CodeRabbit finishes its pass), (3) re-check: > 0 threads -> arm `review <job> --pr <N>` (default 5 rounds); 0 threads -> emit `review_skipped` with `reason:"no open threads after CodeRabbit warmup"`. `--rounds 0` means auto-derive at arm time (`ceil(open / per_round)`, `per_round` default 12), capped — a convenience for large PRs, not the daemon deciding scope. The PR number is parsed from the `pull/<N>` in the already-scraped `pr_url`; no second scrape.
+- **Auto-trigger on marker + open PR.** When a marked round (marker **and**
+  final report) links an OPEN PR (`pr_url` from §4 scrape) and the job def
+  carries `auto_review`: the gate closes the build job first, then the job
+  transitions `done → reviewing` and the daemon (1) posts the fixed
+  `@coderabbitai review` comment, (2) waits the warmup
+  (`review.coderabbit_warmup`, default 5m — a fresh PR has zero threads until
+  CodeRabbit finishes its pass), (3) re-checks paginated: > 0 threads -> run
+  the campaign (default 5 rounds); 0 threads -> emit `review_skipped` with
+  `reason:"no open threads after CodeRabbit warmup"` and leave the job `done`.
+  The `done → reviewing` hop is load-bearing: the gate clears `active` and
+  `Start` refuses a `done` job, so there is no live round to fire from — the
+  trigger runs in the gate's tail, and review rounds **resume** the same
+  session under their own round counter. `auto_review` is consumed on fire (the
+  marker latch is sticky, so an unguarded re-arm would loop forever); re-arm
+  explicitly with `review <job> --auto`. The PR number is parsed from the
+  `pull/<N>` in the already-scraped `pr_url`; no second scrape.
 - **Round economics: no-push is free.** Only pi-execution rounds consume
   `MaxRounds`. A round that replied to threads but did not push a new commit
   leaves the head SHA unchanged; the next round re-handles the stale threads
@@ -361,4 +432,13 @@ arms the next review phase.
   evidence but no fix commit (the answer itself is the round's work; only the
   no-push-answer case is free).
 - **`watch` is the review dashboard.** Arm it after `start`; each `round_done` carries round type, open-thread count, `head_sha`, `pushed` (bool), rc, + the remaining-thread list (threads whose latest reply is not by this job's `gh` user). Stats surface `#acceptance` / `#rebuttal` counts — so you can see, mid-campaign, how many rounds were pure fixes vs how many defended a "this finding is out of scope / not-a-real-issue."
-- **Pre-merge is a gate; bulk-close is human-gated.** The campaign gates *on* `pre-merge --pr <N>` and never merges — the owner merges once threads read zero. Bulk close is a `bulk_resolve` action the LLM may invoke: it posts a PR comment (thread IDs + reason), emits `bulk_resolve_requested`, and waits for a peer ACK (`pi-supervisor ack --event <id>`) before firing the mutations — out-of-scope threads can be closed, but never silently or autonomously.
+- **Pre-merge is a gate; bulk-close is ack-gated, never human-gated.** The
+  campaign *reports* readiness — the owner merges once threads read zero, and
+  the daemon never merges. Bulk close is a `bulk_resolve` action the LLM may
+  invoke: it posts a PR comment (thread IDs + reason), emits
+  `bulk_resolve_requested` with an `ack_id`, and applies the mutations **only**
+  after a peer ACK (`pi-supervisor ack --event <ack_id>`). Because no human is
+  ever present, an unacked request **expires** after `review.ack_timeout`
+  (default `30m`) and applies nothing, emitting `bulk_resolve_expired` — the
+  threads stay open, which is the safe default. So out-of-scope threads can be
+  closed, but never silently and never into a deadlock.
