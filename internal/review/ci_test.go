@@ -1,6 +1,12 @@
 package review
 
-import "testing"
+import (
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/google/go-github/v90/github"
+)
 
 // Only REQUIRED checks block. An optional check that fails must not hold a
 // review campaign open for its entire budget — that is the livelock the
@@ -99,6 +105,74 @@ func TestRollupUnknownRequiredFailsClosed(t *testing.T) {
 	}
 	if !got.All[0].Required {
 		t.Error("with unknown required-ness every check must count as required")
+	}
+}
+
+// go-github synthesizes a plain error for an unprotected branch instead of
+// returning an *ErrorResponse, so the detection must work off the message too.
+// Getting this wrong makes every campaign on an unprotected repo treat all
+// checks as required (live-test finding).
+func TestIsNotProtected(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		resp *github.Response
+		want bool
+	}{
+		{"synthesized message", errors.New("branch is not protected"), nil, true},
+		{"message casing", errors.New("Branch is not protected"), nil, true},
+		{"forbidden is NOT unprotected", errors.New("Resource not accessible by integration"), nil, false},
+		{"nil err", nil, nil, false},
+	}
+	for _, c := range cases {
+		if got := isNotProtected(c.err, c.resp); got != c.want {
+			t.Errorf("%s: isNotProtected = %v, want %v", c.name, got, c.want)
+		}
+	}
+	// A real *github.ErrorResponse carrying a 404 must also be recognized.
+	resp := &http.Response{StatusCode: http.StatusNotFound}
+	rerr := &github.ErrorResponse{Response: resp}
+	if !isNotProtected(rerr, nil) {
+		t.Error("a 404 ErrorResponse must be recognized as not-protected")
+	}
+	// And a 403 ErrorResponse must NOT be.
+	rerr403 := &github.ErrorResponse{Response: &http.Response{StatusCode: http.StatusForbidden}}
+	if isNotProtected(rerr403, nil) {
+		t.Error("a 403 must not be read as unprotected — that would fail OPEN")
+	}
+}
+
+// An unprotected branch must NOT be treated as required_unknown: that would make
+// every check blocking and deadlock the campaign.
+func TestUnprotectedBranchRequiresNothing(t *testing.T) {
+	got := rollup("abc", []CICheck{
+		{Name: "build", Status: "completed", Conclusion: "failure"},
+	}, map[string]bool{}, true)
+	got.NoProtection = true
+	if got.Verdict != "pass" {
+		t.Fatalf("verdict = %q, want pass on an unprotected branch", got.Verdict)
+	}
+	if got.RequiredUnknown {
+		t.Error("unprotected must not set RequiredUnknown")
+	}
+	if len(got.NonBlocking) != 1 {
+		t.Errorf("the failing check must be reported as non-blocking: %v", got.NonBlocking)
+	}
+}
+
+func TestRequiredMatchesIsCaseInsensitive(t *testing.T) {
+	req := map[string]bool{"CI / CircleCI": true}
+	if !requiredMatches(req, "CI / CircleCI") {
+		t.Error("exact match failed")
+	}
+	if !requiredMatches(req, "ci / circleci") {
+		t.Error("case-insensitive match failed — protection contexts and check names differ in case")
+	}
+	if requiredMatches(req, "Build") {
+		t.Error("unrelated check matched a required context")
+	}
+	if requiredMatches(nil, "Build") {
+		t.Error("a nil requirement map must match nothing")
 	}
 }
 

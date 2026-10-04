@@ -160,7 +160,24 @@ Unix socket.
 23. **A live campaign owns its round budget.** `loop` reads the campaign's
     `MaxRounds` while `state == "reviewing"`, not the build job's — otherwise a
     5-round campaign runs to the job's default 200.
-24. **go-github v90 renamed its services.** `Pulls` → `PullRequests`,
+24. **Required-ness comes from branch protection, not GraphQL `isRequired`.**
+    A live test showed `checkRun.isRequired(pullRequestId:)` returns empty check
+    runs for a fork PR, so it silently degraded to fail-closed — every check
+    blocking, which defeats the optional-check split. Use
+    `Repositories.GetBranchProtection(base)`. Also: an UNPROTECTED branch
+    (`no_protection`) requires nothing and blocks nothing — that is the opposite
+    of `required_unknown`, and conflating them deadlocks campaigns. go-github
+    reports that 404 as a plain `errors.New("branch is not protected")`, not an
+    `*ErrorResponse`, so `isNotProtected` matches the message too.
+25. **`thread_detail` needs `... on PullRequestReviewThread` wrapping the whole
+    selection.** `isResolved` is not on the `Node` interface; the fragment on the
+    inner field is also rejected. Both misplacements were found by the live test.
+26. **There is a live GitHub test, read-only.** `internal/review/live_gh_test.go`
+    runs against a real PR when `PI_SUPERVISOR_LIVE_GH=1` (+ `_LIVE_REPO`,
+    `_LIVE_PR`). It only READS — never post/reply/resolve against a real PR.
+    Run it after touching the GraphQL queries or the CI rollup; unit fixtures
+    cannot catch a schema or shape error.
+27. **go-github v90 renamed its services.** `Pulls` → `PullRequests`,
     `Apps.FindRepositoryInstallation` → `GetRepositoryInstallation`, and
     `AppsTransport`/`InstallationTokenSource` were REMOVED — App auth now goes
     through `github.com/bradleyfalzon/ghinstallation/v2` (`NewAppsTransport` then
@@ -174,6 +191,9 @@ Unix socket.
 GOTOOLCHAIN=auto go build ./... && go vet ./...   # both must be clean
 GOTOOLCHAIN=auto go fix -diff ./...                # must print nothing (modernizers)
 gofmt -l .                                         # must print nothing
+# Live GitHub, READ-ONLY, opt-in — catches schema/shape errors fixtures cannot
+PI_SUPERVISOR_LIVE_GH=1 PI_SUPERVISOR_LIVE_REPO=owner/name PI_SUPERVISOR_LIVE_PR=N \
+  go test ./internal/review/ -run Live -v
 GOTOOLCHAIN=auto go test ./... -race              # -race is not optional
 /home/balor/go/bin/golangci-lint run ./...        # must exit 0 (v2.14.0)
 pi-supervisor completion install               # detect+install shell completion (idempotent)

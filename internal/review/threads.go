@@ -151,36 +151,49 @@ func (c *Client) ThreadDetail(ctx context.Context, owner, repo, threadID string)
 				"the numeric pulls-comments id is a COMMENT node and both mutations reject it",
 			threadID, threadIDPrefix)
 	}
-	// Thread ids are global node ids, so resolve through node(id: $id)
-	// rather than re-paging the PR's thread list.
+	// Thread ids are global node ids, so resolve through node(id: $id).
+	//
+	// The inline fragment is REQUIRED and must wrap the WHOLE selection:
+	// `isResolved` lives on PullRequestReviewThread, not on the Node interface,
+	// so selecting it directly off node(id:) fails with "Field 'isResolved'
+	// doesn't exist on type 'Node'". Putting the fragment on the inner field
+	// instead of the struct's own tag does not satisfy the query builder — a
+	// live test caught both misplacements.
 	var byID struct {
 		Node struct {
-			ID         githubv4.ID
-			IsResolved githubv4.Boolean
-			Comments   struct {
-				Nodes []struct {
-					Author struct {
-						Login githubv4.String
+			ReviewThread struct {
+				ID         githubv4.ID
+				IsResolved githubv4.Boolean
+				Comments   struct {
+					Nodes []struct {
+						Author struct {
+							Login githubv4.String
+						}
+						Body githubv4.String
 					}
-					Body githubv4.String
-				}
-			} `graphql:"comments(last: 20)"`
+				} `graphql:"comments(last: 20)"`
+			} `graphql:"... on PullRequestReviewThread"`
 		} `graphql:"node(id: $id)"`
 	}
 	err := c.gql.Query(ctx, &byID, map[string]any{"id": githubv4.ID(threadID)})
 	if err != nil {
 		return nil, classifyGH(graphqlErr(err))
 	}
+	rt := byID.Node.ReviewThread
 	d := &ThreadDetail{
-		ThreadID: fmt.Sprintf("%v", byID.Node.ID),
-		Resolved: bool(byID.Node.IsResolved),
+		ThreadID: fmt.Sprintf("%v", rt.ID),
+		Resolved: bool(rt.IsResolved),
 	}
-	for _, cm := range byID.Node.Comments.Nodes {
+	for _, cm := range rt.Comments.Nodes {
 		body := string(cm.Body)
 		d.Comments = append(d.Comments, ThreadCmt{Author: string(cm.Author.Login), Body: body})
 		if d.Body == "" {
 			d.Body = CleanBody(body)
 		}
+	}
+	if d.ThreadID == "" {
+		return nil, refuse(ReasonUnknownThread,
+			"node %q did not resolve to a review thread (wrong id type, or no access)", threadID)
 	}
 	return d, nil
 }

@@ -188,8 +188,9 @@ thread ids here, so the shim never has to construct one.
 | thread replies + resolves | **GraphQL** mutations | typed errors for the §2.2 guard |
 | `head_sha`, PR open/closed, Actions job conclusions | **REST** (`go-github`) | plain metadata, no GraphQL needed |
 
-Two inherited query-shape constraints, because both fail *silently* rather than
-loudly — an LLM reads a schema error as "no threads yet" and polls forever:
+Three query-shape constraints — two inherited from the proven queries, one found
+by a live test. All three fail *silently* rather than loudly: an LLM reads a
+schema error as "no threads yet" and polls forever.
 
 - **`author` lives on the COMMENT node, not on the review thread.** Selecting
   `reviewThreads.nodes.author` fails schema validation on every poll.
@@ -197,6 +198,11 @@ loudly — an LLM reads a schema error as "no threads yet" and polls forever:
   page 1 is mostly already-resolved history — a truncated read reports "0 open"
   while dozens are open (hit on PR #184, 67 threads). A `cursor:null` in the
   *response* means exhausted.
+- **`thread_detail` needs an inline fragment on `node(id:)`** (live-test
+  finding). `isResolved` lives on `PullRequestReviewThread`, not the `Node`
+  interface, so selecting it off `node(id:)` fails with *"Field 'isResolved'
+  doesn't exist on type 'Node'"*. Putting the fragment on the inner field does
+  not satisfy the query builder either — it must wrap the whole selection.
 
 The two mutations are asymmetric, which is its own silent failure:
 `addPullRequestReviewThreadReply` takes **`pullRequestReviewThreadId`**, while
@@ -343,6 +349,23 @@ Deps, current as of 2026: `github.com/google/go-github/v90` (REST) +
 (App JWT + installation-token refresh). `githubv4` wraps a plain
 `http.Client`, so both API clients share one authenticated transport and
 therefore one token source — two SDKs, one auth path to keep in sync (DRY).
+
+**Live-test corrections.** A read-only live test against a real PR
+(`PI_SUPERVISOR_LIVE_GH=1`) overturned two assumptions:
+
+1. **`checkRun.isRequired(pullRequestId:)` is not usable here.** The query
+   returned *empty* check runs for a fork PR, so required-ness silently
+   degraded to fail-closed — meaning every check blocked and any failing optional
+   check would have burned the whole budget anyway. Required-ness now comes from
+   the **base branch's protection rules** (`GET /branches/{branch}/protection`),
+   which is the only place it exists; neither check-runs REST nor Actions /jobs
+   carries a required flag.
+2. **`no_protection` is a distinct outcome from `required_unknown`.** A branch
+   with no protection requires *nothing*, so nothing blocks. Conflating that with
+   "unknown → assume all required" deadlocks every campaign on an unprotected
+   repo. Note go-github reports the 404 as a plain
+   `errors.New("branch is not protected")`, **not** an `*ErrorResponse` — so
+   detection matches on the message as well as the status.
 
 > **Correction, found at implementation time.** This section originally named
 > `go-github`'s `InstallationTokenSource` as the App-token refresher.
