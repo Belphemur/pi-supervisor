@@ -128,3 +128,34 @@ func TestDispatchReviewWithoutReviewer(t *testing.T) {
 		t.Errorf("error = %q, want the unsupported message", resp.Error)
 	}
 }
+
+// Every review verb must be ROUTED, not just handled.
+//
+// The first cut of the post-completion re-check feature added
+// review_recheck_all to the supervisor's own switch but not to the control
+// layer's verb list, so the daemon answered `unknown cmd review_recheck_all`
+// and the post-push hook silently did nothing on every push.
+//
+// Every test that missed this called the supervisor method DIRECTLY, so the
+// routing layer was never exercised. This one goes through dispatch — the same
+// path a socket request takes — and asserts the verb reaches the reviewer.
+func TestDispatchRoutesEveryReviewVerb(t *testing.T) {
+	for _, cmd := range []string{"review", "review_action", "ack", "review_recheck", "review_recheck_all"} {
+		t.Run(cmd, func(t *testing.T) {
+			fr := &fakeReviewer{}
+			h := &fakeHandlerWithReview{fakeReviewer: fr}
+			resp := dispatch(h, []byte(`{"cmd":"`+cmd+`","job":"j","pushed":true,"repo":"o/r"}`))
+			if !resp.OK {
+				t.Fatalf("cmd %q was not routed: %s", cmd, resp.Error)
+			}
+			if fr.got.Cmd != cmd {
+				t.Fatalf("reviewer saw cmd %q, want %q", fr.got.Cmd, cmd)
+			}
+			if cmd == "review_recheck_all" {
+				if !fr.got.Pushed || fr.got.Repo != "o/r" {
+					t.Fatalf("repo scope lost: pushed=%v repo=%q", fr.got.Pushed, fr.got.Repo)
+				}
+			}
+		})
+	}
+}
