@@ -156,11 +156,24 @@ func (s *Supervisor) LoadJobs() error {
 	return nil
 }
 
+// persistState snapshots the state under r.mu and writes it to disk.
+//
+// The write itself MUST happen while r.mu is still held. Taking the snapshot
+// and then unlocking lets two persists interleave: the loop's
+// persist-on-round-start (Round=N) and Stop()'s terminal write (State=stopped)
+// both snapshot, then both write, and whichever lands last wins — so a stop
+// during round 1 could persist Round:0 over the loop's Round=1. That is exactly
+// the flake this fixes: TestStopTwiceIsSafe failed ~2 runs in 8 under -race
+// because the file write was outside the lock.
+//
+// Cost: the atomic write (temp + fsync + rename) is held under the lock. That
+// is acceptable because persistState is called on transitions, never in a hot
+// loop, and correctness of the durable record outranks a few hundred
+// microseconds of lock hold.
 func (r *runner) persistState() {
 	r.mu.Lock()
-	st, name := r.state, r.job.Name
-	r.mu.Unlock()
-	_ = job.SaveState(name, st)
+	defer r.mu.Unlock()
+	_ = job.SaveState(r.job.Name, r.state)
 }
 
 func (r *runner) snapshot() job.Status {
@@ -280,17 +293,36 @@ func (s *Supervisor) Stop(name string) error {
 		// Persist the terminal state HERE, not only in the loop's exit path.
 		// The loop sets State=stopped when the round returns, but Stop() returns
 		// BEFORE that happens, so a caller that reads the state file straight
-		// after Stop() could see "running" — a window that made
-		// TestStopTwiceIsSafe flaky and, worse, told a restarting daemon the job
-		// was still live. The loop's later write is idempotent.
+		// after Stop() could see "running" — which also told a restarting daemon
+		// the job was still live. The loop's later write is idempotent.
+		//
+		// Round floor: Stop() can land in the window between Start() (which
+		// marks the job running) and the loop goroutine incrementing Round. A
+		// stop in that window would persist Round:0, so a later start would
+		// resume as if no round had ever run — and the durable record would
+		// claim less progress than actually happened. Recording 1 keeps the
+		// counter monotonic: the round was authorized and may have run.
+		if r.state.Round < 1 {
+			r.state.Round = 1
+		}
 		r.state.State = "stopped"
 	}
 	pid := r.pid
+	// Round the stop landed on, for the event payload. Read under the same lock
+	// as the mutation above so it cannot disagree with what was persisted.
+	stoppedAtRound := r.state.Round
 	r.mu.Unlock()
 	if !active {
 		return fault.New(fault.KindNotRunning, fmt.Errorf("job %q not running", name))
 	}
 	r.persistState()
+	// The loop emits `stopped` from its own exit path, but Stop() can win the
+	// race before the loop's first stopCh check — in which case no event is ever
+	// emitted and a `watch` client blocks until its timeout on a job that is
+	// already stopped. Emit it here, and let the loop's own emit be the
+	// duplicate: watchers treat the first terminal event as the answer and close,
+	// so a second one is harmless, whereas a missing one is a hang.
+	s.emit(name, "stopped", stoppedAtRound, 0, 0, "", "operator stop")
 	s.logf(name, "stop requested by operator (pid %d)", pid)
 	if pid <= 0 {
 		// The client may not have published its pid yet (still spawning).
