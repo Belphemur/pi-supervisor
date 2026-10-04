@@ -763,6 +763,19 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if round == 1 {
 			s.emit(j.Name, "job_started", round, 0, 0, "", "round 1 launched")
 		}
+		// A new round means new commits on this branch, which is the free,
+		// event-driven trigger for a post-completion thread re-check
+		// (ADR-0012 follow-up). Bots re-review the whole diff after every
+		// push, so new findings can appear on a job whose campaign already
+		// closed. Doing it HERE rather than on a timer keeps the cost
+		// proportional to pushes, not to wall-clock, and honors the
+		// push-only delivery rule (AGENTS.md invariant 6).
+		//
+		// Only past round 1: round 1 of a fresh job has no baseline yet, and
+		// recheckThreads is already a no-op without one.
+		if round > 1 {
+			go s.recheckThreads(j.Name)
+		}
 
 		// CI-stall watcher (ADR-0004): rounds with a captured transcript get
 		// a detector that interrupts the session and fails the run once the

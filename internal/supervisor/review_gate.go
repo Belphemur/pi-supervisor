@@ -86,6 +86,11 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 		s.emit(name, "review_done", round, 0, 0, "",
 			"review campaign complete: 0 open threads and CI passing on %s/%s#%d after %d round(s) — the owner merges, the daemon never does",
 			owner, repo, pr, used)
+		// Record the baseline so a LATER push that attracts new findings is
+		// detectable. `len(open)` is 0 here, but the campaign may have ended on
+		// review_exhausted with threads still open, so record whatever the last
+		// observed count was rather than assuming zero.
+		s.recordThreadBaseline(name, r, owner, repo, pr, len(open))
 		_ = wt
 		return true
 	}

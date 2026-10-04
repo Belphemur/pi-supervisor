@@ -151,6 +151,13 @@ type State struct {
 	// to the gate — otherwise a finished job livelocks to MaxRounds and ends
 	// fatal (exactly what happened to mealime-roomux on PR #43).
 	MarkerSeen bool `json:"marker_seen,omitempty"`
+	// ReviewBaseline is the post-completion thread baseline (ADR-0012
+	// follow-up). It lives on State, NOT on the in-memory reviewCampaign,
+	// because its whole purpose is to outlive the campaign: bots re-review the
+	// whole diff after every push, so a campaign that closed clean can gain new
+	// findings minutes later, with no live round to answer them in. The
+	// campaign object is gone by then; this is not.
+	ReviewBaseline *ReviewBaseline `json:"review_baseline,omitempty"`
 	// PRURL is the first GitHub pull-request URL scraped from this round's
 	// transcript (ADR-0006). Best-effort: "" when the agent never linked a
 	// PR, even if it opened one.
@@ -170,6 +177,25 @@ type ReviewStatus struct {
 	Type     string `json:"type,omitempty"`
 	// PendingAcks is how many bulk_resolve requests await an ack.
 	PendingAcks int `json:"pending_acks"`
+}
+
+// ReviewBaseline records what the PR looked like when a review campaign ended,
+// so a later event-driven check can say "threads appeared after you finished"
+// instead of silently losing them. See ADR-0012 follow-up.
+type ReviewBaseline struct {
+	Owner string `json:"owner"`
+	Repo  string `json:"repo"`
+	PR    int    `json:"pr"`
+	// OpenAtClose is the open-thread count observed when the campaign ended.
+	OpenAtClose int `json:"open_at_close"`
+	// Head is the git SHA that campaign reviewed.
+	Head string `json:"head"`
+	// ClosedAt is when the baseline was recorded.
+	ClosedAt string `json:"closed_at"`
+	// OpenNow / NewSinceClose come from the most recent re-check.
+	OpenNow       int    `json:"open_now,omitempty"`
+	NewSinceClose int    `json:"new_since_close,omitempty"`
+	CheckedAt     string `json:"checked_at,omitempty"`
 }
 
 // Status is the live snapshot served over the socket / written to disk.
