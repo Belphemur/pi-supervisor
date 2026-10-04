@@ -2,17 +2,30 @@
 
 ## Status
 
-Accepted; all design questions resolved (§8). Ready for implementation.
-Blocking external prerequisite: the GitHub App install (task `t_57751a5a`) —
-the `gh` fallback needs no setup, so this blocks the *preferred* path only.
+**Implemented and verified against a live GitHub PR.** All design questions
+resolved (§8); the daemon, the shim, and the injected skill are on `master`.
 
-**Amended** after a review pass over this ADR, the `answer-code-review` skill
-and its `reply_review.py` helper, the daemon's marker gate, and the constraint
-that every command on this surface is consumed by an LLM rather than a human.
-The amendment restructured the document (each fact now has exactly one home)
-and corrected four things: thread identifiers, which API serves which read, the
-state transition the auto-trigger actually needs, and the human ACK that could
-never be granted. No scope was added.
+Blocking external prerequisite for the *preferred* auth path only: the GitHub
+App install (task `t_57751a5a`). The `gh auth token` fallback needs no setup and
+is what the live tests exercise.
+
+**Amended twice after the initial design — both times by evidence, not opinion:**
+
+1. A review pass over this ADR, the `answer-code-review` skill and its
+   `reply_review.py` helper, the daemon's marker gate, and the constraint that
+   every command here is consumed by an LLM rather than a human. That
+   restructured the document (each fact now has exactly one home) and corrected
+   four design errors: thread identifiers, which API serves which read, the state
+   transition the auto-trigger actually needs, and the human ACK that could never
+   be granted.
+2. Implementation plus a live test against a real PR, which found **four further
+   defects in the design as written** — including two that would have made the
+   feature unusable in production (the GraphQL input type names, and a
+   required-ness source that silently returns nothing). All eight findings, with
+   evidence and severity, are in **§9, Implementation findings log**.
+
+No scope was added in either pass. Every correction was a correctness fix to the
+accepted design.
 
 ## Context
 
@@ -246,6 +259,10 @@ Two properties matter here:
 `neutral`/`skipped` count as passing (inherited from the `pre-merge` gate: they
 are deliberate opt-outs, not failures).
 
+> **Two of these rules are load-bearing and were found the hard way — see §9.2
+> and §9.3.** Required-ness comes from branch protection, not `isRequired`, and
+> an unprotected branch is a distinct outcome from an unknown one.
+
 ### 4. Campaign lifecycle
 
 #### 4.1 `done → reviewing`, and why the trigger is not mid-round
@@ -467,6 +484,99 @@ what the loser would have cost.
 - **Q10 — No `--merge`.** The daemon reports readiness; the owner merges. *KISS
   and safety:* an unattended agent that can merge is an unattended agent that
   can merge the wrong SHA.
+
+## 9. Implementation findings log
+
+Every entry below was found **after** §1–§8 were accepted, by implementing the
+code and then testing it against a real GitHub PR
+(`Belphemur/XPoint#171`, 21 threads). Each is a defect in the design *as
+written*, not an implementation slip — which is the argument for the live test
+existing at all. Ordered by severity.
+
+| # | Finding | Severity | Resolution |
+|---|---|---|---|
+| 1 | `post_replies` / `resolve_thread` / `bulk_resolve` **could never have worked** | **fatal** | input types renamed to GitHub's exact names |
+| 2 | Required-ness source returns nothing | **fatal** | branch-protection API |
+| 3 | Unprotected branch read as "unknown" | **high** | `no_protection` is now distinct |
+| 4 | `thread_detail` query invalid | **high** | inline fragment required |
+| 5 | `watch` truncated live campaigns | **high** (pre-implementation) | `reviewing` is non-terminal |
+| 6 | Campaign budget ignored | **high** (pre-implementation) | campaign owns `MaxRounds` |
+| 7 | No campaign exit condition | **high** (pre-implementation) | `reviewGate` |
+| 8 | Every check blocked, optional included | **high** (pre-implementation) | required-only blocking |
+
+### 9.1 The mutations were unusable — input type names are load-bearing
+
+`shurcooL/graphql` derives the GraphQL **input type name from the Go type
+name**. The structs were named for their role (`addReplyInput`,
+`resolveInput`), so GitHub answered:
+
+```
+addReplyInput isn't a defined input type (on $input)
+```
+
+Every reply the daemon sent would have failed. The structs are now
+`AddPullRequestReviewThreadReplyInput` and `ResolveReviewThreadInput`. No unit
+fixture could catch this: a hand-rolled `http.Client` accepts anything.
+
+**The lesson generalises:** with a generated GraphQL client, the *Go type name*
+is wire contract. Renaming a struct is an API change.
+
+### 9.2 `checkRun.isRequired` returns nothing for a fork PR
+
+The ADR (§3.3, as first written) named `isRequired(pullRequestId:)` as the
+authoritative source of required-ness. Live, it returns **empty check runs** for
+a PR whose base is unprotected. The failure mode was silent and inverted: empty
+→ "unknown" → *treat everything as required* → **every** optional check blocking,
+which is precisely the livelock §8/Q8 exists to prevent.
+
+Required-ness now comes from `GET /repos/{o}/{r}/branches/{base}/protection`,
+which is the only place it exists — neither the check-runs REST endpoint nor
+Actions `/jobs` carries a required flag.
+
+### 9.3 Unprotected is the opposite of unknown
+
+These two must not share a code path:
+
+| State | Meaning | Effect |
+|---|---|---|
+| `no_protection` | the branch requires nothing | **nothing blocks** |
+| `required_unknown` | protection exists, list unreadable | **everything blocks** (fail closed) |
+| known | the list is authoritative | required checks block |
+
+Conflating them deadlocks every campaign on an unprotected repo. A further trap:
+go-github reports the 404 as a plain `errors.New("branch is not protected")`,
+**not** an `*ErrorResponse`, so a status-code check alone never fires.
+
+### 9.4 `node(id:)` needs an inline fragment
+
+`isResolved` lives on `PullRequestReviewThread`, not on the `Node` interface, so
+`node(id: $id) { isResolved }` fails with *"Field 'isResolved' doesn't exist on
+type 'Node'"*. The fragment must wrap the **whole** selection; putting it on the
+inner field is rejected too. Both misplacements were hit live.
+
+### 9.5 What the live tests are, and what they deliberately are not
+
+`internal/review/live_gh_test.go` (reads) and `live_gh_mutate_test.go` (writes)
+are opt-in:
+
+```bash
+# read-only
+PI_SUPERVISOR_LIVE_GH=1 PI_SUPERVISOR_LIVE_REPO=owner/name PI_SUPERVISOR_LIVE_PR=N \
+  go test ./internal/review/ -run Live -v
+
+# writes: posts replies and resolves threads
+PI_SUPERVISOR_LIVE_GH=1 PI_SUPERVISOR_LIVE_MUTATE=1 … -run LiveMutate -v
+```
+
+The write path has a **separate** env gate on purpose: reading a PR is harmless,
+posting to it is not, and nobody should mutate a PR because they left one variable
+set. Every probe reply is tagged `[pi-supervisor live-probe]`, and every thread
+the tests resolve is **re-opened afterwards**, so a run leaves the PR as found.
+
+Verified live on #171: 21 threads all `PRRT_`-prefixed, CodeRabbit bodies cleaned,
+`open → answered → resolved` confirmed by read-back, all three probe threads
+re-opened. The GitHub-mutating verbs are the only paths in this ADR that cannot be
+proven without a live PR — which is exactly why the write test exists.
 
 ## Consequences
 

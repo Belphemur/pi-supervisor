@@ -275,12 +275,20 @@ func (s *Supervisor) Stop(name string) error {
 		// no-op rather than a double-close of the stop channel.
 		r.active = false
 		close(r.stopCh)
+		// Persist the terminal state HERE, not only in the loop's exit path.
+		// The loop sets State=stopped when the round returns, but Stop() returns
+		// BEFORE that happens, so a caller that reads the state file straight
+		// after Stop() could see "running" — a window that made
+		// TestStopTwiceIsSafe flaky and, worse, told a restarting daemon the job
+		// was still live. The loop's later write is idempotent.
+		r.state.State = "stopped"
 	}
 	pid := r.pid
 	r.mu.Unlock()
 	if !active {
 		return fmt.Errorf("job %q not running", name)
 	}
+	r.persistState()
 	s.logf(name, "stop requested by operator (pid %d)", pid)
 	if pid <= 0 {
 		// The client may not have published its pid yet (still spawning).
@@ -636,6 +644,11 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		r.state.Round = round
 		j := r.job
 		r.mu.Unlock()
+		// Persist the round counter as soon as the round starts. Two reasons:
+		// a daemon crash mid-round must not resume as if the round never
+		// happened, and Stop() reads this value when it writes the terminal
+		// state — without it, a stop during round 1 persists Round:0.
+		r.persistState()
 		if round == 1 {
 			s.emit(j.Name, "job_started", round, 0, 0, "", "round 1 launched")
 		}

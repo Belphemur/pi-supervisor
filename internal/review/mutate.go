@@ -21,14 +21,31 @@ import (
 // generated, because getting it backwards fails at runtime with a schema error
 // an agent will misread.
 
-// addReplyInput is the input for addPullRequestReviewThreadReply.
-type addReplyInput struct {
+// The two review mutations are ASYMMETRIC in their input field name, which is
+// its own silent failure (ADR-0012 §3.2):
+//
+//	addPullRequestReviewThreadReply -> pullRequestReviewThreadId
+//	resolveReviewThread             -> threadId
+//
+// Same PRRT_ value, different field. Written out explicitly rather than
+// generated, because getting it backwards fails at runtime with a schema error
+// an agent will misread.
+//
+// The TYPE NAMES are load-bearing too: shurcooL/graphql derives the GraphQL
+// input type name from the Go type name, so these must be spelled exactly as
+// GitHub spells them. A live test caught "addReplyInput isn't a defined input
+// type (on $input)" — the struct was named for its role, not for GitHub's type,
+// so every reply would have failed in production.
+
+// AddPullRequestReviewThreadReplyInput is the input for
+// addPullRequestReviewThreadReply. Named exactly as GitHub names it.
+type AddPullRequestReviewThreadReplyInput struct {
 	PullRequestReviewThreadID githubv4.ID     `json:"pullRequestReviewThreadId"`
 	Body                      githubv4.String `json:"body"`
 }
 
-// resolveInput is the input for resolveReviewThread.
-type resolveInput struct {
+// ResolveReviewThreadInput is the input for resolveReviewThread.
+type ResolveReviewThreadInput struct {
 	ThreadID githubv4.ID `json:"threadId"`
 }
 
@@ -47,7 +64,7 @@ func (c *Client) PostReply(ctx context.Context, threadID, body string) error {
 			}
 		} `graphql:"addPullRequestReviewThreadReply(input: $input)"`
 	}
-	in := addReplyInput{
+	in := AddPullRequestReviewThreadReplyInput{
 		PullRequestReviewThreadID: githubv4.ID(threadID),
 		Body:                      githubv4.String(body),
 	}
@@ -70,7 +87,37 @@ func (c *Client) ResolveThread(ctx context.Context, threadID string) error {
 			}
 		} `graphql:"resolveReviewThread(input: $input)"`
 	}
-	if err := c.gql.Mutate(ctx, &m, resolveInput{ThreadID: githubv4.ID(threadID)}, nil); err != nil {
+	if err := c.gql.Mutate(ctx, &m, ResolveReviewThreadInput{ThreadID: githubv4.ID(threadID)}, nil); err != nil {
+		return classifyGH(graphqlErr(err))
+	}
+	return nil
+}
+
+// UnresolveReviewThreadInput is the input for unresolveReviewThread. The type
+// name must match GitHub's exactly: shurcooL/graphql derives the input type from
+// the Go type name.
+type UnresolveReviewThreadInput struct {
+	ThreadID githubv4.ID `json:"threadId"`
+}
+
+// UnresolveThread re-opens a resolved review thread.
+//
+// The daemon never needs this to gate a campaign — but the live tests do, to
+// leave a PR exactly as they found it after probing a resolve. Keeping it here
+// rather than in the test means the live test exercises the real client rather
+// than a hand-rolled mutation.
+func (c *Client) UnresolveThread(ctx context.Context, threadID string) error {
+	if !ValidThreadID(threadID) {
+		return refuse(ReasonUnknownThread, "thread_id %q is not a %s… review-thread id", threadID, threadIDPrefix)
+	}
+	var m struct {
+		UnresolveReviewThread struct {
+			Thread struct {
+				IsResolved githubv4.Boolean
+			}
+		} `graphql:"unresolveReviewThread(input: $input)"`
+	}
+	if err := c.gql.Mutate(ctx, &m, UnresolveReviewThreadInput{ThreadID: githubv4.ID(threadID)}, nil); err != nil {
 		return classifyGH(graphqlErr(err))
 	}
 	return nil

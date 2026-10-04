@@ -185,6 +185,23 @@ Unix socket.
     reintroduce the v69-era App helpers; there is no hand-rolled JWT or refresh
     loop in this tree.
 
+## State-durability invariants
+
+These two are load-bearing and were both wrong at once (found via
+`TestStopTwiceIsSafe`, which is now stable over 14/14 runs and 10/10 under
+`-race`):
+
+- **The round counter is persisted when a round STARTS**, not only when it
+  ends. A daemon crash mid-round must not resume as if the round never ran.
+- **`Stop()` writes the terminal state itself**, before returning, rather than
+  leaving it to the round goroutine's exit path. `Stop()` returns before the
+  round unwinds, so a caller reading the state file straight after a stop saw
+  `running` — which also told a restarting daemon the job was still live. The
+  loop's later write is idempotent.
+
+Corollary: any code that changes a job's terminal state must persist it before
+returning, not only on the goroutine that happens to notice.
+
 ## Build / test / install
 
 ```bash
