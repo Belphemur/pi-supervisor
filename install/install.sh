@@ -50,6 +50,27 @@ if ! command -v pi-supervisor >/dev/null 2>&1; then
   echo "          add it, or export PI_SUPERVISOR_BIN=${BIN_DIR}/pi-supervisor"
 fi
 
+# The post-push hook (ADR-0012 follow-up) is the push-as-trigger path: a push
+# makes the daemon compare each job's review baseline against the PR's current
+# open-thread count. Installed into the SUPERVISOR repo's own worktree, because
+# that is the repository whose review findings we care about; other repos get
+# the hook by copying install/hooks/post-push into their .git/hooks.
+echo "==> post-push review re-check hook"
+HOOK_SRC="${REPO_DIR}/install/hooks/post-push"
+if [ -f "$HOOK_SRC" ] && git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  HOOK_DIR="$(git -C "$REPO_DIR" rev-parse --git-common-dir)/hooks"
+  install -d "$HOOK_DIR"
+  if [ -e "${HOOK_DIR}/post-push" ] && ! grep -q 'pi-supervisor: post-push hook' "${HOOK_DIR}/post-push" 2>/dev/null; then
+    echo "    note: an existing post-push hook is present; leaving it alone."
+    echo "          merge install/hooks/post-push into it by hand if you want both."
+  else
+    install -m 0755 "$HOOK_SRC" "${HOOK_DIR}/post-push"
+    echo "    installed ${HOOK_DIR}/post-push"
+  fi
+else
+  echo "    skipped (not a git checkout, or hook source missing)"
+fi
+
 echo "==> enabling service"
 systemctl --user daemon-reload
 # `enable --now` is a NO-OP on an already-active unit: it enables the unit but

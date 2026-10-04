@@ -325,7 +325,7 @@ func dispatch(h Handler, raw []byte) Response {
 			return refuse(err)
 		}
 		return Response{OK: true}
-	case "review", "review_action", "ack":
+	case "review", "review_action", "ack", "review_recheck":
 		return dispatchReview(h, raw)
 	default:
 		return Response{OK: false, Error: "unknown cmd " + req.Cmd, Reason: string(fault.KindUnknownCmd)}

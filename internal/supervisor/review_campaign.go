@@ -25,10 +25,29 @@ type reviewCampaign struct {
 	// does NOT authorize a resolve in round N: the ADR requires the answer and
 	// the close to belong to the same round.
 	answered map[int]map[string]bool
-	// pendingAcks holds bulk-resolve requests awaiting a peer ACK, with their
+	// pendingAcks holds bulk_resolve requests awaiting a peer ACK, with their
 	// expiry. An unacked request never applies; it just expires (fail closed).
 	pendingAcks map[string]*pendingAck
 	ackSeq      int
+	// lastOpen is the open-thread count from the most recent gate evaluation.
+	// It exists so an EXHAUSTED campaign can record a truthful baseline: that
+	// path ends with threads still open, so the baseline must be that count and
+	// not 0, or the next re-check flags every one of them as brand new.
+	lastOpen int
+}
+
+// setLastOpen records the open-thread count observed by a gate evaluation.
+func (c *reviewCampaign) setLastOpen(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastOpen = n
+}
+
+// lastOpenCount returns the most recently observed open-thread count.
+func (c *reviewCampaign) lastOpenCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastOpen
 }
 
 type pendingAck struct {

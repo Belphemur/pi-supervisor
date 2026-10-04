@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -130,6 +132,285 @@ func (s *Supervisor) recheckThreads(name string) {
 			"Re-arm: pi-supervisor review %s --pr %d",
 		delta, bl.Owner, bl.Repo, bl.PR, bl.OpenAtClose, openNow, moved, name, bl.PR)
 }
+
+// campaignSnapshot returns the live campaign's identity, or nil when none is
+// armed. It exists so the exhausted path can record a baseline BEFORE the
+// campaign is torn down, while owner/repo/pr are still reachable.
+func (r *runner) campaignSnapshot() *reviewCampaign {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.review
+}
+
+// jobResult is one job's verdict in a repo-wide re-check. Package scope so the
+// regression tests can assert on the slice the daemon actually returns.
+type jobResult struct {
+	Job          string `json:"job"`
+	Checked      bool   `json:"checked"`
+	OpenAtClose  int    `json:"open_at_close"`
+	OpenNow      int    `json:"open_now"`
+	NewThreads   int    `json:"new_threads"`
+	Action       string `json:"action"`
+	Owner        string `json:"owner"`
+	Repo         string `json:"repo"`
+	PR           int    `json:"pr"`
+	CampaignBusy bool   `json:"campaign_active"`
+	Error        string `json:"error,omitempty"`
+}
+
+// recheckAllResult is the repo-wide re-check's reply shape. Named so callers
+// (and tests) can assert on it without going through JSON.
+type recheckAllResult struct {
+	Jobs     []jobResult `json:"jobs"`
+	Alerted  int         `json:"alerted"`
+	Skipped  int         `json:"skipped"`
+	ScopeStr string      `json:"scope"`
+}
+
+// RecheckThreadsAll is the post-push hook's entry point: re-check every job
+// that has a recorded review baseline, optionally narrowed to the jobs whose
+// baseline PR lives in `repoSlug` (owner/name).
+//
+// Narrowing matters. A push to one repo must not spend API calls re-checking
+// jobs whose PRs live elsewhere — and on a busy machine that fan-out is the
+// difference between one GraphQL list and dozens. With `pushed` set and no
+// slug, the caller means "this repository", resolved from the worktree's origin.
+//
+// Per-job failures are collected, not fatal: one job with a dead token must not
+// hide the verdict for the others.
+func (s *Supervisor) RecheckThreadsAll(ctx context.Context, pushed bool, repoSlug string) (any, error) {
+	s.mu.Lock()
+	names := make([]string, 0, len(s.jobs))
+	for n := range s.jobs {
+		names = append(names, n)
+	}
+	s.mu.Unlock()
+	sort.Strings(names)
+
+	out := recheckAllResult{ScopeStr: "all jobs with a review baseline"}
+
+	wantRepo, wantOwner := "", ""
+	if repoSlug != "" {
+		wantOwner, wantRepo, _ = strings.Cut(repoSlug, "/")
+		out.ScopeStr = "jobs whose review PR is in " + repoSlug
+	} else if pushed {
+		wantOwner, wantRepo = s.originRepo()
+		out.ScopeStr = "jobs whose review PR is in this repository"
+		if wantRepo == "" {
+			out.ScopeStr += " (origin unresolvable; checked every job instead)"
+		}
+	}
+
+	for _, n := range names {
+		r := s.jobs[n]
+		if r == nil {
+			continue
+		}
+		r.mu.Lock()
+		hasBaseline := r.state.ReviewBaseline != nil
+		var blOwner, blRepo string
+		var blPR int
+		if hasBaseline {
+			blOwner, blRepo, blPR = r.state.ReviewBaseline.Owner, r.state.ReviewBaseline.Repo, r.state.ReviewBaseline.PR
+		}
+		r.mu.Unlock()
+		if !hasBaseline {
+			out.Skipped++
+			continue
+		}
+		// Case-insensitive: GitHub owner/repo casing is not stable across
+		// transcript scrapes, REST payloads and git remotes.
+		if wantRepo != "" &&
+			(!strings.EqualFold(blOwner, wantOwner) || !strings.EqualFold(blRepo, wantRepo)) {
+			out.Skipped++
+			continue
+		}
+
+		res, err := s.RecheckThreads(ctx, n)
+		if err != nil {
+			out.Jobs = append(out.Jobs, jobResult{Job: n, Action: "re-check failed: " + err.Error(), Error: err.Error()})
+			continue
+		}
+		m, _ := res.(map[string]any)
+		jr := jobResult{
+			Job: n, Owner: blOwner, Repo: blRepo, PR: blPR,
+			OpenAtClose: intOf(m["open_at_close"]), OpenNow: intOf(m["open_now"]),
+			NewThreads: intOf(m["new_threads"]), Checked: true,
+			Action: strOf(m["action"]), CampaignBusy: boolOf(m["campaign_active"]),
+		}
+		if jr.NewThreads > 0 {
+			out.Alerted++
+		}
+		out.Jobs = append(out.Jobs, jr)
+	}
+	return out, nil
+}
+
+// originRepo reads owner/name from a job worktree's origin remote. Used to
+// scope a push-triggered re-check to the repo that was actually pushed.
+func (s *Supervisor) originRepo() (owner, repo string) {
+	s.mu.Lock()
+	r := s.jobs[s.anyJobName()]
+	wt := ""
+	if r != nil {
+		r.mu.Lock()
+		wt = r.job.Worktree
+		r.mu.Unlock()
+	}
+	s.mu.Unlock()
+	if wt == "" {
+		// Fall back to any job's worktree: the repos are usually shared.
+		s.mu.Lock()
+		for _, j := range s.jobs {
+			j.mu.Lock()
+			if j.job.Worktree != "" {
+				wt = j.job.Worktree
+			}
+			j.mu.Unlock()
+			if wt != "" {
+				break
+			}
+		}
+		s.mu.Unlock()
+	}
+	if wt == "" {
+		return "", ""
+	}
+	out, err := exec.Command("git", "-C", wt, "remote", "get-url", "origin").Output()
+	if err != nil {
+		return "", ""
+	}
+	u := strings.TrimSpace(string(out))
+	// Accept both the SSH and HTTPS spellings; anything else is not a repo we
+	// can scope by, and the caller falls back to checking everything.
+	for _, prefix := range []string{"git@github.com:", "https://github.com/", "http://github.com/", "ssh://git@github.com/"} {
+		if after, ok := strings.CutPrefix(u, prefix); ok {
+			rest := strings.TrimSuffix(after, ".git")
+			return owner, rest[strings.Index(rest, "/")+1:]
+		}
+	}
+	return "", ""
+}
+
+// anyJobName returns an arbitrary loaded job name, or "".
+func (s *Supervisor) anyJobName() string {
+	for n := range s.jobs {
+		return n
+	}
+	return ""
+}
+
+func intOf(v any) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case int64:
+		return int(t)
+	case float64:
+		return int(t)
+	default:
+		return 0
+	}
+}
+
+func strOf(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func boolOf(v any) bool {
+	b, _ := v.(bool)
+	return b
+}
+
+// RecheckThreads is the operator-facing `review --recheck`: it compares the
+// PR's current open-thread count against the recorded baseline and RETURNS the
+// verdict, so a caller gets an answer synchronously instead of having to infer
+// one from a later event.
+//
+// It is deliberately NOT gated on a live round. Every other review verb is
+// (ADR-0012 §4), because those verbs post to GitHub on the job's behalf. This
+// one only READS thread state, so allowing it outside a round is safe and is the
+// whole point: the findings it reports are precisely the ones that arrived when
+// no round existed to answer them.
+func (s *Supervisor) RecheckThreads(ctx context.Context, name string) (any, error) {
+	s.mu.Lock()
+	r, ok := s.jobs[name]
+	s.mu.Unlock()
+	if !ok {
+		return nil, review.ErrUnknownJob(name)
+	}
+	r.mu.Lock()
+	if r.state.ReviewBaseline == nil {
+		r.mu.Unlock()
+		// Not an error: the job never ran a campaign, so there is no baseline
+		// and nothing to compare. Say so plainly instead of refusing.
+		return map[string]any{
+			"job": name, "checked": false,
+			"message": "no review baseline recorded — this job never ran a review campaign, so there is nothing to re-check",
+		}, nil
+	}
+	bl := *r.state.ReviewBaseline
+	active := r.active
+	r.mu.Unlock()
+
+	if bl.Owner == "" || bl.Repo == "" || bl.PR == 0 {
+		return nil, review.ErrUsage("the recorded review baseline for %s names no PR; re-arm the campaign", name)
+	}
+
+	cli, err := s.reviewClient(ctx, bl.Owner, bl.Repo)
+	if err != nil {
+		return nil, err
+	}
+	all, err := cli.ListThreads(ctx, bl.Owner, bl.Repo, bl.PR)
+	if err != nil {
+		return nil, err
+	}
+	openNow := len(review.OpenThreads(all))
+	delta := openNow - bl.OpenAtClose
+
+	r.mu.Lock()
+	if r.state.ReviewBaseline != nil {
+		r.state.ReviewBaseline.OpenNow = openNow
+		r.state.ReviewBaseline.CheckedAt = time.Now().UTC().Format(time.RFC3339)
+		r.state.ReviewBaseline.NewSinceClose = max(delta, 0)
+	}
+	r.mu.Unlock()
+	r.persistState()
+
+	out := map[string]any{
+		"job": name, "checked": true,
+		"owner": bl.Owner, "repo": bl.Repo, "pr": bl.PR,
+		"open_at_close":   bl.OpenAtClose,
+		"open_now":        openNow,
+		"new_threads":     max(delta, 0),
+		"campaign_active": active,
+	}
+	if head := s.headSHA(r); head != bl.Head {
+		out["head_at_close"] = bl.Head
+		out["head_now"] = head
+	}
+	if delta > 0 {
+		// The campaign already ended (or is inactive); a live campaign owns its
+		// own threads, so only warn when the job is not mid-campaign.
+		if !active {
+			s.logf(name, "review_threads_appeared: %d new thread(s) after the campaign closed", delta)
+			s.emit(name, "review_threads_appeared", 0, 0, 0, "",
+				"%d new review thread(s) appeared on %s/%s#%d AFTER the review campaign closed (%d -> %d open) — "+
+					"the campaign is one-shot by design and every review verb needs a live round, so these have no answering round. "+
+					"Re-arm: pi-supervisor review %s --pr %d",
+				delta, bl.Owner, bl.Repo, bl.PR, bl.OpenAtClose, openNow, name, bl.PR)
+		}
+		out["action"] = "re-arm with: pi-supervisor review " + name + " --pr " + itoa(bl.PR)
+	} else {
+		out["action"] = "nothing new since the campaign closed"
+	}
+	return out, nil
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
 
 // headSHA is the worktree's current HEAD, or "" when unavailable. Used only as
 // a change signal, so an error degrades to "" instead of failing a re-check.

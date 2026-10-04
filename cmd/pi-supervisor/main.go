@@ -490,6 +490,7 @@ func newRootCmd() *cobra.Command {
 		newReloadCmd(),
 		newWatchCmd(),
 		newReviewCmd(),
+		newReviewRecheckCmd(),
 		newAckCmd(),
 		newReviewActionCmd(),
 		newVersionCmd(),

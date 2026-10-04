@@ -200,6 +200,12 @@ func (r *runner) snapshot() job.Status {
 	if r.job.FinalReport != "" {
 		st.FinalReportOK = job.Exists(r.job.FinalReport)
 	}
+	// Same for the post-completion thread baseline: persisted on State, and
+	// copied here so `status` can actually show it.
+	if r.state.ReviewBaseline != nil {
+		bl := *r.state.ReviewBaseline
+		st.ReviewBaseline = &bl
+	}
 	// Review snapshot is built INLINE: reviewStatus takes r.mu, which this
 	// method already holds — calling it here would self-deadlock.
 	if c := r.review; c != nil {
@@ -677,6 +683,15 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				s.emit(name, "review_exhausted", round, 0, 0, "",
 					"review round cap %d reached with threads still open — re-arm with `pi-supervisor review %s --pr N`",
 					maxRounds, name)
+				// Record the baseline on THIS path too. An exhausted campaign
+				// ends with threads STILL OPEN, and that count is the baseline:
+				// without it the next re-check has nothing to compare against,
+				// and every still-open thread reads as brand new. Recorded
+				// BEFORE finish() clears the campaign, so owner/repo/pr are
+				// still reachable.
+				if c := r.campaignSnapshot(); c != nil {
+					s.recordThreadBaseline(name, r, c.owner, c.repo, c.pr, c.lastOpenCount())
+				}
 				return
 			}
 			// Same honesty requirement for the build job. `done` requires BOTH
@@ -763,20 +778,6 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if round == 1 {
 			s.emit(j.Name, "job_started", round, 0, 0, "", "round 1 launched")
 		}
-		// A new round means new commits on this branch, which is the free,
-		// event-driven trigger for a post-completion thread re-check
-		// (ADR-0012 follow-up). Bots re-review the whole diff after every
-		// push, so new findings can appear on a job whose campaign already
-		// closed. Doing it HERE rather than on a timer keeps the cost
-		// proportional to pushes, not to wall-clock, and honors the
-		// push-only delivery rule (AGENTS.md invariant 6).
-		//
-		// Only past round 1: round 1 of a fresh job has no baseline yet, and
-		// recheckThreads is already a no-op without one.
-		if round > 1 {
-			go s.recheckThreads(j.Name)
-		}
-
 		// CI-stall watcher (ADR-0004): rounds with a captured transcript get
 		// a detector that interrupts the session and fails the run once the
 		// agent has parked on the CI/review loop ci_stall_cap times.
@@ -870,6 +871,18 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if instant {
 			s.emit(name, "instant_exit", round, rc, dur, "", "instant exit strike %d/3 (rc=%d, %ds)", strikes, rc, dur)
 		}
+		// Post-completion thread re-check (ADR-0012 follow-up). Fired HERE,
+		// after the round is classified rather than at round start: a round
+		// START has r.active==true, and recheckThreads deliberately no-ops on
+		// an active job (its own in-flight replies would look like new
+		// findings). Triggering at the start therefore meant the automatic
+		// path could NEVER fire — the guard canceled it every time.
+		//
+		// A finished round is the honest push edge: the agent committed work,
+		// and any campaign that just closed is exactly the window where new
+		// bot findings appear. Still proportional to pushes, not wall-clock,
+		// so the push-only rule (invariant 6) holds.
+		go s.recheckThreads(name)
 		s.logf(name, "round %d: client exit=%d duration=%ds runlog=%dB", round, rc, dur, runlogB)
 		if r.stateSnapshot().LastDiag != "" {
 			s.logf(name, "round %d diagnostic: %s", round, r.stateSnapshot().LastDiag)
@@ -1717,19 +1730,34 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 			snap := r.snapshot()
 			switch snap.State {
 			case "done", "fatal", "stopped":
-				cancel()
+				r.mu.Lock()
+				// Fields read under the same lock as the baseline check below.
 				ev := events.Event{
 					TS: time.Now().UTC().Format(time.RFC3339), Job: jobName,
 					Event: snap.State, Round: snap.Round, RC: snap.LastRC,
-					DurS: snap.LastDurS,
-					Info: "run already " + snap.State + " — nothing to wait for",
+					DurS:        snap.LastDurS,
+					Info:        "run already " + snap.State + " — nothing to wait for",
+					Worktree:    r.job.Worktree,
+					SessionPath: r.job.SessionPath,
+					PRURL:       r.state.PRURL,
 				}
-				r.mu.Lock()
-				ev.Worktree = r.job.Worktree
-				ev.SessionPath = r.job.SessionPath
-				ev.PRURL = r.state.PRURL
+				hasBaseline := r.state.ReviewBaseline != nil
 				r.mu.Unlock()
-				return nil, func() {}, &ev
+				// A finished job is NOT necessarily silent. If it ran a review
+				// campaign, a later push can still attract findings that nothing
+				// will answer (ADR-0012 follow-up), and this operator is exactly
+				// who wants to hear about it. So answer immediately with the
+				// precheck — as before — but STAY SUBSCRIBED instead of
+				// unsubscribing, so review_threads_appeared can still arrive.
+				//
+				// Without a baseline there is nothing that can ever be emitted
+				// for this job, so the old immediate return stands.
+				if !hasBaseline {
+					cancel()
+					return nil, func() {}, &ev
+				}
+				ev.Info += " — but this job has a review baseline, so staying subscribed for late review findings (Ctrl-C to stop)"
+				return ch, cancel, &ev
 			}
 		}
 	}

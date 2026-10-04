@@ -216,6 +216,11 @@ type Status struct {
 	// Review is the live review campaign's snapshot (ADR-0012), nil when the
 	// job is not in a review phase.
 	Review *ReviewStatus `json:"review,omitempty"`
+	// ReviewBaseline mirrors State.ReviewBaseline so an operator can see the
+	// post-completion thread counts through `pi-supervisor status` (ADR-0012
+	// follow-up). Without this copy the persisted baseline is invisible on the
+	// only interface an operator has.
+	ReviewBaseline *ReviewBaseline `json:"review_baseline,omitempty"`
 	// MarkerSeen latches true once the completion marker has been observed in
 	// the session transcript (ADR-0011). It is deliberately sticky: the run
 	// log is truncated at the start of every round, so a marker seen in ANY

@@ -72,6 +72,9 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 			ciNote += fmt.Sprintf(" (non-blocking, ignored: %s)", nb)
 		}
 	}
+	// Record the observed open count on the campaign so an exhausted close can
+	// record a truthful baseline (see reviewCampaign.lastOpen).
+	camp.setLastOpen(len(open))
 	s.emit(name, "review_round_done", round, 0, 0, "",
 		"review round %d/%d (%s): %d open thread(s), ci=%s%s on %s/%s#%d",
 		used, camp.maxRound, kind, len(open), ciVerdict, ciNote, owner, repo, pr)
