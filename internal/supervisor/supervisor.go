@@ -693,9 +693,25 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			// Name the ACTUAL missing artifact so the next run is one copy-paste
 			// instead of a diagnosis.
 			r.mu.Lock()
-			markerSeen := r.state.MarkerSeen
+			latched := r.state.MarkerSeen
 			report := r.job.FinalReport
+			sess := r.job.SessionPath
+			marker := r.job.Marker
 			r.mu.Unlock()
+			// Use the SAME marker surfaces the completion gate uses, not just
+			// the streaming latch. The gate (below) accepts a marker found by a
+			// cumulative transcript scan or by the current round's run log
+			// WITHOUT writing either result back to r.state.MarkerSeen. Reading
+			// only the latch therefore reports "marker NOT seen" for a marker
+			// the gate accepted via stdout — reintroducing exactly the
+			// wrong-cause diagnosis this switch exists to eliminate.
+			markerSeen := latched
+			if !markerSeen && marker != "" && sess != "" {
+				markerSeen = job.TranscriptContains(sess, marker)
+			}
+			if !markerSeen && marker != "" {
+				markerSeen = job.RunlogContains(job.Runlog(name), marker)
+			}
 			switch {
 			case !markerSeen && report != "" && !job.Exists(report):
 				msg := fmt.Sprintf("round cap %d reached: marker NOT seen AND final report missing (%s)", maxRounds, report)
@@ -1105,7 +1121,16 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 					return
 				}
 				r.mu.Lock()
-				fresh := r.job.SessionPath == ""
+				// Gate on `active` as well as the empty path. Restart
+				// (ADR-0010) clears SessionPath and a concurrent Stop
+				// closes the watcher that unblocks Wait, so this
+				// goroutine can wake AFTER that reset and observe the
+				// cleared field. Pinning then would make the next
+				// round compute resume=true and RESUME the session
+				// `restart --fresh` just quarantined — resurrecting the
+				// exact stale-adoption bug the notBefore floor fixed.
+				// Only a still-live round may adopt.
+				fresh := r.active && r.job.SessionPath == ""
 				var adopted job.Job
 				if fresh {
 					r.job.SessionPath = p
