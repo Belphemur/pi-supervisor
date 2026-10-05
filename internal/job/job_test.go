@@ -297,11 +297,23 @@ func TestRunlogContains(t *testing.T) {
 	if RunlogContains(p, "ALL_DONE") {
 		t.Fatal("marker outside the 4KB window must not match")
 	}
-	// An empty marker matches any non-empty file (strings.Contains(x, "") is
-	// true). That is exactly why the supervisor's done gate refuses to run
-	// without a marker; pinned here so the guard stays necessary.
-	if !RunlogContains(p, "") {
-		t.Fatal("empty-marker semantics changed: the empty-marker gate guard needs revisiting")
+	// An empty marker matches NOTHING. This is a deliberate change from the old
+	// strings.Contains semantics, where Contains(x, "") was true for any file and
+	// the supervisor's gate needed an empty-marker guard to avoid declaring every
+	// finished job done. RunlogContains now applies the same EMITS rule as the
+	// transcript surfaces, and that rule refuses an empty marker itself — the
+	// primitive is safe standalone, exactly like TranscriptContains.
+	if RunlogContains(p, "") {
+		t.Fatal("an empty marker must never match, same rule as TranscriptContains")
+	}
+	// A marker QUOTED or declined on stdout must not count — the run log is a
+	// completion surface, so it needs the same negation rule as the transcript
+	// (qodo PR #5: bare strings.Contains completed a job through this third door).
+	if err := os.WriteFile(p, []byte("ALL_DONE deliberately NOT emitted: T6-T9 are incomplete.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if RunlogContains(p, "ALL_DONE") {
+		t.Fatal("a declined marker in the run log satisfied the completion surface")
 	}
 }
 

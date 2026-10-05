@@ -99,10 +99,17 @@ bash -n .githooks/pre-push || fail=1
 step "test -race"
 # Skippable for a fast push when the tree is unchanged; -race is the default
 # because two ADR-0012 bugs were only visible under it.
+#
+# ADR0011_LIVE=0 keeps the opt-in live-pi test out of the gate. CI never runs it
+# (no pi binary on the runner, so the test self-skips); a dev box HAS pi on PATH,
+# so without this the hook ran a real model session on every push — a ~2 minute
+# doomed run whenever a pi session was already live, failing the gate on harness
+# contention that has nothing to do with the commit. Live tests are opt-in
+# (ADR-0011), and a push gate is not the place to opt in.
 if [ "${PI_SUPERVISOR_SKIP_TESTS:-0}" = "1" ]; then
     echo "skipped (PI_SUPERVISOR_SKIP_TESTS=1)"
 else
-    go test ./... -race || fail=1
+    ADR0011_LIVE=0 go test ./... -race || fail=1
 fi
 
 if command -v golangci-lint >/dev/null 2>&1; then

@@ -71,6 +71,11 @@ var incompleteReportRes = []*regexp.Regexp{
 	// "deliberately NOT emitted", "do not emit the marker", "marker NOT emitted"
 	regexp.MustCompile(`(?im)\b(?:do\s+not|don't|never)\s+emit\s+(?:the\s+)?marker\b`),
 	regexp.MustCompile(`(?im)\bmarker\b[^\n]{0,40}\b(?:not|isn't|wasn't)\s+emitted\b`),
-	// "a follow-up run needs" / "needs a follow-up run"
-	regexp.MustCompile(`(?im)\b(?:a\s+)?follow[ -]?up\s+run\s+(?:needs?|is\s+needed|will\s+be\s+needed)\b`),
+	// "The next run needs", "a follow-up is needed" — BUT only in a status
+	// position, like every other pattern here. A handoff SECTION can be titled
+	// "Repo facts a follow-up run needs" inside a COMPLETE report (qodo PR #5:
+	// that phrase is documentation, not a declaration), and firing on it
+	// diverts genuinely finished work into an endless loop.
+	regexp.MustCompile(`(?im)^[\s>*#-]{0,12}(?:a\s+)?follow[ -]?up(?:\s+run)?\s+(?:is\s+)?needed\b`),
+	regexp.MustCompile(`(?im)^[\s>*#-]{0,12}(?:the\s+)?next\s+run\s+(?:needs?|should)\b`),
 }

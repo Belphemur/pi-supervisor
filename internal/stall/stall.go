@@ -209,22 +209,30 @@ func (s *PRURLScanner) PRURL() string {
 		return s.last
 	}
 	size := fi.Size()
+	ino, inoOK := inodeOf(fi)
 	if size < s.offset {
 		// Truncated or rotated: the old bytes are gone and the offset is
 		// meaningless, so start over rather than read from a bogus position.
-		s.offset, s.last, s.lastSize = 0, "", 0
-	}
-	if ino, ok := inodeOf(fi); ok {
-		s.lastIno = ino
+		s.offset, s.last, s.lastSize, s.lastIno = 0, "", 0, ino
 	}
 	// Detect a REPLACEMENT, not just a shrink. A rewrite or rotation can produce a
-	// different file of EXACTLY the same length, which a size comparison alone
-	// cannot see — so the "nothing appended" short-circuit would keep serving the
-	// previous file's link. The inode catches it: a new file has a new inode,
-	// while an append keeps the same one. Both platforms surface it through
-	// os.FileInfo.Sys, and any error falls back to trusting size.
-	if ino, ok := inodeOf(fi); ok && s.lastIno != 0 && ino != s.lastIno {
-		s.offset, s.last, s.lastSize, s.lastIno = 0, "", 0, ino
+	// different file of EXACTLY the same length, which no size comparison can see:
+	// the first attempt asserted fi.Sys() against an Ino() METHOD interface, but on
+	// every Unix Ino is a FIELD of *syscall.Stat_t, so the assertion matched
+	// nothing and the check was dead code (found by live probe: iface=false,
+	// stat_t=true) — and a size-heuristic variant was wrong in the other direction,
+	// because a caught-up scanner sits at offset==size and never satisfies
+	// "offset behind". The inode is the signal that works, compared BEFORE it is
+	// recorded; lastIno==0 means "first observation, nothing to compare yet".
+	//
+	// Where the platform hides the inode, the scanner degrades to trusting size —
+	// the pre-inode behavior, never a failure.
+	if inoOK && s.lastIno != 0 && ino != s.lastIno {
+		s.rewind()
+		s.lastIno = ino
+	}
+	if inoOK {
+		s.lastIno = ino
 	}
 	if size == s.lastSize && s.offset >= size {
 		return s.last // nothing appended since the last call
@@ -248,8 +256,21 @@ func (s *PRURLScanner) PRURL() string {
 
 	buf := make([]byte, readTo-from)
 	n, _ := readFileAt(s.path, buf, from)
-	// Advance by what was actually consumed, NOT by the window size: recording the
-	// window as the offset is exactly what permanently skipped the middle.
+	// Commit the offset to the raw end of what was read — NOT to the last
+	// complete line. Line bookkeeping here was tried and both variants fail:
+	// committing from+n lands mid-line, so the partial-line trim had to exist,
+	// and that trim ate the unscanned tail of a line longer than the overlap
+	// whenever a chunk boundary straddled it (kody PR #5 — a link past the
+	// 256KiB boundary in a long JSON line was gone permanently); committing
+	// only to the last newline instead makes the offset STOP advancing for a
+	// single line longer than the chunk, so bytes beyond it are never scanned.
+	//
+	// The overlap makes both unnecessary: every read re-scans the 4KiB before
+	// the raw end, and a PR URL is under 255 bytes, so a URL straddling the
+	// chunk boundary is fully inside the NEXT call's window. A split match
+	// (prefix in this call, digits in the next) cannot false-positive either,
+	// because prRe requires the full "https://…/pull/" prefix. Scanning is
+	// pure bytes; the offset is pure bytes.
 	if n > 0 {
 		s.offset = from + int64(n)
 	}
@@ -266,22 +287,9 @@ func (s *PRURLScanner) PRURL() string {
 		return s.last
 	}
 	buf = buf[:n]
-	// Drop a leading PARTIAL line, but only a genuinely partial one: one where the
-	// byte immediately before `from` was not a newline. Deciding it by asking the
-	// file, rather than by `from > 0`, is what makes this correct — the offset
-	// always sits on a line boundary, so the first line in the buffer is normally
-	// COMPLETE and must be scanned.
-	//
-	// Trimming on `from > 0` instead threw away the first line of every read after
-	// the first, and when a read's first line was also its last, that discarded the
-	// whole buffer — losing a link sitting exactly where we were reading.
-	if from > 0 && len(buf) > 0 && !offsetAtLineStart(s.path, from) {
-		i := bytes.IndexByte(buf, '\n')
-		if i < 0 {
-			return s.last // no complete line yet; wait for more bytes
-		}
-		buf = buf[i+1:]
-	}
+	// No partial-line trimming on this buffer, on purpose — see the comment above
+	// the offset commit: the overlap already re-reads every byte a split match
+	// could straddle, and trimming has twice cost real links.
 	if all := prRe.FindAll(buf, -1); len(all) > 0 {
 		s.last = string(all[len(all)-1])
 	}
@@ -295,38 +303,6 @@ const prURLChunkBytes = 256 << 10
 
 // readFileAt reads into buf at off, tolerating a short read: a PR link near the
 // tail is exactly what we came for, so partial data is better than none.
-// inodeOf returns the file's inode where the platform exposes it. It is used to
-// tell an APPEND (same inode) from a REPLACEMENT (new inode) of identical size.
-// Returns ok=false when unavailable, and the caller then trusts size alone —
-// degrading to the previous behavior rather than failing.
-func inodeOf(fi os.FileInfo) (uint64, bool) {
-	type inodeSys interface{ Ino() uint64 }
-	switch sys := fi.Sys().(type) {
-	case inodeSys:
-		return sys.Ino(), true
-	default:
-		return 0, false
-	}
-}
-
-// offsetAtLineStart reports whether off begins a line (i.e. off == 0 or the byte
-// before it is a newline).
-func offsetAtLineStart(path string, off int64) bool {
-	if off == 0 {
-		return true
-	}
-	var one [1]byte
-	f, err := os.Open(path)
-	if err != nil {
-		return true // cannot tell; assume complete rather than discard data
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := f.ReadAt(one[:], off-1); err != nil {
-		return true
-	}
-	return one[0] == '\n'
-}
-
 func readFileAt(path string, buf []byte, off int64) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -334,6 +310,14 @@ func readFileAt(path string, buf []byte, off int64) (int, error) {
 	}
 	defer func() { _ = f.Close() }()
 	return f.ReadAt(buf, off)
+}
+
+// rewind resets the scanner's position and cached link, so the next call
+// re-scans from byte 0. Shared by the truncate path and the replacement path,
+// so there is one place that decides what "start over" means. lastIno is left
+// alone: the caller has already established the new file's identity.
+func (s *PRURLScanner) rewind() {
+	s.offset, s.last, s.lastSize = 0, "", 0
 }
 
 // EmptyTurnWindow is the quiet window that turns "alive but producing nothing"

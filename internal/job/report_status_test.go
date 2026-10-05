@@ -88,3 +88,41 @@ func TestReportMissingIsNotFlagged(t *testing.T) {
 		t.Fatal("empty path flagged")
 	}
 }
+
+// qodo PR #5: a COMPLETE report can carry a handoff SECTION titled "Repo facts a
+// follow-up run needs" — documentation, not a declaration. It must not divert a
+// finished job into another round (that is the same false-direction failure the
+// whole gate exists to avoid, mirrored).
+func TestReportCompleteWithFollowUpSectionNotFlagged(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "r.md")
+	body := `# Task — final report
+
+**Status: COMPLETE.** All tasks implemented and green.
+
+## Repo facts a follow-up run needs
+Branch is behind origin/main by 2 commits; the table schema is in doc/adr/.
+
+ALL_TASK_DONE
+`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if phrase, bad := ReportDeclaresIncomplete(p); bad {
+		t.Fatalf("a handoff section in a COMPLETE report was flagged as a partial declaration: %q", phrase)
+	}
+}
+
+// The DECLARATION form — a follow-up needed, stated as a status line — still
+// fires, so narrowing the pattern did not amputate the real signal.
+func TestReportFollowUpDeclarationStillFires(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "r.md")
+	body := "A follow-up run is needed: T6-T9 are unimplemented.\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, bad := ReportDeclaresIncomplete(p); !bad {
+		t.Fatal("a genuine follow-up-needed declaration was not detected")
+	}
+}
