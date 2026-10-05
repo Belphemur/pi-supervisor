@@ -93,17 +93,11 @@ func (s *Supervisor) recheckThreads(name string) {
 	head := s.headSHA(r)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cli, err := s.reviewClient(ctx, bl.Owner, bl.Repo)
-	if err != nil {
-		s.logf(name, "thread re-check skipped: %v", err)
-		return
-	}
-	all, err := cli.ListThreads(ctx, bl.Owner, bl.Repo, bl.PR)
+	openNow, err := listOpenThreads(ctx, bl.Owner, bl.Repo, bl.PR)
 	if err != nil {
 		s.logf(name, "thread re-check failed: %v", err)
 		return
 	}
-	openNow := len(review.OpenThreads(all))
 	delta := openNow - bl.OpenAtClose
 
 	r.mu.Lock()
@@ -368,15 +362,10 @@ func (s *Supervisor) RecheckThreads(ctx context.Context, name string) (any, erro
 		return nil, review.ErrUsage("the recorded review baseline for %s names no PR; re-arm the campaign", name)
 	}
 
-	cli, err := s.reviewClient(ctx, bl.Owner, bl.Repo)
+	openNow, err := listOpenThreads(ctx, bl.Owner, bl.Repo, bl.PR)
 	if err != nil {
 		return nil, err
 	}
-	all, err := cli.ListThreads(ctx, bl.Owner, bl.Repo, bl.PR)
-	if err != nil {
-		return nil, err
-	}
-	openNow := len(review.OpenThreads(all))
 	delta := openNow - bl.OpenAtClose
 
 	r.mu.Lock()
