@@ -46,10 +46,64 @@ def delta(s):
          "assistantMessageEvent": {"type": "text_delta", "delta": s}})
 
 
+def send_state():
+    out({"type": "response", "command": "get_state", "success": True,
+         "data": {"sessionFile": os.path.join(os.getcwd(), "sess-fake.jsonl"),
+                  "sessionId": "fake-sess-1"}})
+
+
+def emit_taskwatch(prompt):
+    """ADR-0014 fixture: exercise the client's TaskUpdate correlation.
+
+    Sends a get_state reply (sessionFile/sessionId), then the tool execution
+    records the prompt names, then agent_end. Variants:
+      TEST_TASKWATCH          -> one eligible TaskUpdate completed (taskId 7)
+      TEST_TASKWATCH_NOISE    -> bash start/end, TaskUpdate status=in_progress
+                                 completed-but-error end (no observation)
+      TEST_TASKWATCH_ORPHAN   -> tool_execution_end with no start
+      TEST_TASKWATCH_DUPEND   -> same toolCallId end twice (one observation)
+    """
+    variant = prompt.strip()
+    send_state()
+
+    def start(call, tool, args):
+        out({"type": "tool_execution_start", "toolCallId": call,
+             "toolName": tool, "args": args})
+
+    def end(call, tool, res, is_error=False):
+        out({"type": "tool_execution_end", "toolCallId": call,
+             "toolName": tool, "result": res, "isError": is_error})
+
+    if variant.endswith("TEST_TASKWATCH_NOISE"):
+        start("c1", "bash", {"command": "ls"})
+        end("c1", "bash", "ok")
+        start("c2", "TaskUpdate", {"taskId": "7", "status": "in_progress"})
+        end("c2", "TaskUpdate", "ok")
+        start("c3", "TaskUpdate", {"taskId": "8", "status": "completed"})
+        end("c3", "TaskUpdate", "Task #8 not found", True)
+    elif variant.endswith("TEST_TASKWATCH_ORPHAN"):
+        # End with no recorded start: must be ignored.
+        end("c9", "TaskUpdate", "ok")
+    elif variant.endswith("TEST_TASKWATCH_DUPEND"):
+        start("c5", "TaskUpdate", {"taskId": "5", "status": "completed"})
+        end("c5", "TaskUpdate", "ok")
+        # Duplicate re-delivery of the same execution end.
+        end("c5", "TaskUpdate", "ok")
+    else:
+        start("c7", "TaskUpdate", {"taskId": "7", "status": "completed"})
+        delta("marked task 7 complete ")
+        end("c7", "TaskUpdate", "ok")
+    delta("done ")
+    out({"type": "agent_end"})
+
+
 def emit(prompt):
     if "TEST_FRAMELOG" in prompt:
         # Deliberately silent and never agent_end: the round stays live so a
         # steer can be delivered into it.
+        return
+    if "TEST_TASKWATCH" in prompt:
+        emit_taskwatch(prompt)
         return
     if "TEST_MKSESSION" in prompt:
         # pi writes its session transcript asynchronously into the
@@ -116,6 +170,10 @@ def main():
         t = frame.get("type")
         if t == "prompt":
             emit(frame.get("message", ""))
+        elif t == "get_state":
+            # ADR-0014: the client requests session identity; answer here so
+            # the fixture exercises the real correlated-reply path.
+            send_state()
         elif t == "abort":
             # The aborted turn ends here; the client may then deliver a held
             # interrupt message, which we handle on the next loop iteration.

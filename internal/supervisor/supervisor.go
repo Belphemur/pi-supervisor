@@ -24,6 +24,7 @@ import (
 	"pi-supervisor/internal/job"
 	"pi-supervisor/internal/journal"
 	"pi-supervisor/internal/stall"
+	"pi-supervisor/internal/taskwatch"
 )
 
 // Handler is the control-socket surface (implemented by Supervisor).
@@ -205,7 +206,6 @@ func (r *runner) persistState() {
 
 func (r *runner) snapshot() job.Status {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	st := job.Status{
 		Name: r.job.Name, State: r.state.State, Round: r.state.Round,
 		MaxRounds: r.job.MaxRounds, SessionPath: r.job.SessionPath,
@@ -218,6 +218,7 @@ func (r *runner) snapshot() job.Status {
 	if r.job.FinalReport != "" {
 		st.FinalReportOK = job.Exists(r.job.FinalReport)
 	}
+	sessCopy, wtCopy := r.job.SessionPath, r.job.Worktree
 	// Same for the post-completion thread baseline: persisted on State, and
 	// copied here so `status` can actually show it.
 	if r.state.ReviewBaseline != nil {
@@ -241,8 +242,14 @@ func (r *runner) snapshot() job.Status {
 			st.SessionAgeS = time.Since(fi.ModTime()).Seconds()
 		}
 	}
-	// Truthful mid-round, not just after classification (ADR-0011).
+	// Truthful mid-round, not just after classification (ADR-0011). Read under
+	// the same lock as every other state field.
 	st.MarkerFound = r.state.State == "done" || r.state.MarkerSeen
+	r.mu.Unlock()
+	// Task counts read ON DEMAND with NO lock held: one open-read of the
+	// plugin's current store (owner amendment). Never a ticker, never a
+	// second watcher, never derived from completion events.
+	st.Tasks = taskProgress(sessCopy, wtCopy)
 	return st
 }
 
@@ -1130,10 +1137,72 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 	}
 }
 
+// stateSnapshot copies the runner's persisted state under its lock.
 func (r *runner) stateSnapshot() job.State {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.state
+}
+
+// taskProgress counts the job's CURRENT plugin-task list through the ONE
+// store adapter (owner amendment). Identity comes from the pinned session
+// file (pi names transcripts <timestamp>_<sessionID>.jsonl) and the worktree
+// (the child's cwd). No session identity → fallback with reason; memory/off
+// or unreadable store → fallback 0/0 PLUS reason+explanation. I/O happens
+// HERE, outside every supervisor lock; callers pass copied paths.
+func taskProgress(sess, worktree string) *job.TaskProgress {
+	sid := ""
+	if sess != "" {
+		sid = sessionIDFromPath(sess)
+	}
+	if sid == "" {
+		return &job.TaskProgress{Reason: string(fault.KindTaskNoIdentity), Detail: taskReasonDetail(fault.KindTaskNoIdentity)}
+	}
+	res := taskwatch.Resolver{SessionID: sid, Cwd: worktree}
+	tgt := res.Resolve()
+	completed, total, why := res.Counts()
+	if why == "" {
+		// Valid counts (an EMPTY list is valid and error-free).
+		path := tgt.Path
+		if tgt.Memory {
+			path = ""
+		}
+		return &job.TaskProgress{Completed: completed, Total: total, StorePath: path, Valid: true}
+	}
+	path := tgt.Path
+	if tgt.Unavailable {
+		path = ""
+	}
+	var kind fault.Kind
+	switch why {
+	case taskwatch.ReasonMemoryStore:
+		kind = fault.KindTaskStoreMemory
+	case taskwatch.ReasonInvalidData:
+		kind = fault.KindTaskStoreInvalid
+	default:
+		kind = fault.KindTaskStoreMissing
+	}
+	return &job.TaskProgress{
+		Completed: completed, Total: total,
+		Reason: string(kind), Detail: taskReasonDetail(kind),
+		StorePath: path,
+	}
+}
+
+// taskReasonDetail is the human half of a structured task-status failure.
+func taskReasonDetail(kind fault.Kind) string {
+	switch kind {
+	case fault.KindTaskNoIdentity:
+		return "no session identity yet (the job has not pinned a pi session), so the plugin task store cannot be resolved"
+	case fault.KindTaskStoreMemory:
+		return "the plugin runs memory-only (PI_TASKS=off or taskScope=memory): there is no readable task store"
+	case fault.KindTaskStoreInvalid:
+		return "the task store exists but is unreadable or malformed"
+	case fault.KindTaskStoreMissing:
+		return "the task store for this session is missing (the plugin has not persisted one yet)"
+	default:
+		return string(kind)
+	}
 }
 
 // startedAt is when this job's first round launched, used to scope
@@ -1293,6 +1362,13 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		return 1, 0, 0
 	}
 
+	// ADR-0014: wire the TaskUpdate completion watch into THIS round. The
+	// watcher is round-scoped: one worker goroutine, buffered channels, and
+	// a bounded flush before the round is classified, so the terminal close
+	// can never precede a queued task event and stop/shutdown stay bounded.
+	tw := newTaskWatcher(s, j.Name, j.SessionPath, round)
+	go tw.run()
+	defer tw.finish() // the flush happens BEFORE this round's rc is used
 	opts := client.Options{
 		PiBin:        j.PiBin,
 		Session:      j.SessionPath,
@@ -1307,6 +1383,8 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		PollInterval: controlPollInterval,
 		Timeout:      time.Duration(j.TimeoutS) * time.Second,
 		GracePeriod:  30 * time.Second,
+		Observations: tw.obsCh,
+		Identity:     tw.identCh,
 		Out:          out,
 		Diag:         out,
 		OnPID: func(pid int) {
@@ -1733,11 +1811,23 @@ func (s *Supervisor) interruptWith(name, text string) error {
 // emit is the single funnel every lifecycle transition already flows through,
 // so the journal line is emitted here rather than at ~40 call sites (DRY):
 // one call means the structured log cannot drift from the event stream.
-// emitJournal maps the event-stream vocabulary onto the log vocabulary.
 func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text, format string, args ...any) {
 	if len(text) > 200 {
 		text = text[len(text)-200:]
 	}
+	s.emitEnvelope(jobName, &events.Event{
+		Event: event, Round: round, RC: rc, DurS: durS, Text: text,
+	}, format, args...)
+}
+
+// emitEnvelope is the funnel's shared body: fill the job context, write ONE
+// journal line, publish ONE event. Both lifecycle emits and task-watch emits
+// (ADR-0014) reach the audit/broker through exactly this path, so the log
+// cannot drift from the stream no matter who calls.
+//
+// The journal line carries identifiers/outcome only — callers must not put
+// task descriptions or payloads into info.
+func (s *Supervisor) emitEnvelope(jobName string, e *events.Event, format string, args ...any) {
 	info := format
 	if len(args) > 0 {
 		info = fmt.Sprintf(format, args...)
@@ -1752,11 +1842,13 @@ func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text
 		r.mu.Unlock()
 	}
 	s.mu.Unlock()
-	s.logEvent(jobName, event, round, rc, durS, info)
-	events.Emit(events.Event{
-		Job: jobName, Event: event, Round: round, RC: rc, DurS: durS,
-		Text: text, Info: info, Worktree: wt, SessionPath: sess, PRURL: pr,
-	})
+	e.Job = jobName
+	e.Info = info
+	e.Worktree = wt
+	e.SessionPath = sess
+	e.PRURL = pr
+	s.logEvent(jobName, e.Event, e.Round, e.RC, e.DurS, info)
+	events.Emit(*e)
 }
 
 // logEvent writes one structured line for a lifecycle transition. Level is
