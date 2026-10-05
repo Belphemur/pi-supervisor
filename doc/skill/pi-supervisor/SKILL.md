@@ -248,6 +248,23 @@ Behavior:
   background+notify) and the status command; after a terminal event it says the
   run is over and that no re-arm is needed. `stopped` additionally prints the
   resume command. Act on the event, then re-arm for the next one.
+- **Task completions are reported with the task's real data (ADR-0014).** When
+  the agent runs `TaskUpdate` with `status=completed`, watch publishes a
+  NON-terminal `task_completed` event carrying the plugin's JSON record
+  (`task.subject`, `task.description`, `task.owner`, `task.id`, timestamps)
+  plus `task_id`/`tool_call_id`/`task_file`. The JSON — not result prose — is
+  the source: a lookup that cannot confirm the task emits one
+  `task_lookup_failed` with a machine `reason` (`task-store-missing`,
+  `task-not-completed`, `task-store-invalid`, …). Both stay non-terminal: the
+  JOB keeps running, ordinary watch exits after printing the event and its
+  re-arm footer, `watch -t` keeps waiting. A completion is plugin-reported
+  state, never independent verification of the work.
+- **`status` shows the task list's current progress.** Every status (single
+  job and all) carries `tasks: {completed, total}` read on demand from the
+  CURRENT store — `tasks 4/7 completed` in the CLI's readable line, with the
+  structured JSON beside it. A failed lookup prints the fallback `0/0` PLUS
+  the reason and a human explanation (`NOT verified — task-store-missing: …`);
+  a valid empty list is a plain `0/0` with no error note.
 - **Exit codes:** 0 = event delivered (or run already over), 1 = connection
   lost (daemon restarted — check `systemctl --user status pi-supervisor`,
   then re-arm), 2 = usage error (unknown job).
