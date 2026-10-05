@@ -41,7 +41,11 @@ func TestPRURLScannerFindsLinkAcrossIncrementalReads(t *testing.T) {
 	}
 	_ = f.Close()
 
-	// And a link appended at the very end wins, since it is the latest.
+	// A link appended at the very end wins, since it is the latest. Note the
+	// CATCH-UP LOOP: one call consumes at most prURLChunkBytes, so scanning a
+	// region larger than that needs several calls. That is the deliberate
+	// trade — bounding a read must not mean bounding what gets scanned, which
+	// is the bug this replaced (jumping to the tail skipped the middle forever).
 	f2, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -49,8 +53,15 @@ func TestPRURLScannerFindsLinkAcrossIncrementalReads(t *testing.T) {
 	newer := "https://github.com/Belphemur/pi-supervisor/pull/9"
 	_, _ = f2.WriteString(`{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"also ` + newer + `"}]}}` + "\n")
 	_ = f2.Close()
-	if got := sc.PRURL(); got != newer {
-		t.Fatalf("scanner = %q, want the LAST link %q", got, newer)
+	var got string
+	for range 64 { // 64 * 256KiB == 16MiB, far more than the 1.5MiB backlog
+		got = sc.PRURL()
+		if got == newer {
+			break
+		}
+	}
+	if got != newer {
+		t.Fatalf("scanner = %q after catching up, want the LAST link %q", got, newer)
 	}
 }
 
@@ -68,12 +79,23 @@ func TestPRURLScannerReadsOnlyNewBytes(t *testing.T) {
 	sc := NewPRURLScanner(p)
 	sc.PRURL()
 
-	// Grow past the window with filler that has no link, then call again.
+	// Grow well past one chunk with filler that has no link, then read until the
+	// backlog is drained. Draining first is required: while unread bytes remain,
+	// a call legitimately keeps reading (that is the fix for the skipped-middle
+	// bug), so "no growth" only means a no-op once everything is consumed.
 	filler := strings.Repeat("x", 64<<10)
 	for range 24 {
 		_, _ = f.WriteString(filler + "\n")
 	}
-	sc.PRURL()
+	for range 64 {
+		sc.mu.Lock()
+		off := sc.offset
+		sc.mu.Unlock()
+		if fi, err := os.Stat(p); err == nil && off >= fi.Size() {
+			break
+		}
+		sc.PRURL()
+	}
 
 	// Record the offset, then assert a no-growth call is a no-op.
 	sc.mu.Lock()

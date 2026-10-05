@@ -307,7 +307,11 @@ func (w *TranscriptWatcher) Poll() bool {
 		w.offset = 0
 	}
 	w.offset = scanTranscript(w.path, w.offset, func(text string) bool {
-		if text != "" && strings.Contains(text, w.marker) {
+		// The SAME rule as TranscriptContains, not strings.Contains. The gate
+		// reads this sticky latch FIRST, so a watcher using the looser test
+		// would re-introduce the quoted-marker false positive through the latch
+		// even though the cumulative scan rejects it.
+		if textEmitsMarker(text, w.marker) {
 			w.seen = true
 			w.seenAtOff = w.offset
 			return false // stop consuming; we have what we came for

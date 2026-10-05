@@ -989,7 +989,12 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 					"so this job is NOT done — it continues to the next round. The agent is documenting unfinished work; "+
 					"the report is at %s",
 				j.FinalReport, phrase, j.Marker, j.FinalReport)
-			return
+			// `continue`, NOT `return`: this is inside loop(), whose only caller
+			// hands it to a WaitGroup. Returning would end the round goroutine
+			// with state still running/active=true, leaving RunningCount stuck
+			// at 1 forever and no further round ever starting — the job would
+			// hang instead of continuing.
+			continue
 		}
 
 		if j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {

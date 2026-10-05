@@ -211,43 +211,58 @@ func (s *PRURLScanner) PRURL() string {
 	if size < s.offset {
 		// Truncated or rotated: the old bytes are gone and the offset is
 		// meaningless, so start over rather than read from a bogus position.
-		s.offset, s.last = 0, ""
+		s.offset, s.last, s.lastSize = 0, "", 0
 	}
 	if size == s.lastSize {
 		return s.last // nothing appended since the last call
 	}
 
-	start := s.offset
-	if start > prOverlapBytes {
-		start -= prOverlapBytes
-	}
-	if size-start > prURLTailBytes {
-		if s.offset > 0 {
-			// Subsequent call: the window bounds the read, and anything older
-			// was already offered to a previous call.
-			start = size - prURLTailBytes
-		} else {
-			// FIRST call on a file already larger than the window. Do not skip
-			// to the tail here: nothing has been scanned yet, so the link may be
-			// at the very beginning. Read the head instead — a bounded prefix —
-			// and let the NEXT call walk forward from there. This is what keeps
-			// a one-shot PRURLFrom correct on a large transcript.
-			start = 0
-			if size > prURLTailBytes {
-				size = prURLTailBytes
-			}
-		}
+	// Read FORWARD from the offset in bounded chunks, never jumping to the tail.
+	//
+	// Jumping to the tail skipped the middle: when more than one chunk arrived
+	// between two calls, every byte in [offset, size-chunk] was never scanned, so
+	// a link written there was lost forever — the ADR-0006 failure again, for a
+	// job that emits a lot in a single round. The chunk bounds a SINGLE read; the
+	// offset bounds the TOTAL, so correctness never depends on one append being
+	// small.
+	readTo := min(s.offset+prURLChunkBytes, size)
+	// Re-read a little before the offset so a link straddling a chunk boundary is
+	// not split. A PR URL is far shorter than the overlap.
+	from := s.offset
+	if from > prOverlapBytes {
+		from -= prOverlapBytes
 	}
 
-	buf := make([]byte, size-start)
-	n, _ := readFileAt(s.path, buf, start)
-	s.offset, s.lastSize = size, size
+	buf := make([]byte, readTo-from)
+	n, _ := readFileAt(s.path, buf, from)
+	// Advance by what was actually consumed, NOT by the window size: recording the
+	// window as the offset is exactly what permanently skipped the middle.
+	if n > 0 {
+		s.offset = from + int64(n)
+	}
+	// lastSize is the "nothing new" short-circuit ONLY when the backlog is fully
+	// drained. Setting it while bytes remain would make the NEXT call return early
+	// and the rest of the backlog would never be scanned — the same silent skip in
+	// a different guise.
+	if s.offset >= size {
+		s.lastSize = size
+	} else {
+		s.lastSize = -1 // force the next call to keep reading
+	}
 	if n <= 0 {
 		return s.last
 	}
 	buf = buf[:n]
-	if start > 0 {
-		// Drop the partial first line so a match cannot begin mid-line.
+	// Drop a leading PARTIAL line, but only a genuinely partial one: one where the
+	// byte immediately before `from` was not a newline. Deciding it by asking the
+	// file, rather than by `from > 0`, is what makes this correct — the offset
+	// always sits on a line boundary, so the first line in the buffer is normally
+	// COMPLETE and must be scanned.
+	//
+	// Trimming on `from > 0` instead threw away the first line of every read after
+	// the first, and when a read's first line was also its last, that discarded the
+	// whole buffer — losing a link sitting exactly where we were reading.
+	if from > 0 && len(buf) > 0 && !offsetAtLineStart(s.path, from) {
 		i := bytes.IndexByte(buf, '\n')
 		if i < 0 {
 			return s.last // no complete line yet; wait for more bytes
@@ -260,8 +275,31 @@ func (s *PRURLScanner) PRURL() string {
 	return s.last
 }
 
+// prURLChunkBytes bounds ONE read. Several calls may be needed to catch up on a
+// large append; each consumes at most this much and the next continues from the
+// offset. Bounding a read is not the same as bounding what gets scanned.
+const prURLChunkBytes = 256 << 10
+
 // readFileAt reads into buf at off, tolerating a short read: a PR link near the
 // tail is exactly what we came for, so partial data is better than none.
+// offsetAtLineStart reports whether off begins a line (i.e. off == 0 or the byte
+// before it is a newline).
+func offsetAtLineStart(path string, off int64) bool {
+	if off == 0 {
+		return true
+	}
+	var one [1]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return true // cannot tell; assume complete rather than discard data
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.ReadAt(one[:], off-1); err != nil {
+		return true
+	}
+	return one[0] == '\n'
+}
+
 func readFileAt(path string, buf []byte, off int64) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -270,11 +308,6 @@ func readFileAt(path string, buf []byte, off int64) (int, error) {
 	defer func() { _ = f.Close() }()
 	return f.ReadAt(buf, off)
 }
-
-// prURLTailBytes bounds the tail scan. Generous enough to reach back past a
-// short round's worth of output, small enough that a multi-megabyte transcript
-// is never fully read on the gate path.
-const prURLTailBytes = 512 << 10
 
 // EmptyTurnWindow is the quiet window that turns "alive but producing nothing"
 // into an empty-turn stall (ADR-0010): the transcript grew, but the agent
