@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"pi-supervisor/internal/taskwatch"
 )
 
 // Dir is where the per-job event audit JSONL files live.
@@ -42,6 +44,15 @@ type Event struct {
 	// PR was opened, only that the agent did not link one before the round
 	// ended.
 	PRURL string `json:"pr_url,omitempty"`
+	// Task-watch enrichment (ADR-0014): present only on task_completed
+	// (Task/TaskFile) and task_lookup_failed (TaskID, ToolCallID, Reason).
+	// TaskInfo is the validated, immutable copy from the plugin's JSON —
+	// never a title cache or parsed prose.
+	TaskID     string              `json:"task_id,omitempty"`
+	ToolCallID string              `json:"tool_call_id,omitempty"`
+	TaskFile   string              `json:"task_file,omitempty"`
+	Reason     string              `json:"reason,omitempty"`
+	Task       *taskwatch.TaskInfo `json:"task,omitempty"`
 }
 
 // Terminal reports whether an event ends the job's run: `watch` closes the

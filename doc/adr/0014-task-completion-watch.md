@@ -1,7 +1,7 @@
 # ADR 0014 — TaskUpdate completion notifications enriched from pi-tasks JSON
 
 Date: 2026-10-05
-Status: Accepted — owner-approved v1 scope; implementation pending
+Status: Accepted — owner-approved v1 scope + owner amendment (status task counts); implementation pending
 Author: Antoine Aflalo (Belphemur), Hermes Agent
 
 ## Context
@@ -39,8 +39,8 @@ Verified references (installed source, not a new dependency):
 |---|---|
 | pi-tasks | Task mutations, task storage and path-selection semantics |
 | RPC client | Correlating actual executions and identifying their session |
-| Task-store reader | Resolving the active store and validating a snapshot |
-| Supervisor | Stamping job/round and publishing the resulting observation |
+| Task-store reader | Resolving the active store, validating a snapshot, and counting the CURRENT list (owner amendment) |
+| Supervisor | Stamping job/round, publishing the resulting observation, and answering `status` with current task counts |
 | Existing event/control/watch path | Audit, fan-out, rendering and terminality |
 
 The RPC call is the trigger; the task JSON is the source of information.
@@ -119,7 +119,32 @@ Ignore additional plugin fields for forward compatibility. Use bounded reads
 and finite handling of malformed/oversized data; never block on a FIFO/device.
 Do not repair, lock, delete or mutate the plugin's store.
 
-### 4. Event shape and output
+### 4a. Status task counts (owner amendment, approved 2026-10-06)
+
+`status` — single job and all jobs — ALSO shows the CURRENT completed/total
+counts of the session's plugin task list. The counts come from the SAME
+store adapter (one resolver, one parser, one validation) reading the store
+directly on demand; they are never derived from observed completion events,
+never cached, and never watched: auto-clear and deletion shrink totals, so
+every read describes the list as it is NOW.
+
+- A valid empty list reads `0/0` and carries NO error.
+- A failed lookup (unresolved identity, memory/off, missing/unreadable/
+  invalid store) renders the FALLBACK `0/0` PLUS a separate structured
+  task-status error: a machine-readable reason and a human explanation.
+  The CLI prints that explanation beside the 0/0, and wire output is
+  never presented as a successful empty list.
+- Reads happen on demand inside the daemon with the correct session and
+  child environment; no ticker, no second watcher. I/O runs outside
+  supervisor/runner locks.
+- Works before the first completion, after create/reopen/deletion, and for
+  stopped/resumed jobs whose session identity is available (pi names its
+  transcript `<timestamp>_<sessionID>.jsonl`, which is the identity the
+  adapter falls back to).
+- The event contract in §2–§5 is unchanged: counts and completion watch
+  share ONE parser but remain separate surfaces.
+
+### 4b. Event shape and output
 
 Extend the existing event envelope additively. `task_completed` carries the
 usual job, round, session_path, worktree, timestamp and best-effort pr_url,
@@ -188,6 +213,9 @@ Tests must exercise the connected path, not just a new parser:
 - Resolver parity for default/resume/first LAUNCH, PI_TASKS overrides, memory,
   project, session-global legacy precedence, agent-dir overrides and two
   simultaneous sessions reusing the same task ID.
+- Status counts (owner amendment): valid list, valid EMPTY list (0/0 no
+  error), failed lookup (fallback 0/0 + reason + human explanation),
+  all-jobs list, no-identity jobs, and the CLI's readable line.
 - Atomic rename, bounded oversized reads, unsupported file types and a
   missing source during lookup. No task-store writes by the supervisor.
 - Real client -> supervisor -> control socket -> watch integration: enriched
@@ -219,6 +247,8 @@ and golangci-lint. Reconcile this ADR and operator docs with the shipped code.
 Automatic subagent completions without TaskUpdate; detecting every task state
 change; plugin modifications; independent proof that code/tests succeeded;
 turning task completion into job completion; migrating task storage; adding
-status dashboards; altering restart/session ownership; durable exactly-once
+watch-side status dashboards or a second counts implementation (the owner
+amendment's on-demand counts ARE the sanctioned status surface); altering
+restart/session ownership; durable exactly-once
 notifications or watch replay. A later comprehensive mutation-event/bridge
 extension design may supersede the trigger without duplicating task ownership.

@@ -189,6 +189,59 @@ func sendCTL(req control.Request) error {
 	if line := prStatusLine(resp.Data); line != "" {
 		fmt.Println(line)
 	}
+	// Readable task progress beside the structured JSON (ADR-0014 owner
+	// amendment). Never fabricates: failed lookups print WHY, not silent 0/0.
+	for _, line := range taskProgressLines(resp.Data) {
+		fmt.Println(line)
+	}
+	return nil
+}
+
+// taskProgressLines renders `tasks C/T completed` for a single-job status or
+// per job in a list; a failed lookup renders the fallback WITH its reason:
+// `tasks 0/0 (reason: <reason> — <human explanation>)`. "" when the payload
+// is not status-shaped or carries no task progress.
+func taskProgressLines(data any) []string {
+	one := func(m map[string]any, withName bool) string {
+		tp, ok := m["tasks"].(map[string]any)
+		if !ok {
+			return ""
+		}
+		c, _ := tp["completed"].(float64)
+		tot, _ := tp["total"].(float64)
+		line := ""
+		if name, _ := m["name"].(string); withName {
+			line = "tasks " + name + ": "
+		} else {
+			line = "tasks "
+		}
+		line += fmt.Sprintf("%d/%d completed", int(c), int(tot))
+		if reason, _ := tp["reason"].(string); reason != "" {
+			detail, _ := tp["detail"].(string)
+			line += fmt.Sprintf("  (NOT verified — %s: %s)", reason, cleanTaskText(detail))
+		}
+		if path, _ := tp["store_path"].(string); path != "" {
+			line += "\n  store: " + path
+		}
+		return line
+	}
+	if m, ok := data.(map[string]any); ok {
+		if l := one(m, false); l != "" {
+			return []string{l}
+		}
+		return nil
+	}
+	if arr, ok := data.([]any); ok {
+		var out []string
+		for _, v := range arr {
+			if m, ok := v.(map[string]any); ok {
+				if l := one(m, true); l != "" {
+					out = append(out, l)
+				}
+			}
+		}
+		return out
+	}
 	return nil
 }
 
@@ -386,12 +439,58 @@ func watchFooter(ev map[string]any) {
 	case "stopped":
 		fmt.Printf("operator stop — %s paused at round %.0f.\n", name, round)
 		fmt.Printf("Re-arm: pi-supervisor start %s ; pi-supervisor watch %s\n", name, name)
+	case "task_completed":
+		// Non-terminal (ADR-0014 §5): the job keeps running. Task text is
+		// DATA: escape terminal control characters, never execute it, and
+		// bound its length visibly.
+		tid, _ := ev["task_id"].(string)
+		subj, _ := ev["task"].(map[string]any)["subject"].(string)
+		desc, _ := ev["task"].(map[string]any)["description"].(string)
+		owner, _ := ev["task"].(map[string]any)["owner"].(string)
+		fmt.Printf("TASK COMPLETED — %s: %s (round %v)\n", name, cleanTaskText(tid+": "+subj), round)
+		if desc != "" {
+			fmt.Printf("  %s\n", cleanTaskText(desc))
+		}
+		if owner != "" {
+			fmt.Printf("  owner: %s\n", cleanTaskText(owner))
+		}
+		fmt.Printf("  job still running — task completion is plugin-reported state, not verification.\n")
+		fmt.Printf("  re-arm: pi-supervisor watch %s   (background+notify=true)\n", name)
+	case "task_lookup_failed":
+		tid, _ := ev["task_id"].(string)
+		reason, _ := ev["reason"].(string)
+		fmt.Printf("TASK COMPLETION NOT CONFIRMED — %s: task %s (%s)\n", name, cleanTaskText(tid), reason)
+		fmt.Printf("LLM: TaskUpdate looked completed but the plugin's JSON did not " +
+			"confirm it. No completion was claimed; the job keeps running.\n")
+		fmt.Printf("  check the task list (TaskList), then re-arm: pi-supervisor watch %s\n", name)
 	case "job_started":
 		fmt.Printf("Job %s launched at %s.\n", name, wt)
 		fmt.Printf("Monitor: pi-supervisor watch %s   | status: pi-supervisor status %s\n", name, name)
 	default:
 		fmt.Printf("next: re-arm (background+notify): pi-supervisor watch %s | status: pi-supervisor status %s\n", name, name)
 	}
+}
+
+// cleanTaskText escapes terminal control characters in plugin-sourced task
+// text and bounds its display length (ADR-0014 §4: task text is data, never
+// instructions, and a display truncation must be visible).
+func cleanTaskText(s string) string {
+	if len(s) > 400 {
+		s = s[:400] + "…(truncated)"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if r == '\n' || r == '\r' || r == '\t' || (
+		// C0 controls except the handled whitespace above.
+		r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0)) {
+			if r != '\n' && r != '\r' && r != '\t' {
+				b.WriteString(fmt.Sprintf("\\x%02x", r))
+				continue
+			}
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // watchCtl blocks on the control socket and prints events as they arrive.
