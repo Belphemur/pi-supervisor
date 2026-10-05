@@ -284,10 +284,18 @@ func (s *Supervisor) originRepo() (owner, repo string) {
 	// Accept both the SSH and HTTPS spellings; anything else is not a repo we
 	// can scope by, and the caller falls back to checking everything.
 	for _, prefix := range []string{"git@github.com:", "https://github.com/", "http://github.com/", "ssh://git@github.com/"} {
-		if after, ok := strings.CutPrefix(u, prefix); ok {
-			rest := strings.TrimSuffix(after, ".git")
-			return owner, rest[strings.Index(rest, "/")+1:]
+		after, ok := strings.CutPrefix(u, prefix)
+		if !ok {
+			continue
 		}
+		rest := strings.TrimSuffix(after, ".git")
+		owner, repo, ok := strings.Cut(rest, "/")
+		if !ok || owner == "" || repo == "" {
+			// A remote we cannot split into owner/repo cannot scope anything;
+			// the caller falls back to checking every job.
+			return "", ""
+		}
+		return owner, repo
 	}
 	return "", ""
 }
