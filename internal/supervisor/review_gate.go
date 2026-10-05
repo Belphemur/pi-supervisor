@@ -94,6 +94,12 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 		// review_exhausted with threads still open, so record whatever the last
 		// observed count was rather than assuming zero.
 		s.recordThreadBaseline(name, r, owner, repo, pr, len(open))
+		// The job is idle and a baseline now exists, so this is the one point
+		// the re-check can actually run. Firing it only from the build job's
+		// marker-done branch would mean it never sees a baseline at all:
+		// baselines are created HERE and in the exhausted path, both of which
+		// leave the job terminal and refused by Start.
+		go s.recheckThreads(name)
 		_ = wt
 		return true
 	}

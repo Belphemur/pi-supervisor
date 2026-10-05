@@ -704,6 +704,10 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				// still reachable.
 				if c := r.campaignSnapshot(); c != nil {
 					s.recordThreadBaseline(name, r, c.owner, c.repo, c.pr, c.lastOpenCount())
+					// Same reason as the clean-close path: finish() has cleared
+					// active and a baseline now exists, so this is a point where
+					// the re-check can run rather than no-op.
+					go s.recheckThreads(name)
 				}
 				return
 			}

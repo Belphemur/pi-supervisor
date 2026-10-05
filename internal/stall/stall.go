@@ -201,11 +201,24 @@ func prURLFromSince(path string, _ int) string {
 	if i := bytes.IndexByte(buf, '\n'); i >= 0 && start > 0 {
 		buf = buf[i+1:]
 	}
-	all := prRe.FindAll(buf, -1)
-	if len(all) == 0 {
-		return ""
+	if all := prRe.FindAll(buf, -1); len(all) > 0 {
+		return string(all[len(all)-1])
 	}
-	return string(all[len(all)-1])
+	// Nothing in the tail. Fall back to the whole file rather than reporting
+	// "not linked": a long job can open its PR early and then emit megabytes of
+	// CI output, pushing the link far outside the window. Returning "" here
+	// would emit review_skipped for a transcript that plainly contains the URL —
+	// exactly the ADR-0006 failure this helper exists to fix.
+	if start > 0 {
+		full, err := os.ReadFile(path)
+		if err != nil {
+			return ""
+		}
+		if all := prRe.FindAll(full, -1); len(all) > 0 {
+			return string(all[len(all)-1])
+		}
+	}
+	return ""
 }
 
 // prURLTailBytes bounds the tail scan. Generous enough to reach back past a
