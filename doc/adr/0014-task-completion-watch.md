@@ -1,7 +1,8 @@
 # ADR 0014 — TaskUpdate completion notifications enriched from pi-tasks JSON
 
 Date: 2026-10-05
-Status: Accepted — owner-approved v1 scope + owner amendment (status task counts); implementation pending
+Status: Accepted — implemented on feat/task-watch (client correlation, store
+adapter, emit funnel, watch/status surfaces); Hermes to verify tests/build
 Author: Antoine Aflalo (Belphemur), Hermes Agent
 
 ## Context
