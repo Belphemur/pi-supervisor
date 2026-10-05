@@ -109,7 +109,9 @@ var (
 	followUpLineRe = regexp.MustCompile(`(?i)^[>*#-]{0,12}\s*(?:a\s+)?follow[ -]?up(?:\s+run)?\s+(?:(?:is|will\s+be)\s+)?(?:need(?:s|ed)?|required)\s*(?:(?::\s*(.*)$)|(?:[ 	]+(?:to|for)\b))`)
 	// The no-follow-up value, as a WHOLE value: "none", "N/A", "nothing",
 	// "not needed", or a bare dash.
-	noFollowUpRe = regexp.MustCompile(`(?i)^(?:none|n/?a|nothing|no|not\s+(?:needed|required))[ 	]*[.!]*$|^[-–—]+$`)
+	// Explicit benign multi-word values are accepted, but no generic prefix:
+	// "none of T6-T9 are implemented" must remain an incomplete declaration.
+	noFollowUpRe = regexp.MustCompile(`(?i)^(?:none(?:[ 	]+(?:required|needed))?|n/?a|nothing(?:[ 	]+to[ 	]+do)?|no(?:[ 	]+(?:further[ 	]+action|additional[ 	]+work))?|not[ 	]+(?:needed|required))[ 	]*[.!]*$|^[-–—]+$`)
 )
 
 // incompleteReportRes are deliberately anchored to a STATUS position: a heading

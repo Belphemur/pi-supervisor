@@ -185,6 +185,9 @@ func TestReportFollowUpEmphasisIsIrrelevant(t *testing.T) {
 		"- Follow-up needed: N/A\n",
 		"- Follow-up needed: **N/A**\n",
 		"- Follow-up needed: nothing\n",
+		"- Follow-up needed: no further action\n",
+		"- Follow-up needed: nothing to do\n",
+		"- Follow-up needed: none required\n",
 		"- Follow-up needed: not needed\n",
 		"The next run should rebase onto main.\n",
 	}
