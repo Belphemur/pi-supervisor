@@ -922,6 +922,22 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if !markerSeen && j.Marker != "" {
 			markerSeen = job.RunlogContains(job.Runlog(name), j.Marker)
 		}
+		// Scrape the PR URL from the transcript at the gate, not only from the
+		// stall watchers (ADR-0006). Those watchers start only once a transcript
+		// path is pinned, so on a fresh LAUNCH — where the round that opens the
+		// PR and the round that finishes it are often the SAME one — nothing was
+		// scraping. autoReviewHandoff then saw an empty prURL and emitted
+		// review_skipped ("no GitHub PR was linked") for a transcript that
+		// plainly contained the link.
+		//
+		// "" still means "not linked", never "no PR exists", so a genuine miss
+		// stays a skip rather than becoming an error.
+		if r.stateSnapshot().PRURL == "" && sess != "" {
+			if u := stall.PRURLFrom(sess); u != "" {
+				s.recordPR(r, u)
+			}
+		}
+
 		if j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {
 			// ADR-0012 §4.1: the auto-trigger runs HERE, in the gate's tail —
 			// not "mid-round". There is no live round to fire from: the gate

@@ -149,6 +149,28 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 // if the agent has not linked one (ADR-0006).
 func (d *Detector) PRURL() string { return d.prURL }
 
+// PRURLFrom scans a whole transcript for a pull-request URL, starting at the
+// beginning of the file.
+//
+// It exists because the streaming Detector only sees bytes appended after
+// New(), and the Detector is only constructed once a transcript path is pinned.
+// On a fresh LAUNCH — where the agent opens its PR and finishes in the same
+// round — that meant nothing ever scraped the link, and the review auto-trigger
+// skipped a job whose transcript plainly contained it (ADR-0006).
+//
+// Returns "" when there is no link, which still means "not linked", never "no
+// PR exists".
+func PRURLFrom(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if m := prRe.Find(data); m != nil {
+		return string(m)
+	}
+	return ""
+}
+
 // EmptyTurnWindow is the quiet window that turns "alive but producing nothing"
 // into an empty-turn stall (ADR-0010): the transcript grew, but the agent
 // emitted no assistant text and no tool_use for the whole window, which the
