@@ -53,8 +53,22 @@ func ReportDeclaresIncomplete(path string) (string, bool) {
 			return strings.TrimSpace(m[0]), true
 		}
 	}
+	// Colon declarations need their value checked: "needed: none" explicitly
+	// says there is no follow-up. Inspect every declaration so such a line does
+	// not hide a later declaration of unfinished work.
+	for _, m := range followUpDeclarationRe.FindAllStringSubmatch(text, -1) {
+		value := strings.Trim(m[1], " 	*_`")
+		if value != "" && !noFollowUpRe.MatchString(value) {
+			return strings.TrimSpace(m[0]), true
+		}
+	}
 	return "", false
 }
+
+var (
+	followUpDeclarationRe = regexp.MustCompile(`(?im)^[ 	>*#-]{0,12}(?:a[ 	]+)?follow[ -]?up(?:[ 	]+run)?[ 	]+(?:(?:is|will[ 	]+be)[ 	]+)?(?:needed|required)[ 	]*:[ 	]*([^\r\n]*)$`)
+	noFollowUpRe          = regexp.MustCompile(`(?i)^(?:(?:none|n/?a|nothing|no)\b|not[ 	]+(?:needed|required)\b|[-—]+$)`)
+)
 
 // incompleteReportRes are deliberately anchored to a STATUS position: a heading
 // or a bolded first token, optionally "not"/"is" then the keyword. That keeps a
@@ -71,11 +85,13 @@ var incompleteReportRes = []*regexp.Regexp{
 	// "deliberately NOT emitted", "do not emit the marker", "marker NOT emitted"
 	regexp.MustCompile(`(?im)\b(?:do\s+not|don't|never)\s+emit\s+(?:the\s+)?marker\b`),
 	regexp.MustCompile(`(?im)\bmarker\b[^\n]{0,40}\b(?:not|isn't|wasn't)\s+emitted\b`),
-	// "The next run needs", "a follow-up is needed" — BUT only in a status
-	// position, like every other pattern here. A handoff SECTION can be titled
-	// "Repo facts a follow-up run needs" inside a COMPLETE report (qodo PR #5:
-	// that phrase is documentation, not a declaration), and firing on it
-	// diverts genuinely finished work into an endless loop.
-	regexp.MustCompile(`(?im)^[\s>*#-]{0,12}(?:a\s+)?follow[ -]?up(?:\s+run)?\s+(?:is\s+)?needed\b`),
-	regexp.MustCompile(`(?im)^[\s>*#-]{0,12}(?:the\s+)?next\s+run\s+(?:needs?|should)\b`),
+	// A follow-up statement only counts when it names the action still required:
+	// "A follow-up run needs to finish T6-T9", "a follow-up run will be needed to
+	// implement T6-T9". That action is the discriminator — it admits a declaration
+	// while rejecting both a documentation HEADING ("Repo facts a follow-up run
+	// needs", qodo PR #5) and a bullet that says there is nothing to do
+	// ("Follow-up needed: none"). Speculative handoff prose ("the next run should
+	// rebase") names no required action and does not fire either.
+	regexp.MustCompile(`(?im)^[\s>*#-]{0,12}(?:a\s+)?follow[ -]?up(?:\s+run)?\s+(?:(?:is|will\s+be)\s+)?needed\s+(?:to|for)\b`),
+	regexp.MustCompile(`(?im)^[\s>*#-]{0,12}(?:a\s+)?follow[ -]?up\s+run\s+needs?\s+(?:to|for)\b`),
 }
