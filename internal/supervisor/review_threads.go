@@ -67,7 +67,11 @@ func (s *Supervisor) recordThreadBaseline(name string, r *runner, owner, repo st
 // No-op when there is no baseline (the job never reviewed anything), which keeps
 // the cost at zero for build-only jobs.
 func (s *Supervisor) recheckThreads(name string) {
+	// s.jobs is mutated by LoadJobs under s.mu; reading it unlocked is a data
+	// race that can crash the daemon, not just miss a job.
+	s.mu.Lock()
 	r := s.jobs[name]
+	s.mu.Unlock()
 	if r == nil {
 		return
 	}
@@ -196,7 +200,9 @@ func (s *Supervisor) RecheckThreadsAll(ctx context.Context, pushed bool, repoSlu
 	}
 
 	for _, n := range names {
+		s.mu.Lock()
 		r := s.jobs[n]
+		s.mu.Unlock()
 		if r == nil {
 			continue
 		}
