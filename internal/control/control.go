@@ -52,13 +52,18 @@ type Reviewer interface {
 // declared here (consumer-defined) so internal/review stays out of the wire
 // types; the supervisor decodes it into its own struct.
 type ReviewRequest struct {
-	Cmd    string          `json:"cmd"`
-	Job    string          `json:"job,omitempty"`
-	PR     int             `json:"pr,omitempty"`
-	Rounds int             `json:"rounds,omitempty"`
-	Type   string          `json:"type,omitempty"`
-	Auto   bool            `json:"auto,omitempty"`
-	Event  string          `json:"event,omitempty"`
+	Cmd    string `json:"cmd"`
+	Job    string `json:"job,omitempty"`
+	PR     int    `json:"pr,omitempty"`
+	Rounds int    `json:"rounds,omitempty"`
+	Type   string `json:"type,omitempty"`
+	Auto   bool   `json:"auto,omitempty"`
+	Event  string `json:"event,omitempty"`
+	// Pushed/Repo scope cmd:"review_recheck_all", the post-push hook's verb:
+	// Pushed narrows to the repository just pushed to, Repo names owner/name
+	// explicitly. Only that verb uses them; --recheck carries neither.
+	Pushed bool            `json:"pushed,omitempty"`
+	Repo   string          `json:"repo,omitempty"`
 	Raw    json.RawMessage `json:"-"`
 }
 
@@ -325,7 +330,7 @@ func dispatch(h Handler, raw []byte) Response {
 			return refuse(err)
 		}
 		return Response{OK: true}
-	case "review", "review_action", "ack":
+	case "review", "review_action", "ack", "review_recheck", "review_recheck_all":
 		return dispatchReview(h, raw)
 	default:
 		return Response{OK: false, Error: "unknown cmd " + req.Cmd, Reason: string(fault.KindUnknownCmd)}

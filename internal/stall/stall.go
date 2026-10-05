@@ -149,6 +149,83 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 // if the agent has not linked one (ADR-0006).
 func (d *Detector) PRURL() string { return d.prURL }
 
+// PRURLFrom scans a whole transcript for a pull-request URL, starting at the
+// beginning of the file.
+//
+// It exists because the streaming Detector only sees bytes appended after
+// New(), and the Detector is only constructed once a transcript path is pinned.
+// On a fresh LAUNCH — where the agent opens its PR and finishes in the same
+// round — that meant nothing ever scraped the link, and the review auto-trigger
+// skipped a job whose transcript plainly contained it (ADR-0006).
+//
+// Returns "" when there is no link, which still means "not linked", never "no
+// PR exists".
+// It returns the LAST match, not the first: the streaming Detector reads
+// forward, so the most recent link is the one this run produced. Taking the
+// first would pick up the brief's own echo of a PR URL, or a link inside a tool
+// result the agent merely read, and hand autoReviewHandoff an unrelated PR to
+// campaign against.
+//
+// Only the tail of the file is read. A transcript grows monotonically, so
+// slurping all of it on every round-end would be O(rounds x transcript size) of
+// wasted I/O for a build job that never links a PR at all.
+func PRURLFrom(path string) string {
+	return prURLFromSince(path, 0)
+}
+
+// prURLFromSince reads at most the last prURLTailBytes of path and returns the
+// last PR link in it, or "".
+func prURLFromSince(path string, _ int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	start := int64(0)
+	if fi.Size() > prURLTailBytes {
+		start = fi.Size() - prURLTailBytes
+	}
+	buf := make([]byte, fi.Size()-start)
+	// A short read is fine: use whatever bytes arrived rather than failing the
+	// scrape, because a PR link near the tail is exactly what we came for.
+	n, _ := f.ReadAt(buf, start)
+	if n <= 0 {
+		return ""
+	}
+	buf = buf[:n]
+	// Trim to the first newline so a match cannot begin in a truncated line.
+	if i := bytes.IndexByte(buf, '\n'); i >= 0 && start > 0 {
+		buf = buf[i+1:]
+	}
+	if all := prRe.FindAll(buf, -1); len(all) > 0 {
+		return string(all[len(all)-1])
+	}
+	// Nothing in the tail. Fall back to the whole file rather than reporting
+	// "not linked": a long job can open its PR early and then emit megabytes of
+	// CI output, pushing the link far outside the window. Returning "" here
+	// would emit review_skipped for a transcript that plainly contains the URL —
+	// exactly the ADR-0006 failure this helper exists to fix.
+	if start > 0 {
+		full, err := os.ReadFile(path)
+		if err != nil {
+			return ""
+		}
+		if all := prRe.FindAll(full, -1); len(all) > 0 {
+			return string(all[len(all)-1])
+		}
+	}
+	return ""
+}
+
+// prURLTailBytes bounds the tail scan. Generous enough to reach back past a
+// short round's worth of output, small enough that a multi-megabyte transcript
+// is never fully read on the gate path.
+const prURLTailBytes = 512 << 10
+
 // EmptyTurnWindow is the quiet window that turns "alive but producing nothing"
 // into an empty-turn stall (ADR-0010): the transcript grew, but the agent
 // emitted no assistant text and no tool_use for the whole window, which the

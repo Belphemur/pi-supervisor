@@ -24,6 +24,11 @@ type reviewReq struct {
 	Auto   bool   `json:"auto,omitempty"`
 	// Event is the ack id for cmd:"ack".
 	Event string `json:"event,omitempty"`
+	// Pushed/Repo scope cmd:"review_recheck_all", the post-push hook's verb:
+	// Pushed narrows to this repository, Repo names owner/name explicitly.
+	// Neither is needed for the per-job review_recheck.
+	Pushed bool   `json:"pushed,omitempty"`
+	Repo   string `json:"repo,omitempty"`
 
 	// The remaining fields are the review_action body.
 	Action    string        `json:"action,omitempty"`
@@ -76,6 +81,18 @@ func (s *Supervisor) HandleReview(ctx context.Context, ctlReq control.ReviewRequ
 		}
 		data, err := s.StartReview(ctx, req.Job, req.PR, req.Rounds, req.Type)
 		return reviewResultResp(req.Job, data, err)
+	case "review_recheck":
+		data, err := s.RecheckThreads(ctx, req.Job)
+		return reviewResultResp(req.Job, data, err)
+	case "review_recheck_all":
+		// The post-push hook's path: no job, a repo scope instead. Reads only,
+		// so it is NOT gated on a live round (ADR-0012 §4 gates verbs that act
+		// on the job's behalf; this one only counts threads).
+		data, err := s.RecheckThreadsAll(ctx, req.Pushed, req.Repo)
+		if err != nil {
+			return reviewResp{OK: false, Reason: string(review.ReasonGitHubError), Message: err.Error()}
+		}
+		return reviewResp{OK: true, Job: "*", Data: data, Message: "review re-check complete"}
 	case "ack":
 		data, err := s.AckBulkResolve(ctx, req.Job, req.Event)
 		return reviewResultResp(req.Job, data, err)

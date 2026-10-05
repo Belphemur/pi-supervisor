@@ -4,6 +4,7 @@
 package supervisor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +71,11 @@ type Supervisor struct {
 	// ghClients caches one GitHub client per owner/repo (ADR-0012). Lazy, so a
 	// daemon that never reviews never touches GitHub credentials.
 	ghClients *reviewClients
+	// listOpen counts a PR's OPEN review threads for the post-completion
+	// re-check. It is a field, not a direct package call, so it is bound to this
+	// Supervisor in New() and therefore reuses ghClients instead of resolving a
+	// fresh App installation token on every call.
+	listOpen func(ctx context.Context, owner, repo string, pr int) (int, error)
 	// reviewRounds is the default campaign budget (ADR-0012 §5); 0 = 5.
 	reviewRounds int
 	// reviewAckTimeoutDur bounds a pending bulk_resolve; 0 = 30m.
@@ -106,11 +112,18 @@ type runner struct {
 }
 
 func New() *Supervisor {
-	return &Supervisor{
+	s := &Supervisor{
 		jobs:      map[string]*runner{},
 		stop:      make(chan struct{}),
 		ghClients: newReviewClients(),
 	}
+	// Bind the re-check seam to THIS supervisor so it reuses the per-repo
+	// client CACHE (see listOpenThreads). Tests that stub the package var still
+	// take effect, because s.listOpen defers to it.
+	s.listOpen = func(ctx context.Context, owner, repo string, pr int) (int, error) {
+		return listOpenThreads(s, ctx, owner, repo, pr)
+	}
+	return s
 }
 
 func (s *Supervisor) logf(name, format string, args ...any) {
@@ -199,6 +212,12 @@ func (r *runner) snapshot() job.Status {
 	}
 	if r.job.FinalReport != "" {
 		st.FinalReportOK = job.Exists(r.job.FinalReport)
+	}
+	// Same for the post-completion thread baseline: persisted on State, and
+	// copied here so `status` can actually show it.
+	if r.state.ReviewBaseline != nil {
+		bl := *r.state.ReviewBaseline
+		st.ReviewBaseline = &bl
 	}
 	// Review snapshot is built INLINE: reviewStatus takes r.mu, which this
 	// method already holds — calling it here would self-deadlock.
@@ -677,6 +696,19 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				s.emit(name, "review_exhausted", round, 0, 0, "",
 					"review round cap %d reached with threads still open — re-arm with `pi-supervisor review %s --pr N`",
 					maxRounds, name)
+				// Record the baseline on THIS path too. An exhausted campaign
+				// ends with threads STILL OPEN, and that count is the baseline:
+				// without it the next re-check has nothing to compare against,
+				// and every still-open thread reads as brand new. Recorded
+				// BEFORE finish() clears the campaign, so owner/repo/pr are
+				// still reachable.
+				if c := r.campaignSnapshot(); c != nil {
+					s.recordThreadBaseline(name, r, c.owner, c.repo, c.pr, c.lastOpenCount())
+					// Same reason as the clean-close path: finish() has cleared
+					// active and a baseline now exists, so this is a point where
+					// the re-check can run rather than no-op.
+					go s.recheckThreads(name)
+				}
 				return
 			}
 			// Same honesty requirement for the build job. `done` requires BOTH
@@ -763,7 +795,6 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if round == 1 {
 			s.emit(j.Name, "job_started", round, 0, 0, "", "round 1 launched")
 		}
-
 		// CI-stall watcher (ADR-0004): rounds with a captured transcript get
 		// a detector that interrupts the session and fails the run once the
 		// agent has parked on the CI/review loop ci_stall_cap times.
@@ -857,11 +888,20 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if instant {
 			s.emit(name, "instant_exit", round, rc, dur, "", "instant exit strike %d/3 (rc=%d, %ds)", strikes, rc, dur)
 		}
+		// The post-completion thread re-check is NOT fired here. This point is
+		// still inside the round, with r.active==true, and recheckThreads
+		// no-ops on an active job (a live campaign's own replies would be
+		// miscounted as new findings) — so a call from here, or from round
+		// start, would never perform a check. It fires from the completion
+		// gate instead, right after active goes false.
 		s.logf(name, "round %d: client exit=%d duration=%ds runlog=%dB", round, rc, dur, runlogB)
 		if r.stateSnapshot().LastDiag != "" {
 			s.logf(name, "round %d diagnostic: %s", round, r.stateSnapshot().LastDiag)
 		}
 
+		// closedJob records that THIS round ended the build job, which is the
+		// only moment the post-completion review re-check may run.
+		closedJob := false
 		// The marker gate (ADR-0011). The completion signal comes from the
 		// SESSION TRANSCRIPT — the streamed MarkerSeen latch, plus a direct
 		// scan as a belt-and-braces for a marker written after the last tick.
@@ -896,6 +936,22 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if !markerSeen && j.Marker != "" {
 			markerSeen = job.RunlogContains(job.Runlog(name), j.Marker)
 		}
+		// Scrape the PR URL from the transcript at the gate, not only from the
+		// stall watchers (ADR-0006). Those watchers start only once a transcript
+		// path is pinned, so on a fresh LAUNCH — where the round that opens the
+		// PR and the round that finishes it are often the SAME one — nothing was
+		// scraping. autoReviewHandoff then saw an empty prURL and emitted
+		// review_skipped ("no GitHub PR was linked") for a transcript that
+		// plainly contained the link.
+		//
+		// "" still means "not linked", never "no PR exists", so a genuine miss
+		// stays a skip rather than becoming an error.
+		if r.stateSnapshot().PRURL == "" && sess != "" {
+			if u := stall.PRURLFrom(sess); u != "" {
+				s.recordPR(r, u)
+			}
+		}
+
 		if j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {
 			// ADR-0012 §4.1: the auto-trigger runs HERE, in the gate's tail —
 			// not "mid-round". There is no live round to fire from: the gate
@@ -916,9 +972,17 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				r.review.round = r.state.Round
 			} else {
 				r.state.State, r.active = "done", false
+				// Done AND inactive: the only point the post-completion
+				// re-check can actually run (ADR-0012 follow-up). Started as a
+				// goroutine AFTER the lock is released below, since
+				// recheckThreads takes r.mu itself.
+				closedJob = true
 			}
 			r.mu.Unlock()
 			r.persistState()
+			if closedJob {
+				go s.recheckThreads(name)
+			}
 			s.logf(name, "round %d: marker %q detected in session transcript — done", round, j.Marker)
 			if autoArmed {
 				// Emit `reviewing`, NOT `done`. `done` is a TERMINAL event
@@ -1704,19 +1768,34 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 			snap := r.snapshot()
 			switch snap.State {
 			case "done", "fatal", "stopped":
-				cancel()
+				r.mu.Lock()
+				// Fields read under the same lock as the baseline check below.
 				ev := events.Event{
 					TS: time.Now().UTC().Format(time.RFC3339), Job: jobName,
 					Event: snap.State, Round: snap.Round, RC: snap.LastRC,
-					DurS: snap.LastDurS,
-					Info: "run already " + snap.State + " — nothing to wait for",
+					DurS:        snap.LastDurS,
+					Info:        "run already " + snap.State + " — nothing to wait for",
+					Worktree:    r.job.Worktree,
+					SessionPath: r.job.SessionPath,
+					PRURL:       r.state.PRURL,
 				}
-				r.mu.Lock()
-				ev.Worktree = r.job.Worktree
-				ev.SessionPath = r.job.SessionPath
-				ev.PRURL = r.state.PRURL
+				hasBaseline := r.state.ReviewBaseline != nil
 				r.mu.Unlock()
-				return nil, func() {}, &ev
+				// A finished job is NOT necessarily silent. If it ran a review
+				// campaign, a later push can still attract findings that nothing
+				// will answer (ADR-0012 follow-up), and this operator is exactly
+				// who wants to hear about it. So answer immediately with the
+				// precheck — as before — but STAY SUBSCRIBED instead of
+				// unsubscribing, so review_threads_appeared can still arrive.
+				//
+				// Without a baseline there is nothing that can ever be emitted
+				// for this job, so the old immediate return stands.
+				if !hasBaseline {
+					cancel()
+					return nil, func() {}, &ev
+				}
+				ev.Info += " — but this job has a review baseline, so staying subscribed for late review findings (Ctrl-C to stop)"
+				return ch, cancel, &ev
 			}
 		}
 	}

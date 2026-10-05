@@ -49,6 +49,33 @@ func (c *reviewClients) get(ctx context.Context, owner, repo string) (*review.Cl
 	return cl, nil
 }
 
+// listOpenThreads is the seam the post-completion re-check reads threads
+// through, so the ALERT path is testable without network access.
+//
+// It exists for the same reason newSessionResolver does: the re-check's whole
+// job is a comparison and an emit, and neither was reachable in a test because
+// the only way in was a live GitHub client. Without this seam every assertion
+// about "threads appeared" stops at "the code tried to dial GitHub", which is
+// how a decision bug can ship with a green suite.
+//
+// Production never reassigns it.
+// It is bound to a Supervisor in New() rather than reading the package-level
+// default, so it can reuse s.reviewClient — the per-repo client CACHE. Building a
+// client per call instead re-resolved the GitHub App installation token every
+// time, which is exactly the multiply-the-credential-traffic cost the cache
+// exists to avoid, and this runs once per round per job.
+var listOpenThreads = func(s *Supervisor, ctx context.Context, owner, repo string, pr int) (int, error) {
+	cl, err := s.reviewClient(ctx, owner, repo)
+	if err != nil {
+		return 0, err
+	}
+	all, err := cl.ListThreads(ctx, owner, repo, pr)
+	if err != nil {
+		return 0, err
+	}
+	return len(review.OpenThreads(all)), nil
+}
+
 // reviewClient is the Supervisor's accessor for the cached client.
 func (s *Supervisor) reviewClient(ctx context.Context, owner, repo string) (*review.Client, error) {
 	return s.ghClients.get(ctx, owner, repo)

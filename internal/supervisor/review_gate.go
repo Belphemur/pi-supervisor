@@ -72,6 +72,9 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 			ciNote += fmt.Sprintf(" (non-blocking, ignored: %s)", nb)
 		}
 	}
+	// Record the observed open count on the campaign so an exhausted close can
+	// record a truthful baseline (see reviewCampaign.lastOpen).
+	camp.setLastOpen(len(open))
 	s.emit(name, "review_round_done", round, 0, 0, "",
 		"review round %d/%d (%s): %d open thread(s), ci=%s%s on %s/%s#%d",
 		used, camp.maxRound, kind, len(open), ciVerdict, ciNote, owner, repo, pr)
@@ -86,6 +89,17 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 		s.emit(name, "review_done", round, 0, 0, "",
 			"review campaign complete: 0 open threads and CI passing on %s/%s#%d after %d round(s) — the owner merges, the daemon never does",
 			owner, repo, pr, used)
+		// Record the baseline so a LATER push that attracts new findings is
+		// detectable. `len(open)` is 0 here, but the campaign may have ended on
+		// review_exhausted with threads still open, so record whatever the last
+		// observed count was rather than assuming zero.
+		s.recordThreadBaseline(name, r, owner, repo, pr, len(open))
+		// The job is idle and a baseline now exists, so this is the one point
+		// the re-check can actually run. Firing it only from the build job's
+		// marker-done branch would mean it never sees a baseline at all:
+		// baselines are created HERE and in the exhausted path, both of which
+		// leave the job terminal and refused by Start.
+		go s.recheckThreads(name)
 		_ = wt
 		return true
 	}

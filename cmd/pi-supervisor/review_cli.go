@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -111,11 +113,12 @@ func printReviewOK(resp control.Response) {
 // newReviewCmd implements `pi-supervisor review <job> --pr N` (ADR-0012 §5).
 func newReviewCmd() *cobra.Command {
 	var (
-		pr     int
-		rounds int
-		kind   string
-		auto   bool
-		asJSON bool
+		pr      int
+		rounds  int
+		kind    string
+		auto    bool
+		recheck bool
+		asJSON  bool
 	)
 	c := &cobra.Command{
 		Use:   "review <job>",
@@ -127,6 +130,20 @@ func newReviewCmd() *cobra.Command {
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: completeJobNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// --recheck is a distinct mode, not a campaign: it compares the
+			// PR's current open-thread count against the baseline recorded
+			// when the campaign ended. It needs no --pr (the baseline carries
+			// the PR) and must not arm anything.
+			if recheck {
+				if pr != 0 || auto {
+					return fmt.Errorf("%w: --recheck takes no --pr/--auto; the baseline already names the PR", errUsage)
+				}
+				return reviewCtl(map[string]any{
+					"cmd":      "review_recheck",
+					"job":      args[0],
+					"blocking": true,
+				}, asJSON)
+			}
 			if pr == 0 && !auto {
 				return fmt.Errorf("%w: pass --pr <N> or --auto", errUsage)
 			}
@@ -153,6 +170,158 @@ func newReviewCmd() *cobra.Command {
 		"round character: acceptance (treat threads as accepted findings) or rebuttal (push back with evidence)")
 	c.Flags().BoolVar(&auto, "auto", false,
 		"arm the completion-gate trigger instead of starting now (one-shot; fires on an open PR)")
+	c.Flags().BoolVar(&recheck, "recheck", false,
+		"compare the PR's open-thread count against the baseline recorded when the campaign ended, "+
+			"and report/emit review_threads_appeared if new findings arrived (arms nothing; needs no --pr)")
+	c.Flags().BoolVar(&asJSON, "json", false, "print the raw JSON reply")
+	return c
+}
+
+// originSlug resolves the CURRENT directory's git origin to owner/name. It is
+// the CLI-side twin of the daemon's originRepo, and it is what makes
+// `--pushed` mean "the repo I am standing in" rather than "some repo the daemon
+// happens to know about".
+func originSlug() (owner, repo string, ok bool) {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		return "", "", false
+	}
+	u := strings.TrimSpace(string(out))
+	for _, prefix := range []string{
+		"git@github.com:", "https://github.com/", "http://github.com/",
+		"ssh://git@github.com/",
+	} {
+		after, cut := strings.CutPrefix(u, prefix)
+		if !cut {
+			continue
+		}
+		o, r, split := strings.Cut(strings.TrimSuffix(after, ".git"), "/")
+		if split && o != "" && r != "" {
+			return o, r, true
+		}
+	}
+	return "", "", false
+}
+
+// reviewRecheckCtl sends a repo-wide re-check request and prints the per-job
+// verdicts. It goes through the same postReview transport as every other review
+// verb; only the fan-out across jobs lives in the daemon (it owns the job list
+// and the worktree mapping).
+func reviewRecheckCtl(payload map[string]any, asJSON bool) error {
+	resp, err := postReview(payload)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		out, mErr := json.Marshal(resp)
+		if mErr != nil {
+			return mErr
+		}
+		fmt.Println(string(out))
+	} else if resp.OK {
+		printRecheckVerdicts(resp)
+	}
+	if !resp.OK {
+		return &reviewFailure{Reason: resp.Reason, Message: resp.Error}
+	}
+	return nil
+}
+
+// printRecheckVerdicts prints one line per job so a push hook's output is
+// scannable, and names the remedy when threads appeared.
+func printRecheckVerdicts(resp control.Response) {
+	type entry struct {
+		Job          string `json:"job"`
+		Checked      bool   `json:"checked"`
+		OpenAtClose  int    `json:"open_at_close"`
+		OpenNow      int    `json:"open_now"`
+		NewThreads   int    `json:"new_threads"`
+		Action       string `json:"action"`
+		Owner        string `json:"owner"`
+		Repo         string `json:"repo"`
+		PR           int    `json:"pr"`
+		CampaignBusy bool   `json:"campaign_active"`
+	}
+	// control.Response.Data is already-decoded `any`, so re-marshal rather
+	// than unmarshal: the shape is the daemon's, and a re-marshal keeps this
+	// printer tolerant of it.
+	raw, mErr := json.Marshal(resp.Data)
+	var out struct {
+		Jobs []entry `json:"jobs"`
+	}
+	if mErr != nil || json.Unmarshal(raw, &out) != nil || len(out.Jobs) == 0 {
+		// No per-job breakdown: fall back to the plain OK printer so the
+		// operator still sees whatever the daemon said.
+		printReviewOK(resp)
+		return
+	}
+	alerted := 0
+	for _, j := range out.Jobs {
+		if !j.Checked {
+			fmt.Printf("%s: nothing to re-check (%s)\n", j.Job, j.Action)
+			continue
+		}
+		if j.NewThreads > 0 {
+			alerted++
+			fmt.Printf("%s: %d NEW review thread(s) on %s/%s#%d (%d -> %d open)\n",
+				j.Job, j.NewThreads, j.Owner, j.Repo, j.PR, j.OpenAtClose, j.OpenNow)
+			fmt.Printf("  %s\n", j.Action)
+			continue
+		}
+		fmt.Printf("%s: %d open thread(s), unchanged since the campaign closed\n", j.Job, j.OpenNow)
+	}
+	if alerted > 0 {
+		fmt.Printf("\n%d job(s) gained review findings after their campaign closed.\n", alerted)
+		fmt.Println("Each needs a NEW campaign: pi-supervisor review <job> --pr <N>")
+	}
+}
+
+// newReviewRecheckCmd implements `pi-supervisor review-recheck`, the entry
+// point the post-push hook calls. It re-checks every job whose baseline PR
+// belongs to the repository that was just pushed to, so ONE push triggers
+// exactly the jobs whose review state could have changed.
+//
+// This is the push-as-trigger path (ADR-0012 follow-up). It is event-driven:
+// git runs the hook, the hook calls the daemon, the daemon compares counts.
+// No timer, no polling.
+func newReviewRecheckCmd() *cobra.Command {
+	var (
+		asJSON   bool
+		pushed   bool
+		repoSlug string
+	)
+	c := &cobra.Command{
+		Use:   "review-recheck",
+		Short: "Compare recorded review baselines against the PRs' current open threads",
+		Long: "Re-check post-completion review threads.\n\n" +
+			"With no flags it re-checks every job that has a recorded review baseline.\n" +
+			"--pushed narrows that to the jobs whose PR belongs to the repository\n" +
+			"just pushed (the post-push hook's mode), so one push touches only the\n" +
+			"jobs whose review state could have changed.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			slug := repoSlug
+			if pushed && slug == "" {
+				// Resolve HERE, in the caller's cwd. Left empty, the daemon
+				// falls back to an ARBITRARY job's worktree — which in a
+				// multi-repo daemon is the wrong repository, and the re-check
+				// then skips every job it should have checked while reporting
+				// a confident scope.
+				if o, r, ok := originSlug(); ok {
+					slug = o + "/" + r
+				}
+			}
+			return reviewRecheckCtl(map[string]any{
+				"cmd":    "review_recheck_all",
+				"pushed": pushed,
+				"repo":   slug,
+			}, asJSON)
+		},
+	}
+	c.Flags().BoolVar(&pushed, "pushed", false,
+		"only re-check jobs whose review PR belongs to the repository just pushed to")
+	c.Flags().StringVar(&repoSlug, "repo", "",
+		"restrict --pushed to this owner/name (defaults to this repository's origin)")
 	c.Flags().BoolVar(&asJSON, "json", false, "print the raw JSON reply")
 	return c
 }

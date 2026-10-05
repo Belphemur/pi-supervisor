@@ -327,6 +327,18 @@ func watchFooter(ev map[string]any) {
 		fmt.Printf("REVIEW BUDGET EXHAUSTED — %s: %s\n", name, info)
 		fmt.Printf("LLM: threads are still open. Check the shim's list_threads for what is left,\n")
 		fmt.Printf("then re-arm with more budget: pi-supervisor review %s --pr N --rounds N\n", name)
+	case "review_threads_appeared":
+		// NOT terminal: the job is long finished, but the PR just gained
+		// findings that nothing will answer, because every review verb needs a
+		// live round and the campaign was consumed (ADR-0012 follow-up).
+		fmt.Printf("NEW REVIEW THREADS AFTER THE CAMPAIGN CLOSED — %s: %s\n", name, info)
+		fmt.Printf("LLM: these have NO answering round: the campaign is one-shot and every\n")
+		fmt.Printf("review verb requires a live round, so they will sit unanswered until a\n")
+		fmt.Printf("new campaign is armed. Start one:\n")
+		fmt.Printf("  pi-supervisor review %s --pr <N>\n", name)
+		fmt.Printf("Then triage with the shim's list_threads, answer each thread inline, and\n")
+		fmt.Printf("resolve it. Do NOT merge on the strength of a clean earlier campaign.\n")
+		fmt.Printf("  re-arm: pi-supervisor watch %s\n", name)
 	case "review_gate_error":
 		fmt.Printf("Review state unreadable — %s: %s\n", name, info)
 		fmt.Printf("LLM: the campaign is still running; this is a read failure, not a verdict.\n")
@@ -478,6 +490,7 @@ func newRootCmd() *cobra.Command {
 		newReloadCmd(),
 		newWatchCmd(),
 		newReviewCmd(),
+		newReviewRecheckCmd(),
 		newAckCmd(),
 		newReviewActionCmd(),
 		newVersionCmd(),
