@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -166,8 +167,102 @@ func TranscriptContains(path, marker string) bool {
 	if marker == "" {
 		return false
 	}
-	return strings.Contains(TranscriptAssistantText(path, TranscriptWindow), marker)
+	return textEmitsMarker(TranscriptAssistantText(path, TranscriptWindow), marker)
 }
+
+// textEmitsMarker reports whether assistant text EMITS the marker, as opposed to
+// merely containing the string.
+//
+// It is a line-anchored match, not strings.Contains, because the two are
+// indistinguishable by substring and only one of them means the work is done.
+// This caused a real false-positive completion on mealime-userrecipes
+// (2026-10-05): the job reported `state: done`, `marker_found: true`, report
+// present — while T6-T9 were unimplemented. The agent had written:
+//
+//	"ALL_MEALIME_USERRECIPES_DONE deliberately **not** emitted: T6-T9 are incomplete."
+//
+// A bare substring matched that sentence, the gate closed, and four rounds of
+// real work were silently discarded: a done job stops looping, so the next round
+// never ran. The agent was REPORTING the incomplete state, and the supervisor
+// read it as completion.
+//
+// The rule is NOT "the marker occupies a line by itself". Real transcripts do
+// not look like that: ADR-0011's own regression tests carry
+// "Done. ALL_MEALIME_ROOMUX_DONE" and "still complete: ALL_MEALIME_ROOMUX_DONE",
+// and a real mealime-roomux transcript emitted "## ALL_MEALIME_ROOMUX_DONE". A
+// position rule rejects markers that genuinely completed the work.
+//
+// The rule is about NEGATION and QUOTATION, which is what actually
+// distinguishes the false positive:
+//
+//	ALL_DONE                                  -> completion
+//	ALL_DONE deliberately NOT emitted: ...     -> a report of incompletion
+//	the brief says to emit ALL_DONE            -> explaining the marker
+//	don't emit the marker until ...            -> deferring it
+//
+// So a mention counts UNLESS the same line declines or defers it. That is
+// deliberately one-directional: a missed marker costs one extra round and is
+// recoverable, while a false "done" silently discards the remaining work.
+func textEmitsMarker(text, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	for line := range strings.Lines(text) {
+		if !strings.Contains(line, marker) {
+			continue
+		}
+		if !mentionIsRefused(line, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// mentionIsRefused reports whether a line that CONTAINS the marker actually
+// declines or defers emitting it. Scoped to the text around the marker, so a
+// negation elsewhere in the same long paragraph does not veto a real emission.
+func mentionIsRefused(line, marker string) bool {
+	idx := strings.Index(line, marker)
+	// Window: from the start of the line to a little past the marker, so
+	// "deliberately NOT emitted" AFTER it is caught, plus a short look back for
+	// "do not emit ALL_DONE" BEFORE it.
+	lo := max(idx-64, 0)
+	hi := min(idx+len(marker)+48, len(line))
+	window := line[lo:hi]
+
+	for _, re := range markerRefusalRes {
+		if re.MatchString(window) {
+			return true
+		}
+	}
+	// An explicit "not emitted" / "do not emit" anywhere in the window.
+	if markerRefusalRe.MatchString(window) {
+		return true
+	}
+	return false
+}
+
+// markerRefusalRes are the ways an agent says "I am NOT emitting this", captured
+// only in a window around the marker mention. Every entry is a NEGATION or a
+// deferral, so a plain completion sentence can never match one.
+var markerRefusalRes = []*regexp.Regexp{
+	// "ALL_DONE deliberately NOT emitted", "marker was not emitted"
+	regexp.MustCompile(`(?i)\b(?:not|isn't|wasn't|never)\s+emitted\b`),
+	// "deliberately NOT done", "explicitly NOT emitted"
+	regexp.MustCompile(`(?i)\b(?:deliberately|explicitly|intentionally)\s+(?:\**\s*)?(?:not|never)\b`),
+	// "do not emit", "don't emit", "without emitting"
+	regexp.MustCompile(`(?i)\b(?:do\s+not|don'?t|never|without)\s+(?:\w+\s+){0,2}emit\b`),
+	// "T6-T9 are NOT done", "remain incomplete" next to the marker
+	regexp.MustCompile(`(?i)\b(?:are|is|remain|remains)\s+(?:\**\s*)?(?:not|isn't|wasn't)\s+(?:done|complete|finished)\b`),
+	// "the brief says to emit ALL_DONE" — quoting instructions, not emitting
+	regexp.MustCompile(`(?i)\b(?:brief|prompt|instructions?|rule)\s+(?:says?|says\s+to|requires?|instructs?)\b`),
+	// "should emit", "must emit" — describing a rule
+	regexp.MustCompile(`(?i)\b(?:should|must|when\s+to)\s+emit\b`),
+}
+
+// markerRefusalRe is the bare "not emitted" form, kept separate so the intent is
+// readable at the call site.
+var markerRefusalRe = regexp.MustCompile(`(?i)\bnot\s+emitted\b`)
 
 // TranscriptWatcher incrementally tails a transcript and latches when the
 // marker first appears in assistant text. It is the streaming form of
