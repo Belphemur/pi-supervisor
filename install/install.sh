@@ -50,26 +50,29 @@ if ! command -v pi-supervisor >/dev/null 2>&1; then
   echo "          add it, or export PI_SUPERVISOR_BIN=${BIN_DIR}/pi-supervisor"
 fi
 
-# The post-push hook (ADR-0012 follow-up) is the push-as-trigger path: a push
-# makes the daemon compare each job's review baseline against the PR's current
-# open-thread count. Installed into the SUPERVISOR repo's own worktree, because
-# that is the repository whose review findings we care about; other repos get
-# the hook by copying install/hooks/post-push into their .git/hooks.
-echo "==> post-push review re-check hook"
-HOOK_SRC="${REPO_DIR}/install/hooks/post-push"
-if [ -f "$HOOK_SRC" ] && git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  HOOK_DIR="$(git -C "$REPO_DIR" rev-parse --git-common-dir)/hooks"
-  install -d "$HOOK_DIR"
-  if [ -e "${HOOK_DIR}/post-push" ] && ! grep -q 'pi-supervisor: post-push hook' "${HOOK_DIR}/post-push" 2>/dev/null; then
-    echo "    note: an existing post-push hook is present; leaving it alone."
-    echo "          merge install/hooks/post-push into it by hand if you want both."
-  else
-    install -m 0755 "$HOOK_SRC" "${HOOK_DIR}/post-push"
-    echo "    installed ${HOOK_DIR}/post-push"
-  fi
-else
-  echo "    skipped (not a git checkout, or hook source missing)"
+# Hooks (ADR-0012 follow-up). This repo sets core.hooksPath=.githooks, where
+# BOTH hooks are tracked in git:
+#
+#   pre-push   the compensating control for the unapplied ruleset (see below)
+#   post-push  asks the daemon to compare each job's review baseline against the
+#              PR's current open-thread count, because a push is what makes bots
+#              re-review and new findings appear
+#
+# Nothing is copied: git runs the tracked files directly. The earlier version
+# installed into .git/hooks, which git NEVER executed here, so the hook was
+# installed and inert.
+echo "==> git hooks"
+HOOKS_PATH="$(git -C "$REPO_DIR" config core.hooksPath || true)"
+if [ "$HOOKS_PATH" != ".githooks" ]; then
+  git -C "$REPO_DIR" config core.hooksPath .githooks
+  echo "    set core.hooksPath=.githooks (was: ${HOOKS_PATH:-unset})"
 fi
+for hook in pre-push post-push; do
+  if [ -f "${REPO_DIR}/.githooks/${hook}" ]; then
+    chmod +x "${REPO_DIR}/.githooks/${hook}"
+    echo "    active: .githooks/${hook}"
+  fi
+done
 
 echo "==> enabling service"
 systemctl --user daemon-reload
