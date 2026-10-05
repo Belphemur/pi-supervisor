@@ -59,8 +59,13 @@ func (c *reviewClients) get(ctx context.Context, owner, repo string) (*review.Cl
 // how a decision bug can ship with a green suite.
 //
 // Production never reassigns it.
-var listOpenThreads = func(ctx context.Context, owner, repo string, pr int) (int, error) {
-	cl, err := review.NewClient(ctx, owner, repo)
+// It is bound to a Supervisor in New() rather than reading the package-level
+// default, so it can reuse s.reviewClient — the per-repo client CACHE. Building a
+// client per call instead re-resolved the GitHub App installation token every
+// time, which is exactly the multiply-the-credential-traffic cost the cache
+// exists to avoid, and this runs once per round per job.
+var listOpenThreads = func(s *Supervisor, ctx context.Context, owner, repo string, pr int) (int, error) {
+	cl, err := s.reviewClient(ctx, owner, repo)
 	if err != nil {
 		return 0, err
 	}

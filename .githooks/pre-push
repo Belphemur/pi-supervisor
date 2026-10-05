@@ -1,6 +1,44 @@
 #!/usr/bin/env bash
-# pre-push — refuse a push when the local gates fail.
+# pre-push — pi-supervisor's review re-check, plus the local gate.
 #
+# WHY HERE AND NOT "post-push": git has NO post-push hook. githooks(5) lists
+# pre-push, post-receive, post-update, post-rewrite, post-merge and others, but
+# nothing that fires after a successful push. An earlier version of this file was
+# named post-push and therefore NEVER RAN — it was installed, reported active, and
+# silently did nothing on every push. Both CodeRabbit and kody-ai caught it.
+#
+# pre-push DOES run, but it runs BEFORE the objects leave, so:
+#   - it must never block: any non-zero exit aborts the push, so everything here
+#     is advisory and the script ends with an explicit `exit 0`;
+#   - it must never slow the push: the re-check is backgrounded, because it
+#     dials GitHub and can take seconds.
+#
+# Why a push is the right trigger for review re-checks: bots re-review the whole
+# diff after every push, so a campaign that closed clean can attract new findings
+# minutes later with no live round to answer them (ADR-0012 follow-up). A push is
+# a real event, so this stays event-driven — no ticker, no quota burn, and
+# AGENTS.md invariant 6 intact.
+#
+# The real gate (build/vet/test/lint) lives in .githooks/pre-push's sibling
+# implementation below; this file chains to it so both run.
+
+set -uo pipefail
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$repo_root" || exit 0
+
+# --- advisory: ask the daemon whether this PR gained review findings ----------
+# Only for a push to origin: a push to a fork cannot change the upstream PR's
+# review state, and dialling GitHub for it would be wasted.
+if [ "${1:-}" = "origin" ]; then
+  if command -v pi-supervisor >/dev/null 2>&1; then
+    # Detached and non-blocking. --pushed scopes the fan-out to jobs whose review
+    # PR belongs to this repository, so one push touches only the jobs whose
+    # review state could have changed.
+    ( pi-supervisor review-recheck --pushed >/dev/null 2>&1 || true ) &
+  fi
+fi
+
+# --- the compensating control for the unapplied ruleset ----------------------
 # WHY THIS EXISTS. The repo's ruleset (.github/rulesets/master-gate.json) is
 # committed but NOT applied: GitHub gates both branch protection and rulesets
 # behind Pro for private repositories. CI therefore *runs* on every push but does
@@ -11,18 +49,10 @@
 # between the two is a gate nobody can trust. Anything added to one belongs in
 # the other.
 #
-# Install:  git config core.hooksPath .githooks
-# Bypass:   git push --no-verify      (the escape hatch, deliberately explicit)
-set -uo pipefail
-
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
-cd "$repo_root" || exit 0
-
-# Remote-only refs on the first push of a branch have no upstream to compare
-# against; the gates still run, so nothing is skipped here.
+# Bypass:   git push --no-verify      (deliberately explicit)
 
 fail=0
-step() { printf '\n── %s\n' "$1"; }
+step() { printf '\n-- %s\n' "$1"; }
 
 step "build"
 go build ./... || fail=1
@@ -45,6 +75,7 @@ fi
 step "shell syntax"
 bash -n install/install.sh || fail=1
 bash -n doc/skill/pi_supervisor_review/_pi-supervisor-review || fail=1
+bash -n .githooks/pre-push || fail=1
 
 step "test -race"
 # Skippable for a fast push when the tree is unchanged; -race is the default
@@ -59,13 +90,14 @@ if command -v golangci-lint >/dev/null 2>&1; then
     step "golangci-lint"
     golangci-lint run ./... || fail=1
 else
-    echo "── golangci-lint not on PATH; skipping (CI runs it)"
+    echo "-- golangci-lint not on PATH; skipping (CI runs it)"
 fi
 
 printf '\n'
 if [ "$fail" -ne 0 ]; then
-    echo "PUSH REFUSED — a gate failed above."
+    echo "PUSH REFUSED - a gate failed above."
     echo "Fix, or bypass deliberately with: git push --no-verify"
     exit 1
 fi
 echo "pre-push: all gates pass"
+exit 0

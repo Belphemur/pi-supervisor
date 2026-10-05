@@ -93,7 +93,7 @@ func (s *Supervisor) recheckThreads(name string) {
 	head := s.headSHA(r)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	openNow, err := listOpenThreads(ctx, bl.Owner, bl.Repo, bl.PR)
+	openNow, err := s.listOpen(ctx, bl.Owner, bl.Repo, bl.PR)
 	if err != nil {
 		s.logf(name, "thread re-check failed: %v", err)
 		return
@@ -242,31 +242,32 @@ func (s *Supervisor) RecheckThreadsAll(ctx context.Context, pushed bool, repoSlu
 
 // originRepo reads owner/name from a job worktree's origin remote. Used to
 // scope a push-triggered re-check to the repo that was actually pushed.
+//
+// s.jobs is read under s.mu and the map is COPIED before iterating: ranging a
+// live map without the lock is a data race, and LoadJobs deletes from it while a
+// re-check may be running.
 func (s *Supervisor) originRepo() (owner, repo string) {
 	s.mu.Lock()
-	r := s.jobs[s.anyJobName()]
-	wt := ""
-	if r != nil {
-		r.mu.Lock()
-		wt = r.job.Worktree
-		r.mu.Unlock()
+	worktrees := make([]string, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		j.mu.Lock()
+		if j.job.Worktree != "" {
+			worktrees = append(worktrees, j.job.Worktree)
+		}
+		j.mu.Unlock()
 	}
 	s.mu.Unlock()
-	if wt == "" {
-		// Fall back to any job's worktree: the repos are usually shared.
-		s.mu.Lock()
-		for _, j := range s.jobs {
-			j.mu.Lock()
-			if j.job.Worktree != "" {
-				wt = j.job.Worktree
-			}
-			j.mu.Unlock()
-			if wt != "" {
-				break
-			}
+	for _, wt := range worktrees {
+		if owner, repo = parseGitHubRemote(wt); owner != "" {
+			return owner, repo
 		}
-		s.mu.Unlock()
 	}
+	return "", ""
+}
+
+// parseGitHubRemote resolves a worktree's origin remote to owner/name, or
+// ("","") when it is absent, unreadable, or not a GitHub remote we can split.
+func parseGitHubRemote(wt string) (owner, repo string) {
 	if wt == "" {
 		return "", ""
 	}
@@ -292,14 +293,6 @@ func (s *Supervisor) originRepo() (owner, repo string) {
 		return owner, repo
 	}
 	return "", ""
-}
-
-// anyJobName returns an arbitrary loaded job name, or "".
-func (s *Supervisor) anyJobName() string {
-	for n := range s.jobs {
-		return n
-	}
-	return ""
 }
 
 func intOf(v any) int {
@@ -362,7 +355,7 @@ func (s *Supervisor) RecheckThreads(ctx context.Context, name string) (any, erro
 		return nil, review.ErrUsage("the recorded review baseline for %s names no PR; re-arm the campaign", name)
 	}
 
-	openNow, err := listOpenThreads(ctx, bl.Owner, bl.Repo, bl.PR)
+	openNow, err := s.listOpen(ctx, bl.Owner, bl.Repo, bl.PR)
 	if err != nil {
 		return nil, err
 	}

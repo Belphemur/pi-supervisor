@@ -4,6 +4,7 @@
 package supervisor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +71,11 @@ type Supervisor struct {
 	// ghClients caches one GitHub client per owner/repo (ADR-0012). Lazy, so a
 	// daemon that never reviews never touches GitHub credentials.
 	ghClients *reviewClients
+	// listOpen counts a PR's OPEN review threads for the post-completion
+	// re-check. It is a field, not a direct package call, so it is bound to this
+	// Supervisor in New() and therefore reuses ghClients instead of resolving a
+	// fresh App installation token on every call.
+	listOpen func(ctx context.Context, owner, repo string, pr int) (int, error)
 	// reviewRounds is the default campaign budget (ADR-0012 §5); 0 = 5.
 	reviewRounds int
 	// reviewAckTimeoutDur bounds a pending bulk_resolve; 0 = 30m.
@@ -106,11 +112,18 @@ type runner struct {
 }
 
 func New() *Supervisor {
-	return &Supervisor{
+	s := &Supervisor{
 		jobs:      map[string]*runner{},
 		stop:      make(chan struct{}),
 		ghClients: newReviewClients(),
 	}
+	// Bind the re-check seam to THIS supervisor so it reuses the per-repo
+	// client CACHE (see listOpenThreads). Tests that stub the package var still
+	// take effect, because s.listOpen defers to it.
+	s.listOpen = func(ctx context.Context, owner, repo string, pr int) (int, error) {
+		return listOpenThreads(s, ctx, owner, repo, pr)
+	}
+	return s
 }
 
 func (s *Supervisor) logf(name, format string, args ...any) {
@@ -871,23 +884,20 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		if instant {
 			s.emit(name, "instant_exit", round, rc, dur, "", "instant exit strike %d/3 (rc=%d, %ds)", strikes, rc, dur)
 		}
-		// Post-completion thread re-check (ADR-0012 follow-up). Fired HERE,
-		// after the round is classified rather than at round start: a round
-		// START has r.active==true, and recheckThreads deliberately no-ops on
-		// an active job (its own in-flight replies would look like new
-		// findings). Triggering at the start therefore meant the automatic
-		// path could NEVER fire — the guard canceled it every time.
-		//
-		// A finished round is the honest push edge: the agent committed work,
-		// and any campaign that just closed is exactly the window where new
-		// bot findings appear. Still proportional to pushes, not wall-clock,
-		// so the push-only rule (invariant 6) holds.
-		go s.recheckThreads(name)
+		// The post-completion thread re-check is NOT fired here. This point is
+		// still inside the round, with r.active==true, and recheckThreads
+		// no-ops on an active job (a live campaign's own replies would be
+		// miscounted as new findings) — so a call from here, or from round
+		// start, would never perform a check. It fires from the completion
+		// gate instead, right after active goes false.
 		s.logf(name, "round %d: client exit=%d duration=%ds runlog=%dB", round, rc, dur, runlogB)
 		if r.stateSnapshot().LastDiag != "" {
 			s.logf(name, "round %d diagnostic: %s", round, r.stateSnapshot().LastDiag)
 		}
 
+		// closedJob records that THIS round ended the build job, which is the
+		// only moment the post-completion review re-check may run.
+		closedJob := false
 		// The marker gate (ADR-0011). The completion signal comes from the
 		// SESSION TRANSCRIPT — the streamed MarkerSeen latch, plus a direct
 		// scan as a belt-and-braces for a marker written after the last tick.
@@ -958,9 +968,17 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				r.review.round = r.state.Round
 			} else {
 				r.state.State, r.active = "done", false
+				// Done AND inactive: the only point the post-completion
+				// re-check can actually run (ADR-0012 follow-up). Started as a
+				// goroutine AFTER the lock is released below, since
+				// recheckThreads takes r.mu itself.
+				closedJob = true
 			}
 			r.mu.Unlock()
 			r.persistState()
+			if closedJob {
+				go s.recheckThreads(name)
+			}
 			s.logf(name, "round %d: marker %q detected in session transcript — done", round, j.Marker)
 			if autoArmed {
 				// Emit `reviewing`, NOT `done`. `done` is a TERMINAL event

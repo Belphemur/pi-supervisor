@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -175,6 +177,32 @@ func newReviewCmd() *cobra.Command {
 	return c
 }
 
+// originSlug resolves the CURRENT directory's git origin to owner/name. It is
+// the CLI-side twin of the daemon's originRepo, and it is what makes
+// `--pushed` mean "the repo I am standing in" rather than "some repo the daemon
+// happens to know about".
+func originSlug() (owner, repo string, ok bool) {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		return "", "", false
+	}
+	u := strings.TrimSpace(string(out))
+	for _, prefix := range []string{
+		"git@github.com:", "https://github.com/", "http://github.com/",
+		"ssh://git@github.com/",
+	} {
+		after, cut := strings.CutPrefix(u, prefix)
+		if !cut {
+			continue
+		}
+		o, r, split := strings.Cut(strings.TrimSuffix(after, ".git"), "/")
+		if split && o != "" && r != "" {
+			return o, r, true
+		}
+	}
+	return "", "", false
+}
+
 // reviewRecheckCtl sends a repo-wide re-check request and prints the per-job
 // verdicts. It goes through the same postReview transport as every other review
 // verb; only the fan-out across jobs lives in the daemon (it owns the job list
@@ -272,10 +300,21 @@ func newReviewRecheckCmd() *cobra.Command {
 			"jobs whose review state could have changed.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			slug := repoSlug
+			if pushed && slug == "" {
+				// Resolve HERE, in the caller's cwd. Left empty, the daemon
+				// falls back to an ARBITRARY job's worktree — which in a
+				// multi-repo daemon is the wrong repository, and the re-check
+				// then skips every job it should have checked while reporting
+				// a confident scope.
+				if o, r, ok := originSlug(); ok {
+					slug = o + "/" + r
+				}
+			}
 			return reviewRecheckCtl(map[string]any{
 				"cmd":    "review_recheck_all",
 				"pushed": pushed,
-				"repo":   repoSlug,
+				"repo":   slug,
 			}, asJSON)
 		},
 	}

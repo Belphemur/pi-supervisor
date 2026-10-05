@@ -15,7 +15,9 @@ import (
 func withThreadCount(t *testing.T, n int) {
 	t.Helper()
 	prev := listOpenThreads
-	listOpenThreads = func(context.Context, string, string, int) (int, error) { return n, nil }
+	listOpenThreads = func(*Supervisor, context.Context, string, string, int) (int, error) {
+		return n, nil
+	}
 	t.Cleanup(func() { listOpenThreads = prev })
 }
 

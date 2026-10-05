@@ -160,16 +160,58 @@ func (d *Detector) PRURL() string { return d.prURL }
 //
 // Returns "" when there is no link, which still means "not linked", never "no
 // PR exists".
+// It returns the LAST match, not the first: the streaming Detector reads
+// forward, so the most recent link is the one this run produced. Taking the
+// first would pick up the brief's own echo of a PR URL, or a link inside a tool
+// result the agent merely read, and hand autoReviewHandoff an unrelated PR to
+// campaign against.
+//
+// Only the tail of the file is read. A transcript grows monotonically, so
+// slurping all of it on every round-end would be O(rounds x transcript size) of
+// wasted I/O for a build job that never links a PR at all.
 func PRURLFrom(path string) string {
-	data, err := os.ReadFile(path)
+	return prURLFromSince(path, 0)
+}
+
+// prURLFromSince reads at most the last prURLTailBytes of path and returns the
+// last PR link in it, or "".
+func prURLFromSince(path string, _ int) string {
+	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
-	if m := prRe.Find(data); m != nil {
-		return string(m)
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return ""
 	}
-	return ""
+	start := int64(0)
+	if fi.Size() > prURLTailBytes {
+		start = fi.Size() - prURLTailBytes
+	}
+	buf := make([]byte, fi.Size()-start)
+	// A short read is fine: use whatever bytes arrived rather than failing the
+	// scrape, because a PR link near the tail is exactly what we came for.
+	n, _ := f.ReadAt(buf, start)
+	if n <= 0 {
+		return ""
+	}
+	buf = buf[:n]
+	// Trim to the first newline so a match cannot begin in a truncated line.
+	if i := bytes.IndexByte(buf, '\n'); i >= 0 && start > 0 {
+		buf = buf[i+1:]
+	}
+	all := prRe.FindAll(buf, -1)
+	if len(all) == 0 {
+		return ""
+	}
+	return string(all[len(all)-1])
 }
+
+// prURLTailBytes bounds the tail scan. Generous enough to reach back past a
+// short round's worth of output, small enough that a multi-megabyte transcript
+// is never fully read on the gate path.
+const prURLTailBytes = 512 << 10
 
 // EmptyTurnWindow is the quiet window that turns "alive but producing nothing"
 // into an empty-turn stall (ADR-0010): the transcript grew, but the agent

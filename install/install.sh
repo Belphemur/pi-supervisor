@@ -63,9 +63,15 @@ fi
 # installed and inert.
 echo "==> git hooks"
 HOOKS_PATH="$(git -C "$REPO_DIR" config core.hooksPath || true)"
-if [ "$HOOKS_PATH" != ".githooks" ]; then
+if [ -z "$HOOKS_PATH" ]; then
   git -C "$REPO_DIR" config core.hooksPath .githooks
-  echo "    set core.hooksPath=.githooks (was: ${HOOKS_PATH:-unset})"
+  echo "    set core.hooksPath=.githooks (was: unset)"
+elif [ "$HOOKS_PATH" != ".githooks" ]; then
+  # NEVER overwrite an existing hooks path: doing so silently disables whatever
+  # hooks the developer already had there (pre-commit, commit-msg, ...).
+  # Point at ours explicitly instead, and say so.
+  echo "    core.hooksPath is '$HOOKS_PATH' — leaving it alone."
+  echo "    to activate ours too: git config core.hooksPath .githooks"
 fi
 for hook in pre-push post-push; do
   if [ -f "${REPO_DIR}/.githooks/${hook}" ]; then
