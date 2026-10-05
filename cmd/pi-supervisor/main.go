@@ -484,7 +484,7 @@ func cleanTaskText(s string) string {
 		// C0 controls except the handled whitespace above.
 		r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0)) {
 			if r != '\n' && r != '\r' && r != '\t' {
-				b.WriteString(fmt.Sprintf("\\x%02x", r))
+				fmt.Fprintf(&b, "\\x%02x", r)
 				continue
 			}
 		}

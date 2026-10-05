@@ -242,13 +242,14 @@ func (r *runner) snapshot() job.Status {
 			st.SessionAgeS = time.Since(fi.ModTime()).Seconds()
 		}
 	}
+	// Truthful mid-round, not just after classification (ADR-0011). Read under
+	// the same lock as every other state field.
+	st.MarkerFound = r.state.State == "done" || r.state.MarkerSeen
 	r.mu.Unlock()
 	// Task counts read ON DEMAND with NO lock held: one open-read of the
 	// plugin's current store (owner amendment). Never a ticker, never a
 	// second watcher, never derived from completion events.
 	st.Tasks = taskProgress(sessCopy, wtCopy)
-	// Truthful mid-round, not just after classification (ADR-0011).
-	st.MarkerFound = r.state.State == "done" || r.state.MarkerSeen
 	return st
 }
 
@@ -1172,11 +1173,14 @@ func taskProgress(sess, worktree string) *job.TaskProgress {
 	if tgt.Unavailable {
 		path = ""
 	}
-	kind := fault.KindTaskStoreMissing
-	if why == taskwatch.ReasonMemoryStore {
+	var kind fault.Kind
+	switch why {
+	case taskwatch.ReasonMemoryStore:
 		kind = fault.KindTaskStoreMemory
-	} else if why == taskwatch.ReasonInvalidData {
+	case taskwatch.ReasonInvalidData:
 		kind = fault.KindTaskStoreInvalid
+	default:
+		kind = fault.KindTaskStoreMissing
 	}
 	return &job.TaskProgress{
 		Completed: completed, Total: total,

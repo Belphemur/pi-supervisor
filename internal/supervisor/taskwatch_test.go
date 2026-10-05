@@ -274,6 +274,9 @@ func TestSessionIsolationForSharedTaskID(t *testing.T) {
 	for gotA == "" || gotB == "" {
 		select {
 		case e := <-chA:
+			if e.Job != "isoA" {
+				continue // Watch subscribes to all jobs; filter here
+			}
 			if e.Event == "task_completed" {
 				if e.Task == nil {
 					t.Fatal("A: nil task")
@@ -281,6 +284,9 @@ func TestSessionIsolationForSharedTaskID(t *testing.T) {
 				gotA = e.Task.Subject
 			}
 		case e := <-chB:
+			if e.Job != "isoB" {
+				continue
+			}
 			if e.Event == "task_completed" {
 				if e.Task == nil {
 					t.Fatal("B: nil task")
@@ -320,9 +326,17 @@ func TestStopDoesNotStallOnPendingObservations(t *testing.T) {
 	if d := time.Since(start); d > 10*time.Second {
 		t.Fatalf("stop blocked %s on task watch teardown", d)
 	}
-	for e := range ch {
-		if e.Event == "task_completed" && e.Round == 0 {
-			t.Fatal("a late task event carried round 0")
+	// No late task event may be attributed to round 0. Bounded listen: the
+	// watch channel is never closed by design, so a plain `range` would hang.
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case e := <-ch:
+			if e.Event == "task_completed" && e.Round == 0 {
+				t.Fatal("a late task event carried round 0")
+			}
+		case <-deadline:
+			return
 		}
 	}
 }

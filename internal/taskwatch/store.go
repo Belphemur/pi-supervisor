@@ -321,7 +321,7 @@ func LookupStore(path, taskID string) (TaskInfo, bool, string, Target) {
 }
 
 // Lookup reads the CURRENT store on demand (open-by-name, never a held
-// handle, so the plugin's atomic rename is honoured), validates the
+// handle, so the plugin's atomic rename is honored), validates the
 // envelope, and returns (info, ok) plus the symbolic failure reason when not
 // ok. Reasons come from internal/fault kinds; the mapping lives in the
 // supervisor layer so this package stays free of it.
@@ -396,7 +396,7 @@ func (r Resolver) Counts() (int, int, string) {
 }
 
 // readSnapshot opens the store BY PATH at call time (so the plugin's atomic
-// rename is honoured), validates the envelope, and returns the snapshot with
+// rename is honored), validates the envelope, and returns the snapshot with
 // a symbolic reason on failure ("" = ok). Memory/missing targets and unsafe
 // file types fail closed; reads are bounded. No locks taken, no writes.
 func readSnapshot(tgt Target) (snapshotJSON, string) {

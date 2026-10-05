@@ -85,6 +85,9 @@ func All() []Kind {
 		KindBadRequest, KindBadJSON, KindUnknownCmd, KindUnsupported, KindRefused,
 		KindNoLiveRound, KindRoundMismatch, KindNotAnswered, KindUnknownThread,
 		KindAuthUnavailable, KindRateLimited, KindGitHubError, KindUsage,
+		KindTaskStoreMissing, KindTaskStoreMemory, KindTaskStoreInvalid,
+		KindTaskMissing, KindTaskAmbiguous, KindTaskNotCompleted,
+		KindTaskBadInput, KindTaskNoIdentity,
 	}
 }
 

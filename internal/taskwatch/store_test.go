@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// writeStore produces a plugin-shaped tasks file: tmp+rename is honoured as a
+// writeStore produces a plugin-shaped tasks file: tmp+rename is honored as a
 // plain write here, because lookup itself only ever opens by NAME.
 func writeStore(t *testing.T, path, json string) string {
 	t.Helper()

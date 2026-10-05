@@ -75,7 +75,7 @@ func TestStatusShowsTaskCountsForStoppedJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := snapAny.(job.Status)
+	st, _ := snapAny.(job.Status)
 	if st.Tasks == nil {
 		t.Fatal("status must expose structured task progress")
 	}
@@ -103,7 +103,7 @@ func TestStatusTaskCountsFallbackOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := snapAny.(job.Status)
+	st, _ := snapAny.(job.Status)
 	if st.Tasks == nil {
 		t.Fatal("status must still expose task progress (the fallback) on failure")
 	}
@@ -131,7 +131,7 @@ func TestStatusTaskCountsUnavailableWithoutIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapAny, _ := s.Status("noid")
-	st := snapAny.(job.Status)
+	st, _ := snapAny.(job.Status)
 	if st.Tasks == nil || st.Tasks.Reason == "" {
 		t.Fatalf("unavailable identity must surface with a reason: %+v", st.Tasks)
 	}
@@ -143,7 +143,7 @@ func TestStatusTaskCountsUnavailableWithoutIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapAny2, _ := s.Status("emptyok")
-	st2 := snapAny2.(job.Status)
+	st2, _ := snapAny2.(job.Status)
 	if st2.Tasks == nil || st2.Tasks.Completed != 0 || st2.Tasks.Total != 0 || st2.Tasks.Reason != "" {
 		t.Fatalf("valid empty list must be 0/0 with no error: %+v", st2.Tasks)
 	}

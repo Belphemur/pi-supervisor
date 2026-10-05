@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -15,10 +14,7 @@ const fakeTaskUpdateSession = `TEST_TASKWATCH`
 
 // drainObs collects observations from a channel.
 type obsSink struct {
-	mu   sync.Mutex
-	obs  []Observation
-	stop bool
-	ch   chan Observation
+	ch chan Observation
 }
 
 func newObsSink() *obsSink {
