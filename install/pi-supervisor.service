@@ -9,6 +9,9 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/pi-supervisor run
 Restart=on-failure
 RestartSec=5
+# A child OOM kill must not stop the supervisor and unrelated jobs.
+# Main-process death is still recovered by Restart=on-failure.
+OOMPolicy=continue
 # Watchdog: the daemon pings WATCHDOG=1 at half this interval (internal/notify).
 WatchdogSec=120
 
