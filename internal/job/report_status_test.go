@@ -123,6 +123,14 @@ func TestReportFollowUpDeclarationStillFires(t *testing.T) {
 		"A follow-up run will be needed to finish T6-T9.\n",
 		"A follow-up run needs to be done: T6-T9 are not implemented.\n",
 		"A follow-up run needs to import the new table.\n",
+		// A colon value that STARTS with a no-follow-up word but is a real
+		// declaration. Matching the marker as a prefix swallowed this and closed
+		// the job done.
+		"A follow-up run is needed: none of T6-T9 are implemented.\n",
+		// Emphasis between the keyword and the colon is how agents bold a
+		// declaration; requiring only spaces there dropped it.
+		"**Follow-up needed**: T6-T9 are not implemented.\n",
+		"**Follow-up required**: finish T6-T9.\n",
 	} {
 		dir := t.TempDir()
 		p := filepath.Join(dir, "r.md")
@@ -135,8 +143,65 @@ func TestReportFollowUpDeclarationStillFires(t *testing.T) {
 	}
 }
 
-// The two forms kody/qodo flagged as ambiguous, which must NOT fire because they
-// name no required action. Both would divert a finished job into extra rounds.
+// Emphasis must not decide the answer, in EITHER direction. Agents bold whatever
+// word they feel like bolding, and two review rounds in a row found an emphasis
+// placement that one code path handled and another dropped. So the same sentence
+// is exercised with the emphasis moved around it, and both outcomes are asserted
+// — the parser strips emphasis once, up front, so no pattern can be "the one that
+// forgot bolding".
+func TestReportFollowUpEmphasisIsIrrelevant(t *testing.T) {
+	fires := []string{
+		"A follow-up run is needed to implement T6-T9.\n",
+		"**A follow-up run is needed to implement T6-T9.**\n",
+		"A **follow-up** run is needed to implement T6-T9.\n",
+		"A follow-up run is **needed** to implement T6-T9.\n",
+		"A follow-up run is needed **to** implement T6-T9.\n",
+		"**Follow-up needed**: T6-T9 are not implemented.\n",
+		"**Follow-up needed:** T6-T9 are not implemented.\n",
+		"__Follow-up needed__: T6-T9 are not implemented.\n",
+		"## **Follow-up needed**: T6-T9 are not implemented.\n",
+		"### _Follow-up needed_: T6-T9 are not implemented.\n",
+		"A follow-up run needs to import the new table.\n",
+		"A follow-up run **needs** to import the new table.\n",
+		"**Follow-up required**: finish T6-T9.\n",
+		"A follow-up run is needed: none of T6-T9 are implemented.\n",
+	}
+	for _, body := range fires {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "r.md")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, bad := ReportDeclaresIncomplete(p); !bad {
+			t.Errorf("emphasis bypassed a real declaration: %q", body)
+		}
+	}
+
+	quiet := []string{
+		"## Repo facts a follow-up run needs\n",
+		"**## Repo facts a follow-up run needs**\n",
+		"- **Follow-up needed**: none\n",
+		"- Follow-up needed: **none**\n",
+		"- Follow-up needed: N/A\n",
+		"- Follow-up needed: **N/A**\n",
+		"- Follow-up needed: nothing\n",
+		"- Follow-up needed: not needed\n",
+		"The next run should rebase onto main.\n",
+	}
+	for _, body := range quiet {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "r.md")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if phrase, bad := ReportDeclaresIncomplete(p); bad {
+			t.Errorf("emphasis turned a no-action line into a declaration: %q (matched %q)", body, phrase)
+		}
+	}
+}
+
+// The exact ambiguous forms qodo/kody raised, kept as their own test: a heading
+// that ENDS in "needs" with body text beneath it, and a lowercase "n/a".
 func TestReportAmbiguousFollowUpNotFlagged(t *testing.T) {
 	for _, body := range []string{
 		// A documentation heading ending in "needs" (qodo PR #5).
@@ -144,6 +209,8 @@ func TestReportAmbiguousFollowUpNotFlagged(t *testing.T) {
 		// A bullet whose whole point is that there is NOTHING to do.
 		"- Follow-up needed: none\n",
 		"- Follow-up needed: n/a\n",
+		"- Follow-up needed: nothing\n",
+		"**Follow-up needed**: none\n",
 		// Speculative handoff prose naming no required action.
 		"The next run should rebase onto main.\n",
 	} {
