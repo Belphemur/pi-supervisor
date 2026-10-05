@@ -405,7 +405,17 @@ func TailLines(path string, n, maxChars int) []string {
 
 // RunlogContains reports whether the marker appears in the run log's last
 // 4KB window (same window semantics as the bash supervisor).
+//
+// The EMITS rule, not strings.Contains: the run log is one of the three
+// surfaces the completion gate accepts, so a marker that was QUOTED or
+// declined on stdout — "ALL_DONE deliberately not emitted" — must not count,
+// exactly as it must not count from the transcript. Same predicate, different
+// window; a quoted marker here would complete the job through a third door
+// after the transcript's two were closed.
 func RunlogContains(path, marker string) bool {
+	if marker == "" {
+		return false
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return false
@@ -420,7 +430,7 @@ func RunlogContains(path, marker string) bool {
 	if _, err := f.ReadAt(buf, off); err != nil && !errors.Is(err, io.EOF) {
 		return false
 	}
-	return strings.Contains(string(buf), marker)
+	return textEmitsMarker(string(buf), marker)
 }
 
 // LastLines returns the final n lines of a file.

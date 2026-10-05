@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"sync"
 	"time"
 )
 
@@ -149,82 +150,175 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 // if the agent has not linked one (ADR-0006).
 func (d *Detector) PRURL() string { return d.prURL }
 
-// PRURLFrom scans a whole transcript for a pull-request URL, starting at the
-// beginning of the file.
+// PRURLScanner finds the last PR link in a transcript that is still growing.
 //
-// It exists because the streaming Detector only sees bytes appended after
-// New(), and the Detector is only constructed once a transcript path is pinned.
-// On a fresh LAUNCH — where the agent opens its PR and finishes in the same
-// round — that meant nothing ever scraped the link, and the review auto-trigger
-// skipped a job whose transcript plainly contained it (ADR-0006).
+// It exists because the two obvious implementations are each wrong in one
+// direction, and BOTH shipped here first:
 //
-// Returns "" when there is no link, which still means "not linked", never "no
-// PR exists".
-// It returns the LAST match, not the first: the streaming Detector reads
-// forward, so the most recent link is the one this run produced. Taking the
-// first would pick up the brief's own echo of a PR URL, or a link inside a tool
-// result the agent merely read, and hand autoReviewHandoff an unrelated PR to
-// campaign against.
+//   - tail-only: cheap, but drops a link written more than prURLTailBytes from
+//     the end, so a long job that opened its PR early and then emitted megabytes
+//     of CI output reported "not linked" — the exact ADR-0006 failure the scrape
+//     exists to prevent;
+//   - whole-file: correct, but re-read a monotonically growing file on every
+//     round for a job that never links a PR — O(rounds x transcript size).
 //
-// Only the tail of the file is read. A transcript grows monotonically, so
-// slurping all of it on every round-end would be O(rounds x transcript size) of
-// wasted I/O for a build job that never links a PR at all.
-func PRURLFrom(path string) string {
-	return prURLFromSince(path, 0)
+// So it scans INCREMENTALLY: it remembers the offset already read and only ever
+// reads forward. The window bounds a SINGLE read; the offset bounds the TOTAL. A
+// transcript is append-only, so bytes already scanned cannot change meaning, and
+// a truncate/rotate (size below the offset) resets it.
+//
+// A scanner is per-transcript and safe for concurrent use; give each job its own.
+// Returns "" when there is no link, which still means "not linked", never "no PR
+// exists".
+type PRURLScanner struct {
+	mu       sync.Mutex
+	path     string
+	offset   int64
+	lastSize int64
+	lastIno  uint64
+	last     string
 }
 
-// prURLFromSince reads at most the last prURLTailBytes of path and returns the
-// last PR link in it, or "".
-func prURLFromSince(path string, _ int) string {
-	f, err := os.Open(path)
+// NewPRURLScanner starts a scanner for one transcript path.
+func NewPRURLScanner(path string) *PRURLScanner {
+	return &PRURLScanner{path: path}
+}
+
+// Path is the transcript this scanner reads, so a caller holding one per job can
+// tell whether it still matches the job's current session (a restart or
+// `restart --fresh` changes it).
+func (s *PRURLScanner) Path() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path
+}
+
+// prOverlapBytes is how far back each incremental read reaches before the recorded
+// offset. It exists so a link STRADDLING a read boundary is never split: the
+// overlap is re-scanned and the match found whole. A PR URL is far shorter.
+const prOverlapBytes = 4 << 10
+
+// PRURL returns the last PR link found so far, reading only bytes appended since
+// the previous call.
+func (s *PRURLScanner) PRURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	fi, err := os.Stat(s.path)
 	if err != nil {
-		return ""
+		return s.last
 	}
-	defer func() { _ = f.Close() }()
-	fi, err := f.Stat()
-	if err != nil {
-		return ""
+	size := fi.Size()
+	ino, inoOK := inodeOf(fi)
+	if size < s.offset {
+		// Truncated or rotated: the old bytes are gone and the offset is
+		// meaningless, so start over rather than read from a bogus position.
+		s.offset, s.last, s.lastSize, s.lastIno = 0, "", 0, ino
 	}
-	start := int64(0)
-	if fi.Size() > prURLTailBytes {
-		start = fi.Size() - prURLTailBytes
+	// Detect a REPLACEMENT, not just a shrink. A rewrite or rotation can produce a
+	// different file of EXACTLY the same length, which no size comparison can see:
+	// the first attempt asserted fi.Sys() against an Ino() METHOD interface, but on
+	// every Unix Ino is a FIELD of *syscall.Stat_t, so the assertion matched
+	// nothing and the check was dead code (found by live probe: iface=false,
+	// stat_t=true) — and a size-heuristic variant was wrong in the other direction,
+	// because a caught-up scanner sits at offset==size and never satisfies
+	// "offset behind". The inode is the signal that works, compared BEFORE it is
+	// recorded; lastIno==0 means "first observation, nothing to compare yet".
+	//
+	// Where the platform hides the inode, the scanner degrades to trusting size —
+	// the pre-inode behavior, never a failure.
+	if inoOK && s.lastIno != 0 && ino != s.lastIno {
+		s.rewind()
+		s.lastIno = ino
 	}
-	buf := make([]byte, fi.Size()-start)
-	// A short read is fine: use whatever bytes arrived rather than failing the
-	// scrape, because a PR link near the tail is exactly what we came for.
-	n, _ := f.ReadAt(buf, start)
+	if inoOK {
+		s.lastIno = ino
+	}
+	if size == s.lastSize && s.offset >= size {
+		return s.last // nothing appended since the last call
+	}
+
+	// Read FORWARD from the offset in bounded chunks, never jumping to the tail.
+	//
+	// Jumping to the tail skipped the middle: when more than one chunk arrived
+	// between two calls, every byte in [offset, size-chunk] was never scanned, so
+	// a link written there was lost forever — the ADR-0006 failure again, for a
+	// job that emits a lot in a single round. The chunk bounds a SINGLE read; the
+	// offset bounds the TOTAL, so correctness never depends on one append being
+	// small.
+	readTo := min(s.offset+prURLChunkBytes, size)
+	// Re-read a little before the offset so a link straddling a chunk boundary is
+	// not split. A PR URL is far shorter than the overlap.
+	from := s.offset
+	if from > prOverlapBytes {
+		from -= prOverlapBytes
+	}
+
+	buf := make([]byte, readTo-from)
+	n, _ := readFileAt(s.path, buf, from)
+	// Commit the offset to the raw end of what was read — NOT to the last
+	// complete line. Line bookkeeping here was tried and both variants fail:
+	// committing from+n lands mid-line, so the partial-line trim had to exist,
+	// and that trim ate the unscanned tail of a line longer than the overlap
+	// whenever a chunk boundary straddled it (kody PR #5 — a link past the
+	// 256KiB boundary in a long JSON line was gone permanently); committing
+	// only to the last newline instead makes the offset STOP advancing for a
+	// single line longer than the chunk, so bytes beyond it are never scanned.
+	//
+	// The overlap makes both unnecessary: every read re-scans the 4KiB before
+	// the raw end, and a PR URL is under 255 bytes, so a URL straddling the
+	// chunk boundary is fully inside the NEXT call's window. A split match
+	// (prefix in this call, digits in the next) cannot false-positive either,
+	// because prRe requires the full "https://…/pull/" prefix. Scanning is
+	// pure bytes; the offset is pure bytes.
+	if n > 0 {
+		s.offset = from + int64(n)
+	}
+	// lastSize is the "nothing new" short-circuit ONLY when the backlog is fully
+	// drained. Setting it while bytes remain would make the NEXT call return early
+	// and the rest of the backlog would never be scanned — the same silent skip in
+	// a different guise.
+	if s.offset >= size {
+		s.lastSize = size
+	} else {
+		s.lastSize = -1 // force the next call to keep reading
+	}
 	if n <= 0 {
-		return ""
+		return s.last
 	}
 	buf = buf[:n]
-	// Trim to the first newline so a match cannot begin in a truncated line.
-	if i := bytes.IndexByte(buf, '\n'); i >= 0 && start > 0 {
-		buf = buf[i+1:]
-	}
+	// No partial-line trimming on this buffer, on purpose — see the comment above
+	// the offset commit: the overlap already re-reads every byte a split match
+	// could straddle, and trimming has twice cost real links.
 	if all := prRe.FindAll(buf, -1); len(all) > 0 {
-		return string(all[len(all)-1])
+		s.last = string(all[len(all)-1])
 	}
-	// Nothing in the tail. Fall back to the whole file rather than reporting
-	// "not linked": a long job can open its PR early and then emit megabytes of
-	// CI output, pushing the link far outside the window. Returning "" here
-	// would emit review_skipped for a transcript that plainly contains the URL —
-	// exactly the ADR-0006 failure this helper exists to fix.
-	if start > 0 {
-		full, err := os.ReadFile(path)
-		if err != nil {
-			return ""
-		}
-		if all := prRe.FindAll(full, -1); len(all) > 0 {
-			return string(all[len(all)-1])
-		}
-	}
-	return ""
+	return s.last
 }
 
-// prURLTailBytes bounds the tail scan. Generous enough to reach back past a
-// short round's worth of output, small enough that a multi-megabyte transcript
-// is never fully read on the gate path.
-const prURLTailBytes = 512 << 10
+// prURLChunkBytes bounds ONE read. Several calls may be needed to catch up on a
+// large append; each consumes at most this much and the next continues from the
+// offset. Bounding a read is not the same as bounding what gets scanned.
+const prURLChunkBytes = 256 << 10
+
+// readFileAt reads into buf at off, tolerating a short read: a PR link near the
+// tail is exactly what we came for, so partial data is better than none.
+func readFileAt(path string, buf []byte, off int64) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	return f.ReadAt(buf, off)
+}
+
+// rewind resets the scanner's position and cached link, so the next call
+// re-scans from byte 0. Shared by the truncate path and the replacement path,
+// so there is one place that decides what "start over" means. lastIno is left
+// alone: the caller has already established the new file's identity.
+func (s *PRURLScanner) rewind() {
+	s.offset, s.last, s.lastSize = 0, "", 0
+}
 
 // EmptyTurnWindow is the quiet window that turns "alive but producing nothing"
 // into an empty-turn stall (ADR-0010): the transcript grew, but the agent

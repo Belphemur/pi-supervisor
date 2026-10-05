@@ -100,6 +100,11 @@ type runner struct {
 	// autoReview is the one-shot intent to arm a review when the completion
 	// gate closes on an open PR.
 	autoReview *autoReviewSpec
+	// prScanner is the incremental PR-URL scanner for this job's transcript
+	// (ADR-0006). Held per runner rather than recreated per gate, so the scrape
+	// only ever reads bytes appended since the last call instead of re-reading a
+	// growing file every round. Reset when the session path changes.
+	prScanner *stall.PRURLScanner
 	// launchedAt is when the current round spawned pi. It is the floor for
 	// session discovery: a transcript that predates the spawn cannot be this
 	// round's session, so FindSession must not adopt it. Zero on a RESUME
@@ -947,9 +952,49 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// "" still means "not linked", never "no PR exists", so a genuine miss
 		// stays a skip rather than becoming an error.
 		if r.stateSnapshot().PRURL == "" && sess != "" {
-			if u := stall.PRURLFrom(sess); u != "" {
+			r.mu.Lock()
+			if r.prScanner == nil || r.prScanner.Path() != sess {
+				r.prScanner = stall.NewPRURLScanner(sess)
+			}
+			sc := r.prScanner
+			r.mu.Unlock()
+			if u := sc.PRURL(); u != "" {
 				s.recordPR(r, u)
 			}
+		}
+
+		// A report that DECLARES itself incomplete is evidence AGAINST
+		// completion, not for it. This is the second signal the
+		// mealime-userrecipes false positive had available and ignored: the
+		// report said "**Status: PARTIAL.**", "T6-T9 are NOT done" and
+		// "Repo facts a follow-up run needs", while the gate checked only that
+		// the file EXISTED.
+		//
+		// Per the decision on that incident: never silently stop on a partial.
+		// The job does NOT go done — it keeps looping so the next round can
+		// finish the work — and the event says exactly why, quoting the agent's
+		// own words. Silently marking it done is the failure mode that lost
+		// four rounds of real work.
+		if phrase, partial := job.ReportDeclaresIncomplete(j.FinalReport); partial {
+			r.mu.Lock()
+			r.state.State, r.active = "running", true
+			r.state.LastDiag = fmt.Sprintf(
+				"report declares the work INCOMPLETE (%q) — not marking done, continuing to the next round", phrase)
+			name := r.job.Name
+			r.mu.Unlock()
+			r.persistState()
+			s.logf(name, "round %d: report declares incomplete (%q) — continuing", round, phrase)
+			s.emit(name, "report_incomplete", round, rc, dur, "",
+				"the final report at %s declares the work INCOMPLETE (%q) and the marker %q was not emitted as a standalone line, "+
+					"so this job is NOT done — it continues to the next round. The agent is documenting unfinished work; "+
+					"the report is at %s",
+				j.FinalReport, phrase, j.Marker, j.FinalReport)
+			// `continue`, NOT `return`: this is inside loop(), whose only caller
+			// hands it to a WaitGroup. Returning would end the round goroutine
+			// with state still running/active=true, leaving RunningCount stuck
+			// at 1 forever and no further round ever starting — the job would
+			// hang instead of continuing.
+			continue
 		}
 
 		if j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {

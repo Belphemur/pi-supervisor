@@ -39,9 +39,22 @@ in-process broker, and cronjob/polling delivery paths are explicitly non-goals.
 The signal that matters is **free and already local**: a push moves the git HEAD
 the daemon can see. So the check is edge-triggered off a real event.
 
-See `references/thread-recheck.md` for the implemented design: a recorded
-baseline (`threads_at_close`) compared against a fresh count on the next push
-or explicit `review recheck`, emitting `review_threads_appeared`.
+## The push trigger is fire-and-forget, and that took measurement
+
+`pre-push` asks the daemon to re-check, and a plain `( ... ) &` is **not**
+non-blocking: the child inherits the hook's stdout pipe, so git blocks reading it
+until every writer closes. Against a daemon that never answers, that turned a
+0.02s push into a **30s** one — backgrounded and still holding the push hostage.
+
+The working form is `nohup <cmd> >/dev/null 2>&1 </dev/null &`, plus a `timeout`
+so a daemon that accepts the connection and then stalls still dies. Measured at
+0.019s with the same hung daemon.
+
+Two rules for anything a hook starts:
+
+- **Detach every descriptor.** `nohup` plus full redirection, or git waits.
+- **Never let advisory work affect the exit status.** The push must succeed when
+  the daemon is absent, hung, or broken. Only the real gates may refuse.
 
 ## Pitfalls
 
