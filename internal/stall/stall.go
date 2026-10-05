@@ -175,6 +175,7 @@ type PRURLScanner struct {
 	path     string
 	offset   int64
 	lastSize int64
+	lastIno  uint64
 	last     string
 }
 
@@ -213,7 +214,19 @@ func (s *PRURLScanner) PRURL() string {
 		// meaningless, so start over rather than read from a bogus position.
 		s.offset, s.last, s.lastSize = 0, "", 0
 	}
-	if size == s.lastSize {
+	if ino, ok := inodeOf(fi); ok {
+		s.lastIno = ino
+	}
+	// Detect a REPLACEMENT, not just a shrink. A rewrite or rotation can produce a
+	// different file of EXACTLY the same length, which a size comparison alone
+	// cannot see — so the "nothing appended" short-circuit would keep serving the
+	// previous file's link. The inode catches it: a new file has a new inode,
+	// while an append keeps the same one. Both platforms surface it through
+	// os.FileInfo.Sys, and any error falls back to trusting size.
+	if ino, ok := inodeOf(fi); ok && s.lastIno != 0 && ino != s.lastIno {
+		s.offset, s.last, s.lastSize, s.lastIno = 0, "", 0, ino
+	}
+	if size == s.lastSize && s.offset >= size {
 		return s.last // nothing appended since the last call
 	}
 
@@ -282,6 +295,20 @@ const prURLChunkBytes = 256 << 10
 
 // readFileAt reads into buf at off, tolerating a short read: a PR link near the
 // tail is exactly what we came for, so partial data is better than none.
+// inodeOf returns the file's inode where the platform exposes it. It is used to
+// tell an APPEND (same inode) from a REPLACEMENT (new inode) of identical size.
+// Returns ok=false when unavailable, and the caller then trusts size alone —
+// degrading to the previous behavior rather than failing.
+func inodeOf(fi os.FileInfo) (uint64, bool) {
+	type inodeSys interface{ Ino() uint64 }
+	switch sys := fi.Sys().(type) {
+	case inodeSys:
+		return sys.Ino(), true
+	default:
+		return 0, false
+	}
+}
+
 // offsetAtLineStart reports whether off begins a line (i.e. off == 0 or the byte
 // before it is a newline).
 func offsetAtLineStart(path string, off int64) bool {

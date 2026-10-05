@@ -207,13 +207,12 @@ func textEmitsMarker(text, marker string) bool {
 	if marker == "" {
 		return false
 	}
+	var prev string
 	for line := range strings.Lines(text) {
-		if !strings.Contains(line, marker) {
-			continue
-		}
-		if !mentionIsRefused(line, marker) {
+		if strings.Contains(line, marker) && !mentionIsRefused(line, marker, prev) {
 			return true
 		}
+		prev = line
 	}
 	return false
 }
@@ -221,7 +220,13 @@ func textEmitsMarker(text, marker string) bool {
 // mentionIsRefused reports whether a line that CONTAINS the marker actually
 // declines or defers emitting it. Scoped to the text around the marker, so a
 // negation elsewhere in the same long paragraph does not veto a real emission.
-func mentionIsRefused(line, marker string) bool {
+//
+// prev is the preceding line. An agent often sets the refusal up first and then
+// writes the bare marker — "I will not emit the marker:" followed by
+// "ALL_DONE" on the next line — so a refusal on the line BEFORE counts too.
+// Without it the most explicit refusal in the transcript was the one shape that
+// did not work.
+func mentionIsRefused(line, marker, prev string) bool {
 	idx := strings.Index(line, marker)
 	// Window: from the start of the line to a little past the marker, so
 	// "deliberately NOT emitted" AFTER it is caught, plus a short look back for
@@ -229,6 +234,15 @@ func mentionIsRefused(line, marker string) bool {
 	lo := max(idx-64, 0)
 	hi := min(idx+len(marker)+48, len(line))
 	window := line[lo:hi]
+	// Include the tail of the previous line, so "…not emit the marker:" on the
+	// line above still reaches this window.
+	if prev != "" {
+		tail := prev
+		if len(tail) > 48 {
+			tail = tail[len(tail)-48:]
+		}
+		window = tail + "\n" + window
+	}
 
 	for _, re := range markerRefusalRes {
 		if re.MatchString(window) {
@@ -246,12 +260,15 @@ func mentionIsRefused(line, marker string) bool {
 // only in a window around the marker mention. Every entry is a NEGATION or a
 // deferral, so a plain completion sentence can never match one.
 var markerRefusalRes = []*regexp.Regexp{
-	// "ALL_DONE deliberately NOT emitted", "marker was not emitted"
-	regexp.MustCompile(`(?i)\b(?:not|isn't|wasn't|never)\s+emitted\b`),
+	// "ALL_DONE deliberately NOT emitted", "marker was not emitted".
+	// Markdown emphasis may sit INSIDE the phrase — an agent writes
+	// "ALL_DONE **not** emitted" — so allow emphasis between the words.
+	regexp.MustCompile(`(?i)\b(?:not|isn't|wasn't|never)\b[\*_` + "`" + `\s]{0,4}emitted\b`),
 	// "deliberately NOT done", "explicitly NOT emitted"
 	regexp.MustCompile(`(?i)\b(?:deliberately|explicitly|intentionally)\s+(?:\**\s*)?(?:not|never)\b`),
-	// "do not emit", "don't emit", "without emitting"
-	regexp.MustCompile(`(?i)\b(?:do\s+not|don'?t|never|without)\s+(?:\w+\s+){0,2}emit\b`),
+	// "do not emit", "don't emit", "will not emit", "without emitting", and the
+	// same with Markdown emphasis inside the phrase ("will **not** emit").
+	regexp.MustCompile(`(?i)\b(?:do\s+not|don'?t|will\s+not|won'?t|never|without|shall\s+not)\b[\*_` + "`" + `\s]{0,4}(?:\w+[\*_` + "`" + `\s]{0,4}){0,2}emit\b`),
 	// "T6-T9 are NOT done", "remain incomplete" next to the marker
 	regexp.MustCompile(`(?i)\b(?:are|is|remain|remains)\s+(?:\**\s*)?(?:not|isn't|wasn't)\s+(?:done|complete|finished)\b`),
 	// "the brief says to emit ALL_DONE" — quoting instructions, not emitting
