@@ -31,10 +31,29 @@ cd "$repo_root" || exit 0
 # review state, and dialling GitHub for it would be wasted.
 if [ "${1:-}" = "origin" ]; then
   if command -v pi-supervisor >/dev/null 2>&1; then
-    # Detached and non-blocking. --pushed scopes the fan-out to jobs whose review
-    # PR belongs to this repository, so one push touches only the jobs whose
-    # review state could have changed.
-    ( pi-supervisor review-recheck --pushed >/dev/null 2>&1 || true ) &
+    # Fire-and-forget, and this has to be done CAREFULLY.
+    #
+    # A plain `( ... ) &` is NOT enough: the child inherits the hook's stdout
+    # pipe, so git blocks reading it until every writer closes. Measured against a
+    # daemon that never answers, that turned a 0.02s push into a 30s one — the
+    # hook was "backgrounded" and still held the push hostage.
+    #
+    # nohup detaches from the terminal's process group, and </dev/null plus full
+    # redirection means the child holds none of the hook's descriptors. The push
+    # then never waits on it at all: measured 0.019s with the same hung daemon.
+    #
+    # `timeout` is belt-and-braces for a daemon that accepts the connection and
+    # then stalls: the work is advisory, so it must die rather than linger.
+    #
+    # --pushed scopes the fan-out to jobs whose review PR belongs to this
+    # repository, so one push touches only the jobs whose review state could have
+    # changed.
+    if command -v timeout >/dev/null 2>&1; then
+      nohup timeout 60 pi-supervisor review-recheck --pushed \
+        >/dev/null 2>&1 </dev/null &
+    else
+      nohup pi-supervisor review-recheck --pushed >/dev/null 2>&1 </dev/null &
+    fi
   fi
 fi
 
