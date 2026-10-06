@@ -61,6 +61,9 @@ Unix socket.
    exit message must always say how to re-arm / get status (ADR-0003). The
    only delivery path to Hermes is the blocking `pi-supervisor watch` client
    armed as a background run — no cronjob, no polling, no chat addressing.
+   A watch whose stream was LIVE (watch_ack received) reconnects on daemon
+   restart with bounded backoff and re-derives the missed terminal state via
+   the precheck (ADR-0015); a connection that never answered exits 1 at once.
 7. **Shutdown stops the loops, not just the children.** `Supervisor.Shutdown`
    closes each active runner's stop channel (under `r.mu`, so a concurrent
    `Stop` cannot double-close) before signalling the client groups, so the

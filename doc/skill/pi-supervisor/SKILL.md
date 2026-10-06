@@ -266,9 +266,18 @@ Behavior:
   structured JSON beside it. A failed lookup prints the fallback `0/0` PLUS
   the reason and a human explanation (`NOT verified — task-store-missing: …`);
   a valid empty list is a plain `0/0` with no error note.
-- **Exit codes:** 0 = event delivered (or run already over), 1 = connection
-  lost (daemon restarted — check `systemctl --user status pi-supervisor`,
-  then re-arm), 2 = usage error (unknown job).
+- **A severed live stream reconnects (ADR-0015).** Once the daemon answered
+  `watch_ack`, a lost connection is retried (2/5/10/20/30s backoff) with the
+  watch re-issued; the daemon re-derives state server-side, so a terminal
+  event that fired while the daemon was down (e.g. a fatal during a restart)
+  still arrives as the precheck and the watch exits 0. Progress prints to
+  stderr. A connection that NEVER answered is not a restart — it still exits 1
+  at once with the re-arm footer.
+- **Exit codes:** 0 = event delivered (live, precheck, or missed-terminal
+  recovered after reconnect), 1 = stream severed past the reconnect budget
+  (or a connection that never answered) — check `systemctl --user status
+  pi-supervisor`, then re-arm; 2 = usage error (unknown job, first connect
+  refused).
 - **Transcript tail.** Every exit message first prints the last complete lines
   of the session JSONL (`session_path`, 2 lines, 300 chars each) plus where the
   rest lives. A live transcript is being appended to while it is read, so only
@@ -294,6 +303,7 @@ Behavior:
 | job ends `fatal` with "round cap reached without marker" but the work is visibly finished and a PR exists | the marker WAS emitted but the gate could not see it. Check `logs <job>` for `marker ... streamed from session transcript`; on a pre-ADR-0011 daemon this was the run-log truncation bug (fixed — upgrade). `status` now shows `marker_found` truthfully mid-round |
 | `status` shows `marker_found: true` but the job is not `done` | the marker was seen but `final_report` does not exist yet — the second half of the gate. Write the report at the path in the job JSON |
 | job state `fatal`, diag "3 consecutive instant exits" | session context wall — start a fresh session (new job or clear state) or trim the session |
+| `status` says fatal but the armed watch never reported it | the watch was a one-shot (no `-t`): it exits after its FIRST event (`round_done`/`backoff`) and must be re-armed — the fatal after that had no listener. Arm `watch -t` (background+notify). If the stream was live across a daemon restart, the client now reconnects and the missed terminal arrives as the precheck (ADR-0015); only a connection that never answered fails at once. |
 | job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |
 || job ends `fatal` with "round cap reached without marker" but the code is committed + pushed and a PR exists | **The marker WAS emitted but the gate could not latch it.** Verify before concluding anything is wrong: `grep -c '<MARKER>' <session_path>` and, decisively, `grep '<MARKER>' <session_path> | grep -c '"role":"assistant"'` — a non-zero count in an ASSISTANT message proves the agent finished (per ADR-0011 only assistant text counts). Then check whether the FINAL REPORT exists; pi often finishes the work, emits the marker, and dies before writing the report. In that case the supervisor cannot be trusted to have recorded the outcome — re-derive it yourself from the commits (`git log <base>..HEAD`, `git diff --stat`) and RE-RUN the gates rather than trusting the run log, then write the missing report. Re-running the gates is not optional: a run log claiming "CI 8/8 green, all shipped" is a self-report. |
 | `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |

@@ -248,6 +248,77 @@ func TestWatchServerErrorExitsTwo(t *testing.T) {
 	}
 }
 
+// A severed LIVE stream (watch_ack already delivered) reconnects and the
+// re-issued watch re-derives state server-side: the fatal that fired while
+// the daemon was restarting arrives as the precheck and the client exits 0.
+// This is the missed-terminal class — status said fatal, the watch said
+// nothing — from the mealime-restrictions run of 2026-10-06.
+func TestWatchReconnectDeliversMissedTerminal(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "r.sock")
+
+	ack := respJSON(t, map[string]any{"ok": true, "data": map[string]any{"type": "watch_ack", "watching": "j"}})
+	ev := respJSON(t, map[string]any{"ok": true, "data": map[string]any{
+		"job": "j", "event": "fatal", "round": 12, "info": "run already fatal — nothing to wait for",
+	}})
+
+	// Phase 1: daemon answers watch_ack, then "restarts" (connection dies).
+	served := make(chan struct{})
+	go func() {
+		ln, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = bufio.NewReader(c).ReadBytes('\n')
+		_, _ = c.Write([]byte(ack + "\n"))
+		_ = c.Close()
+		_ = ln.Close()
+		close(served)
+	}()
+	// Phase 2 starts only after phase 1 served a real connection, so the
+	// client's first watch lands on the dying daemon, not the new listener.
+	go func() {
+		<-served
+		ln, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer ln.Close()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = bufio.NewReader(c).ReadBytes('\n')
+				// The daemon's precheck: the job went fatal during the gap.
+				_, _ = c.Write([]byte(ev + "\n"))
+			}(c)
+		}
+	}()
+
+	got := runCLI(t, sock, "watch", "j", "-t")
+	if got.code != 0 {
+		t.Fatalf("exit %d, want 0 (stdout %q stderr %q)", got.code, got.stdout, got.stderr)
+	}
+	if !strings.Contains(got.stdout, "watching") {
+		t.Fatalf("initial watch_ack missing: %q", got.stdout)
+	}
+	if !strings.Contains(got.stderr, "reconnect") {
+		t.Fatalf("reconnect progress missing: %q", got.stderr)
+	}
+	if !strings.Contains(got.stdout, "\"event\":\"fatal\"") || !strings.Contains(got.stdout, "RUN HALTED") {
+		t.Fatalf("missed fatal not delivered: %q", got.stdout)
+	}
+}
+
 // -t keeps watching after a non-terminal event: the second event is printed
 // too (without -t the process exits on the first one).
 func TestWatchTerminalFlagKeepsStreaming(t *testing.T) {

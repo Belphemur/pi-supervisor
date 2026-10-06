@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -435,62 +436,139 @@ func cleanTaskText(s string) string {
 	return b.String()
 }
 
-// watchCtl blocks on the control socket and prints events as they arrive.
-// Exit 0 on an event (with a footer of next steps), 1 when the connection is
-// lost (daemon restart — re-arm), 2 on usage errors. It owns its own exits
-// because it streams and must distinguish each terminal condition; the tests
-// pin all three codes.
-func watchCtl(req control.Request, terminal bool) {
-	c, err := net.Dial("unix", socketPath())
-	if err != nil {
-		fatalf("daemon not reachable at %s: %v", socketPath(), err)
-	}
-	defer c.Close()
-	line, _ := json.Marshal(req)
-	if _, err := c.Write(append(line, '\n')); err != nil {
-		fatalf("write: %v", err)
-	}
+// watchReconnectDelays is the backoff schedule for recovering a SEVERED
+// watch stream (the daemon went away mid-wait — systemd Restart=on-failure
+// restart, operator bounce). A live stream is worth recovering: on reconnect
+// the watch request is re-issued and the daemon re-derives state server-side
+// (Watch's precheck), so a terminal event that fired during the gap is still
+// delivered — the missed-fatal class this exists for. Exhausting the schedule
+// exits 1 with the re-arm instructions, never silently.
+var watchReconnectDelays = []time.Duration{
+	2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second,
+}
 
-	sc := bufio.NewScanner(c)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		var resp control.Response
-		if err := json.Unmarshal(sc.Bytes(), &resp); err != nil {
-			continue
-		}
-		if !resp.OK {
-			fmt.Fprintln(os.Stderr, "error:", resp.Error)
-			os.Exit(2)
-		}
-		ev, isEvent := resp.Data.(map[string]any)
-		if isEvent && ev["type"] == "watch_ack" {
-			// First message is the ack, not an event — keep waiting.
-			w := req.Job
-			if w == "" {
-				w = "*"
-			}
-			fmt.Println("watching", w, "— blocked until the supervisor sends data (Ctrl-C to stop)")
-			continue
-		}
-		if !isEvent {
-			continue // unexpected non-map payload; ignore
-		}
-		out, _ := json.Marshal(ev)
-		fmt.Println(string(out))
-		kind, _ := ev["event"].(string)
-		watchFooter(ev)
-		switch kind {
-		case "done", "fatal", "stopped", "review_done", "review_exhausted":
-			os.Exit(0)
-		default:
-			if !terminal {
-				os.Exit(0)
-			}
-		}
+// reconnectDelay returns the wait before reconnect attempt n (0-based) and
+// false when the schedule is exhausted.
+func reconnectDelay(attempt int) (time.Duration, bool) {
+	if attempt >= len(watchReconnectDelays) {
+		return 0, false
 	}
-	// Connection closed by the daemon or lost mid-stream.
-	fmt.Fprintln(os.Stderr, "watch connection lost (daemon restart?) — check: systemctl --user status pi-supervisor, then re-arm: pi-supervisor watch", req.Job)
-	os.Exit(1)
+	return watchReconnectDelays[attempt], true
+}
+
+// lostConn prints the connection-lost recovery footer (ADR-0003): the watch
+// never exits without saying how to recover.
+func lostConn(job string, why string) {
+	fmt.Fprintf(os.Stderr, "watch connection lost (%s) — check: systemctl --user status pi-supervisor, then re-arm: pi-supervisor watch %s\n", why, job)
+}
+
+// watchCtl blocks on the control socket and prints events as they arrive.
+// Exit 0 on an event (with a footer of next steps), 1 when the stream is
+// severed AND reconnecting fails (daemon down beyond the reconnect budget),
+// 2 on usage errors. It owns its exits because it streams and must
+// distinguish each terminal condition; the tests pin all three codes.
+//
+// A severed stream that HAD delivered its watch_ack is retried: the daemon
+// re-derives the job state on the re-issued watch (precheck on a terminal
+// job), so the fatal fired during the gap still reaches the client. A
+// connection that never answered is not a restart — that exits 1 at once.
+func watchCtl(req control.Request, terminal bool) {
+	acked := false // a connection answered with watch_ack at least once
+	for attempt := 0; ; {
+		c, err := net.Dial("unix", socketPath())
+		if err != nil {
+			if !acked {
+				fatalf("daemon not reachable at %s: %v", socketPath(), err)
+			}
+			d, ok := reconnectDelay(attempt)
+			if !ok {
+				lostConn(req.Job, "daemon unreachable past reconnect budget")
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "daemon unreachable — reconnecting in %s (attempt %d/%d)\n",
+				d, attempt+1, len(watchReconnectDelays))
+			time.Sleep(d)
+			attempt++
+			continue
+		}
+		line, _ := json.Marshal(req)
+		if _, err := c.Write(append(line, '\n')); err != nil {
+			_ = c.Close()
+			d, ok := reconnectDelay(attempt)
+			if !ok {
+				lostConn(req.Job, "write failed past reconnect budget")
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "watch write failed (%v) — reconnecting in %s\n", err, d)
+			time.Sleep(d)
+			attempt++
+			continue
+		}
+
+		sc := bufio.NewScanner(c)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		sawAck := false
+		for sc.Scan() {
+			var resp control.Response
+			if err := json.Unmarshal(sc.Bytes(), &resp); err != nil {
+				continue
+			}
+			if !resp.OK {
+				fmt.Fprintln(os.Stderr, "error:", resp.Error)
+				os.Exit(2)
+			}
+			ev, isEvent := resp.Data.(map[string]any)
+			if isEvent && ev["type"] == "watch_ack" {
+				w := req.Job
+				if w == "" {
+					w = "*"
+				}
+				if acked {
+					fmt.Println("reconnected — still watching", w, "(Ctrl-C to stop)")
+				} else {
+					acked = true
+					fmt.Println("watching", w, "— blocked until the supervisor sends data (Ctrl-C to stop)")
+				}
+				sawAck = true
+				attempt = 0 // a healthy stream restores the full budget
+				continue
+			}
+			if !isEvent {
+				continue // unexpected non-map payload; ignore
+			}
+			out, _ := json.Marshal(ev)
+			fmt.Println(string(out))
+			kind, _ := ev["event"].(string)
+			watchFooter(ev)
+			switch kind {
+			case "done", "fatal", "stopped", "review_done", "review_exhausted":
+				os.Exit(0)
+			default:
+				if !terminal {
+					os.Exit(0)
+				}
+			}
+		}
+		_ = c.Close()
+		// Stream ended. Terminal/one-shot exits happened above, so this is
+		// either a severed live stream (reconnect) or a connection that never
+		// answered (not a restart — the old immediate failure).
+		if !acked && !sawAck {
+			lostConn(req.Job, "daemon closed without answering")
+			os.Exit(1)
+		}
+		d, ok := reconnectDelay(attempt)
+		if !ok {
+			lostConn(req.Job, "stream severed past reconnect budget")
+			os.Exit(1)
+		}
+		if sawAck {
+			fmt.Fprintf(os.Stderr, "watch connection lost — reconnecting in %s (attempt %d/%d)\n",
+				d, attempt+1, len(watchReconnectDelays))
+		}
+		time.Sleep(d)
+		attempt++
+	}
 }
 
 func fatalf(f string, args ...any) {
