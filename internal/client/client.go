@@ -63,16 +63,6 @@ type Options struct {
 	// OnPID, when set, is called with pi's pid as soon as it starts, so the
 	// supervisor can expose/kill the process group mid-round.
 	OnPID func(int)
-	// Observations, when set, receives one completion observation per eligible
-	// TaskUpdate execution (ADR-0014): toolName == "TaskUpdate",
-	// args.status == "completed", a matching non-error tool_execution_end, and
-	// deduped per execution identity. Round-scoped state; the channel is the
-	// only handoff so the reader goroutine never blocks the supervisor.
-	Observations chan<- Observation
-	// Identity, when set, receives the session identity (get_state reply plus
-	// session-header cwd) once known. At most one send per round; an unsend
-	// keeps the round unaffected (identity is best-effort).
-	Identity chan<- Identity
 }
 
 // Result reports how the round ended.
@@ -88,23 +78,6 @@ type Result struct {
 	Err string
 	// PID is the pi subprocess pid (process-group leader).
 	PID int
-}
-
-// Observation is one eligible TaskUpdate execution that ended without error
-// (ADR-0014 §2): the task JSON still has to confirm the completion before
-// anything is published. Execution identity is the pi toolCallId.
-type Observation struct {
-	TaskID     string `json:"task_id"`
-	ToolCallID string `json:"tool_call_id"`
-}
-
-// Identity is the running session's identity, from pi itself (never guessed):
-// the get_state reply carries sessionId/SessionFile, the session header the
-// cwd. Either half may be absent when pi had not produced it yet.
-type Identity struct {
-	SessionID   string `json:"session_id"`
-	SessionFile string `json:"session_file"`
-	Cwd         string `json:"cwd"`
 }
 
 // PollInterval is how often the control file is checked for new frames.
@@ -173,14 +146,6 @@ func Run(o Options) Result {
 		// it. The round's real result travels in res (RC/Text/Duration).
 		diagf: func(f string, a ...any) { _, _ = fmt.Fprintf(o.Diag, f+"\n", a...) },
 	}
-	if o.Observations != nil {
-		st.observations = o.Observations
-		st.pending = map[string]Observation{}
-	}
-	if o.Identity != nil {
-		st.identity = o.Identity
-		st.cwd = o.Worktree
-	}
 	flusherDone := make(chan struct{})
 	go func() {
 		t := time.NewTicker(200 * time.Millisecond)
@@ -215,17 +180,6 @@ func Run(o Options) Result {
 		st.flush()
 		_ = reap(cmd, 5*time.Second)
 		return fail(start, res, fmt.Sprintf("send prompt: %v", err))
-	}
-	// ADR-0014: ask for session identity once per round. The reply is a
-	// `response` frame correlated by command; the reader consumes it without
-	// touching the error path (only success:false fails a round).
-	if o.Identity != nil {
-		if err := send(map[string]any{"id": "tw-state", "type": "get_state"}); err != nil {
-			// Identity is best-effort: a failed send is diagnosed and the
-			// round continues, so a taskwatch regression can never fail a
-			// pi round.
-			st.diagf("[taskwatch] get_state send failed: %v", err)
-		}
 	}
 
 	done := make(chan struct{})
@@ -352,14 +306,6 @@ type stream struct {
 	held    []any
 	out     *bufio.Writer
 	diagf   func(string, ...any)
-	// taskwatch state (ADR-0014): pending completions keyed by toolCallId,
-	// plus the identity/observation handoffs. All guarded by mu; sends are
-	// non-blocking so the reader never stalls on a slow consumer.
-	pending      map[string]Observation
-	observations chan<- Observation
-	identity     chan<- Identity
-	identSent    bool
-	cwd          string // the child's working directory (identity, ADR-0014)
 }
 
 func (s *stream) read(r io.Reader) {
@@ -407,18 +353,7 @@ func (s *stream) read(r io.Reader) {
 			s.sawEnd = true
 			s.mu.Unlock()
 			return
-		case "tool_execution_start", "tool_execution_end", "response":
-			// Decoded once for the correlation (and get_state); the same line
-			// feeds the round's error path below.
-			tf, _ := decodeToolExec(line)
-			switch e.Type {
-			case "tool_execution_start":
-				s.recordStart(tf)
-			case "tool_execution_end":
-				s.recordEnd(tf)
-			case "response":
-				s.recordResponse(tf)
-			}
+		case "response":
 			if e.Success != nil && !*e.Success {
 				msg := e.Error
 				if msg == "" {
@@ -432,149 +367,6 @@ func (s *stream) read(r io.Reader) {
 				return
 			}
 		}
-	}
-}
-
-// toolExecFrame is the subset of tool_execution_start/end (and the get_state
-// response) the correlation needs, decoded once at the boundary.
-type toolExecFrame struct {
-	Type       string
-	ToolCallID string
-	ToolName   string
-	Args       json.RawMessage
-	IsError    bool
-	// get_state response fields
-	Command string
-	Success bool
-	Data    json.RawMessage
-}
-
-// decodeToolExec parses one raw tool-execution (or response) frame.
-func decodeToolExec(line []byte) (toolExecFrame, bool) {
-	var raw struct {
-		Type       string          `json:"type"`
-		ToolCallID string          `json:"toolCallId"`
-		ToolName   string          `json:"toolName"`
-		Args       json.RawMessage `json:"args"`
-		IsError    bool            `json:"isError"`
-		Command    string          `json:"command"`
-		Success    *bool           `json:"success"`
-		Data       json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(line, &raw); err != nil {
-		return toolExecFrame{}, false
-	}
-	f := toolExecFrame{
-		Type:       raw.Type,
-		ToolCallID: raw.ToolCallID,
-		ToolName:   raw.ToolName,
-		Args:       raw.Args,
-		IsError:    raw.IsError,
-		Command:    raw.Command,
-		Data:       raw.Data,
-	}
-	if raw.Success != nil {
-		f.Success = *raw.Success
-	}
-	return f, true
-}
-
-// recordStart tracks an eligible TaskUpdate completion request keyed by its
-// execution id (ADR-0014 §2.1). Anything else is not a trigger.
-func (s *stream) recordStart(e toolExecFrame) {
-	var args struct {
-		TaskID string `json:"taskId"`
-		Status string `json:"status"`
-	}
-	var eligible bool
-	if e.ToolName == "TaskUpdate" {
-		if err := json.Unmarshal(e.Args, &args); err == nil &&
-			args.TaskID != "" && args.Status == "completed" {
-			eligible = true
-		}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.pending == nil {
-		return
-	}
-	if !eligible {
-		// A non-eligible call re-using the same id (retry, pi-side) must not
-		// leave the earlier trigger armed.
-		delete(s.pending, e.ToolCallID)
-		return
-	}
-	s.pending[e.ToolCallID] = Observation{TaskID: args.TaskID, ToolCallID: e.ToolCallID}
-}
-
-// recordEnd fires the observation for a matching, non-error end exactly once.
-// Orphan ends (no recorded start), error ends and unrelated tools are dropped:
-// none of them may initiate a task-store lookup (ADR-0014 §2.3).
-func (s *stream) recordEnd(e toolExecFrame) {
-	s.mu.Lock()
-	if s.pending == nil {
-		s.mu.Unlock()
-		return
-	}
-	ob, ok := s.pending[e.ToolCallID]
-	if ok {
-		// Dedupe by EXECUTION identity: a duplicate end frame for the same
-		// call is not a new observation.
-		delete(s.pending, e.ToolCallID)
-	}
-	s.mu.Unlock()
-	if !ok || e.IsError {
-		return
-	}
-	s.deliverObservation(ob)
-}
-
-// deliverObservation hands one observation off without ever blocking the
-// reader: a supervisor that is not draining must not stall the goroutine that
-// has to keep receiving pi's frames (ADR-0014 §5).
-func (s *stream) deliverObservation(ob Observation) {
-	if s.observations == nil {
-		return
-	}
-	select {
-	case s.observations <- ob:
-		s.diagf("[taskwatch] eligible completion: task %s call %s", ob.TaskID, ob.ToolCallID)
-	default:
-		s.diagf("[taskwatch] observation dropped (consumer not draining): task %s", ob.TaskID)
-	}
-}
-
-// recordResponse consumes a correlated get_state reply for session identity
-// (ADR-0014 §2). Identity is one-shot per round; a get_state FAILURE still
-// reaches the round's error path through the caller's success check, so only
-// success=true replies with data are consumed here. Auxiliary state replies
-// are never prompt errors nor steer acks: this method reads and leaves.
-func (s *stream) recordResponse(e toolExecFrame) {
-	if e.Command != "get_state" || !e.Success {
-		return
-	}
-	var data struct {
-		SessionID   string `json:"sessionId"`
-		SessionFile string `json:"sessionFile"`
-	}
-	if err := json.Unmarshal(e.Data, &data); err != nil {
-		s.diagf("[taskwatch] get_state data unreadable: %v", err)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.identSent || s.identity == nil {
-		return
-	}
-	s.identSent = true
-	// Cwd: pi's RPC stream has NO session header (docs/json.md), so the
-	// session's cwd is pi's own working directory — Options.Worktree, which
-	// Run set as cmd.Dir. That IS the environment the child inherited.
-	id := Identity{SessionID: data.SessionID, SessionFile: data.SessionFile, Cwd: s.cwd}
-	select {
-	case s.identity <- id:
-	default:
-		s.diagf("[taskwatch] identity event dropped (consumer not draining)")
 	}
 }
 

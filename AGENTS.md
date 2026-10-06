@@ -208,22 +208,6 @@ Unix socket.
     `journalctl --user -u pi-supervisor -o cat | grep ' WARN \| ERROR '`.
     Genuine per-record priorities need a `/dev/log` datagram, which issue #1
     lists under non-goals.
-29. **Task completions are JSON-confirmed, never prose-claimed (ADR-0014).**
-    The trigger is ONLY a `TaskUpdate` execution (`tool_execution_start`/
-    `end` correlated by toolCallId, `args.status == "completed"`, non-error
-    end); the plugin's tasks JSON confirms it, and `task_completed`/
-    `task_lookup_failed` are NON-TERMINAL events through the one emit funnel.
-    The store adapter (internal/taskwatch) mirrors pi-tasks 0.9.0's resolver
-    exactly — PI_TASKS off/absolute/dot/named, tasks-config merge, scope
-    session/project/session-global, PI_CODING_AGENT_DIR — and never guesses a
-    file: memory/off is unavailable, and identity comes from the RUNNING
-    session (get_state reply or the pinned transcript's `<ts>_<id>.jsonl
-    name). Never re-open with a held handle (the plugin saves tmp+rename),
-    never mutate the store, never derive status counts from events (status
-    counts read the CURRENT list on demand; failed lookups are fallback 0/0
-    plus a fault reason, a valid empty list is 0/0 with no error), and no
-    pending task event may be lost to a round's terminal close (bounded
-    flush before classification).
 
 ## State-durability invariants
 

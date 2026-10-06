@@ -229,33 +229,11 @@ type Status struct {
 	MarkerSeen bool `json:"marker_seen,omitempty"`
 	// PRURL is the pull-request URL found in the last round's transcript
 	// (ADR-0006); "" when none was linked.
-	PRURL string `json:"pr_url,omitempty"`
-	// Tasks is the CURRENT plugin-task progress for the job's session store
-	// (ADR-0014 owner amendment): completed/total plus, ONLY on a failed
-	// lookup, a machine reason and a human explanation. nil = the daemon
-	// could not attempt a read (never launched, no identity).
-	Tasks         *TaskProgress `json:"tasks,omitempty"`
-	LastDiag      string        `json:"last_diag"`
-	MarkerFound   bool          `json:"marker_found"`
-	FinalReportOK bool          `json:"final_report_exists"`
-	LastUpdate    string        `json:"last_update"`
-}
-
-// TaskProgress is the structured task-count snapshot. Counts describe the
-// CURRENT list at read time (auto-clear/deletion shrink totals); Valid ==
-// true means the numbers ARE the store's truth; Valid == false means the
-// fallback 0/0 with Reason/Detail describing why (never presented as a
-// successful empty list).
-type TaskProgress struct {
-	Completed int    `json:"completed"`
-	Total     int    `json:"total"`
-	Reason    string `json:"reason,omitempty"`
-	Detail    string `json:"detail,omitempty"`
-	// StorePath is the resolved file the counts came from ("" when the
-	// lookup failed before a path could be resolved). Diagnostics only.
-	StorePath string `json:"store_path,omitempty"`
-	// Valid: false = fallback caused by a failed lookup; true otherwise.
-	Valid bool `json:"valid"`
+	PRURL         string `json:"pr_url,omitempty"`
+	LastDiag      string `json:"last_diag"`
+	MarkerFound   bool   `json:"marker_found"`
+	FinalReportOK bool   `json:"final_report_exists"`
+	LastUpdate    string `json:"last_update"`
 }
 
 // Load parses a job JSON file, applying defaults.
