@@ -77,7 +77,10 @@ Unix socket.
    no `gh`, no network: the PR URL comes from the session JSONL the daemon
    already tails for CI stalls (`stall.prRe`, digits required so a truncated
    `…/pull/` never matches). It is stored on `job.State` and surfaced on every
-   event, so `status <job>` ends with `pr <url>` and `watch` prints it. "" means
+   event, so `status <job>` carries it as the JSON `pr_url` field and `watch`
+   prints the URL in its footer. The status command's stdout is exactly ONE
+   JSON document — jq-parseable — and no trailing human line may be appended.
+   "" means
    "the agent never linked a PR", never "no PR exists" — don't make it an error
    path, and don't add a second tailer for it.
 10. **`steer --interrupt` is opt-in and fail-loud (ADR-0007).** `-i`/`--interrupt`

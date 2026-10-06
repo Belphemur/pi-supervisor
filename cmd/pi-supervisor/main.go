@@ -163,9 +163,23 @@ func sendCTL(req control.Request) error {
 		printSteer(resp)
 		return nil
 	}
-	// A JSON array decodes into []any, not []string: print a string array
-	// (logs) line by line, anything else as indented JSON.
-	if arr, isArr := resp.Data.([]any); isArr && len(arr) > 0 {
+	// Status stdout is a machine contract (jq): renderData prints exactly one
+	// JSON document, so the reply is pipeable whole.
+	renderData(resp.Data)
+	return nil
+}
+
+// renderData prints a response payload as the command's whole stdout. The
+// status output is a machine contract (jq): exactly one JSON document and
+// nothing else — `pr_url` travels inside the JSON (ADR-0006), so the old
+// trailing `pr <url>` grep line is gone. A JSON array of strings (logs)
+// decodes into []any and prints one line per entry; anything else is one
+// indented JSON document. A nil payload (start/stop/reload) prints nothing.
+func renderData(data any) {
+	if data == nil {
+		return
+	}
+	if arr, isArr := data.([]any); isArr && len(arr) > 0 {
 		strs := make([]string, 0, len(arr))
 		for _, v := range arr {
 			s, ok := v.(string)
@@ -177,35 +191,15 @@ func sendCTL(req control.Request) error {
 		}
 		if strs != nil {
 			for _, s := range strs {
-				// sendCTL's own stdout: there is no upstream to report a write
-				// failure to, and the exit code stays 0 either way.
+				// renderData's own stdout: there is no upstream to report a
+				// write failure to, and the exit code stays 0 either way.
 				_, _ = fmt.Println(s)
 			}
-			return nil
+			return
 		}
 	}
-	out, _ := json.MarshalIndent(resp.Data, "", "  ")
+	out, _ := json.MarshalIndent(data, "", "  ")
 	fmt.Println(string(out))
-	if line := prStatusLine(resp.Data); line != "" {
-		fmt.Println(line)
-	}
-	return nil
-}
-
-// prStatusLine renders the trailing `pr <url>` field of a single-job status,
-// or "" when no PR was linked (ADR-0006). The JSON already carries pr_url;
-// this is the human/grep-friendly one-liner. A list status decodes as []any
-// and yields "".
-func prStatusLine(data any) string {
-	m, ok := data.(map[string]any)
-	if !ok {
-		return ""
-	}
-	url, _ := m["pr_url"].(string)
-	if url == "" {
-		return ""
-	}
-	return "pr " + url
 }
 
 // printSteer renders a steer report: where the frame was sent, then what pi

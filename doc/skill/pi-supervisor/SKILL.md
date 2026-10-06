@@ -46,8 +46,9 @@ pi-supervisor start <name>       # round 1 LAUNCHes, later rounds RESUME
 
 # Operate
 pi-supervisor status             # all jobs: state, round, session size/age
-pi-supervisor status <name>      # one job; ends with `pr <url>` when the
-                                 # transcript linked a GitHub PR (ADR-0006)
+pi-supervisor status <name>      # one job; stdout is exactly one JSON
+                                 # document (jq-parseable) carrying pr_url
+                                 # when the transcript linked a PR (ADR-0006)
 pi-supervisor logs <name> 50     # tail the run log (one line per log line)
 pi-supervisor steer <name> 'POLICY CHANGE FROM THE OWNER ...'
 pi-supervisor steer <name> -i '...'  # INTERRUPT: SIGINT pi's group first, so the
@@ -287,7 +288,7 @@ Behavior:
 | `steer -i` says `interrupt requested but cannot SIGINT` | the pi group was already gone (round ended between your `status` and the steer). Nothing was written — check `status`, then re-send; if the round is genuinely running this is a real failure, not a silent no-op |
 | `steer` says `no live round` / `not confirmed` | no round was polling the ctrl file, or pi never acked within the bounded wait (~20s) — the frame was NOT delivered; check `status` and the run log, then re-send |
 | rc=2 in the log | pi's stdout closed with no agent_end (crash mid-turn) — treated as a failure, not a clean cap |
-| `status` shows no `pr <url>` but a PR is open on GitHub | the daemon scrapes the PR URL from the round's transcript as it tails it (ADR-0006); it only sees URLs the agent *linked* in its messages. A PR opened without the agent writing the `pull/<number>` link — e.g. a toolResult that truncated the URL, or a PR filed by CI/a hook — is not surfaced. An empty field means "not linked in the transcript", not "no PR exists"; link the PR in your next round to have it appear. |
+| `status` shows an empty `pr_url` but a PR is open on GitHub | the daemon scrapes the PR URL from the round's transcript as it tails it (ADR-0006); it only sees URLs the agent *linked* in its messages. A PR opened without the agent writing the `pull/<number>` link — e.g. a toolResult that truncated the URL, or a PR filed by CI/a hook — is not surfaced. An empty field means "not linked in the transcript", not "no PR exists"; link the PR in your next round to have it appear. |
 | `pr_url` empty although `pull/N` IS in the transcript, and auto-review skipped with "no GitHub PR was linked" | the scrape rides on the CI/empty-turn STALL watchers, which are only armed once a transcript path exists (`sess != ""`). On a fresh LAUNCH round the watcher has no path yet, so a URL written during THAT round is missed. Link the PR in a LATER round, or pass `--pr <N>` explicitly rather than relying on `--auto`. |
 | `empty_turn` fired while the agent was demonstrably working | the detector reads TRANSCRIPT GROWTH, which stops while pi blocks on a child process (`go test -race`, a CI poll, a detached e2e run it launched). It cannot distinguish "model streaming prose" from "agent waiting on a subprocess". Raise the window per job — `empty_turn_idle_s`, default 60s, is tight for build/test work; 300s suits a job that waits on children. Known design limit, not a misfire. |
 | a re-check says "no review baseline recorded" | correct, not an error: the job never ran a review campaign, so there is nothing to compare against. A baseline is written when a campaign ENDS. |

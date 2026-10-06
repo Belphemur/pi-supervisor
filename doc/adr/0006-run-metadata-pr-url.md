@@ -46,8 +46,10 @@ Two naive fixes were rejected up front:
 - **Surfaces**: `job.State.PRURL` (persisted, so it survives a daemon
   restart) → `job.Status.PRURL` and every event's `pr_url`
   (`done`/`fatal`/`stopped`/`instant_exit`, plus the watch precheck event).
-  `round_done`'s `text` gains ` | pr <url>`, `status <job>` gains a trailing
-  `pr <url>` line next to the JSON, and the watch footer prints the URL.
+  `round_done`'s `text` gains ` | pr <url>`, `status <job>` carries `pr_url`
+  as a JSON field, and the watch footer prints the URL. (Amended: the CLI's
+  trailing `pr <url>` status line was removed — status stdout is exactly one
+  JSON document, jq-parseable.)
 
 ## Consequences
 

@@ -8,7 +8,11 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 UNIT_DIR="${HOME}/.config/systemd/user"
-SKILL_LINK_DIR="${HOME}/.hermes/skills/autonomous-ai-agents"
+# Hermes skill layout: $HERMES_HOME/skills/<category>/<skill>/SKILL.md. The
+# profile-safe rule is "resolve the real home from $HERMES_HOME, never
+# hardcode ~/.hermes" — a non-default profile gets its own skills tree.
+HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
+SKILL_LINK_DIR="${HERMES_HOME}/skills/autonomous-ai-agents"
 SKILL_SRC="${REPO_DIR}/doc/skill"
 
 echo "==> building (Go toolchain per go.mod)"
@@ -21,15 +25,35 @@ echo "==> unit file"
 mkdir -p "$UNIT_DIR" "$BIN_DIR"
 cp "${REPO_DIR}/install/pi-supervisor.service" "$UNIT_DIR/pi-supervisor.service"
 
-echo "==> Hermes skill symlink"
-mkdir -p "$SKILL_LINK_DIR"
-# The skill lives canonically in doc/skill/pi-supervisor/; the skills dir gets
-# a symlink so edits land in one place.
-if [ -e "${SKILL_LINK_DIR}/pi-supervisor" ] && [ ! -L "${SKILL_LINK_DIR}/pi-supervisor" ]; then
-  echo "    existing real dir ${SKILL_LINK_DIR}/pi-supervisor found; replacing with symlink"
-  rm -rf "${SKILL_LINK_DIR}/pi-supervisor"
+echo "==> Hermes skill"
+# Hermes discovers a skill at $HERMES_HOME/skills/<category>/<skill>/SKILL.md;
+# pi-supervisor belongs in the autonomous-ai-agents category, beside pi and
+# pi-orchestrator. The canonical copy stays in doc/skill/pi-supervisor/; the
+# skills dir gets a symlink so edits land in one place. Two ways the install
+# used to leave Hermes unable to see the skill, both guarded here:
+#   - installing from a throwaway checkout (e.g. /tmp) leaves a symlink that
+#     dangles the moment the checkout is deleted — Hermes cannot follow it
+#     and the skill silently vanishes from `skills_list`;
+#   - a stale REAL directory at the link target shadows the fresh copy.
+if [ ! -f "${SKILL_SRC}/pi-supervisor/SKILL.md" ]; then
+  echo "    ERROR: ${SKILL_SRC}/pi-supervisor/SKILL.md not found — refusing to install a dangling skill"
+  exit 1
 fi
-ln -sfn "${SKILL_SRC}/pi-supervisor" "$SKILL_LINK_DIR/pi-supervisor"
+mkdir -p "$SKILL_LINK_DIR"
+if [ -e "${SKILL_LINK_DIR}/pi-supervisor" ] || [ -L "${SKILL_LINK_DIR}/pi-supervisor" ]; then
+  if [ ! -L "${SKILL_LINK_DIR}/pi-supervisor" ]; then
+    echo "    existing real dir ${SKILL_LINK_DIR}/pi-supervisor found; replacing with symlink"
+    rm -rf "${SKILL_LINK_DIR}/pi-supervisor"
+  fi
+fi
+ln -sfn "${SKILL_SRC}/pi-supervisor" "${SKILL_LINK_DIR}/pi-supervisor"
+# Post-install proof: the link MUST resolve to a readable SKILL.md. A symlink
+# is only an install if following it lands on the frontmatter Hermes needs.
+if [ ! -r "${SKILL_LINK_DIR}/pi-supervisor/SKILL.md" ]; then
+  echo "    ERROR: ${SKILL_LINK_DIR}/pi-supervisor does not resolve to a readable SKILL.md"
+  exit 1
+fi
+echo "    installed: ${SKILL_LINK_DIR}/pi-supervisor -> $(readlink -f "${SKILL_LINK_DIR}/pi-supervisor")"
 
 # The review shim (ADR-0012) is the ONLY way a pi review round reaches GitHub,
 # so it is part of the install, not an optional extra: a review round whose
@@ -37,12 +61,22 @@ ln -sfn "${SKILL_SRC}/pi-supervisor" "$SKILL_LINK_DIR/pi-supervisor"
 # canonical copy in doc/skill/pi_supervisor_review/, so edits land in one place.
 echo "==> review shim"
 install -d "$BIN_DIR"
+if [ ! -f "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review" ]; then
+  echo "    ERROR: ${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review not found"
+  exit 1
+fi
 if [ -e "${BIN_DIR}/_pi-supervisor-review" ] && [ ! -L "${BIN_DIR}/_pi-supervisor-review" ]; then
   echo "    existing real file ${BIN_DIR}/_pi-supervisor-review found; replacing with symlink"
   rm -f "${BIN_DIR}/_pi-supervisor-review"
 fi
-ln -sfn "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review" "$BIN_DIR/_pi-supervisor-review"
+ln -sfn "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review" "${BIN_DIR}/_pi-supervisor-review"
 chmod +x "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review"
+# Same dangling-link proof as the skill: a shim that cannot resolve is a
+# review round failing at the first verb, not an install.
+if [ ! -r "${BIN_DIR}/_pi-supervisor-review" ]; then
+  echo "    ERROR: ${BIN_DIR}/_pi-supervisor-review does not resolve to the shim"
+  exit 1
+fi
 # The shim resolves pi-supervisor from PATH; if the user's PATH misses BIN_DIR
 # the shim would fail at exec time rather than at install time, so check here.
 if ! command -v pi-supervisor >/dev/null 2>&1; then
