@@ -60,6 +60,20 @@ const (
 	// ("change the call"), different surface, both exit 2. The values stay
 	// distinct because both are published; fault_test.go pins the relation.
 	KindUsage Kind = "usage"
+
+	// Task-watch lookup failures (ADR-0014 §5). A completed-looking TaskUpdate
+	// execution that the plugin's JSON cannot confirm gets ONE diagnostic with
+	// one of these reasons. They are wire diagnostics, not CLI refusals, but
+	// they live in this vocabulary — one spelling per condition, exit codes
+	// from the same table as everything else.
+	KindTaskStoreMissing Kind = "task-store-missing"
+	KindTaskStoreMemory  Kind = "task-store-memory"
+	KindTaskStoreInvalid Kind = "task-store-invalid"
+	KindTaskMissing      Kind = "task-missing"
+	KindTaskAmbiguous    Kind = "task-ambiguous"
+	KindTaskNotCompleted Kind = "task-not-completed"
+	KindTaskBadInput     Kind = "task-bad-input"
+	KindTaskNoIdentity   Kind = "task-identity-unavailable"
 )
 
 // All is every Kind in the vocabulary, in declaration order. Tests use it to
@@ -71,6 +85,9 @@ func All() []Kind {
 		KindBadRequest, KindBadJSON, KindUnknownCmd, KindUnsupported, KindRefused,
 		KindNoLiveRound, KindRoundMismatch, KindNotAnswered, KindUnknownThread,
 		KindAuthUnavailable, KindRateLimited, KindGitHubError, KindUsage,
+		KindTaskStoreMissing, KindTaskStoreMemory, KindTaskStoreInvalid,
+		KindTaskMissing, KindTaskAmbiguous, KindTaskNotCompleted,
+		KindTaskBadInput, KindTaskNoIdentity,
 	}
 }
 
@@ -100,6 +117,15 @@ var exitCodes = map[Kind]int{
 	KindAuthUnavailable: 1,
 	KindRateLimited:     1,
 	KindGitHubError:     1,
+
+	KindTaskStoreMissing: 1,
+	KindTaskStoreMemory:  1,
+	KindTaskStoreInvalid: 1,
+	KindTaskMissing:      1,
+	KindTaskAmbiguous:    1,
+	KindTaskNotCompleted: 1,
+	KindTaskBadInput:     2,
+	KindTaskNoIdentity:   1,
 }
 
 // ExitCode maps a reason onto the CLI's exit contract (ADR-0008):
