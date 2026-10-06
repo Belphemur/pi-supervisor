@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.5.0
+version: 1.6.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -320,7 +320,9 @@ Behavior:
 | `empty_turn` fired while the agent was demonstrably working | the detector reads TRANSCRIPT GROWTH, which stops while pi blocks on a child process (`go test -race`, a CI poll, a detached e2e run it launched). It cannot distinguish "model streaming prose" from "agent waiting on a subprocess". Raise the window per job — `empty_turn_idle_s`, default 60s, is tight for build/test work; 300s suits a job that waits on children. Known design limit, not a misfire. |
 | a re-check says "no review baseline recorded" | correct, not an error: the job never ran a review campaign, so there is nothing to compare against. A baseline is written when a campaign ENDS. |
 | `reload` ignores an edit to `state/<name>.json` | expected: `LoadJobs` refreshes the job DEFINITION for already-loaded jobs and reads persisted state only when CREATING an entry. An out-of-band state edit therefore has no effect, and the daemon overwrites the file from memory anyway. Do not seed state to force a code path. |
-| `start`/`restart` refuses with "already done" | correct product behaviour — the completion gate was reached. To re-run, clear `~/.pi/supervisor/state/<name>.json` deliberately, or use a new job name; do not route around it by editing state mid-flight. |
+| `start`/`restart` refuses with "already done" | correct product behaviour when NO review campaign is armed — the completion gate was reached. With a campaign armed this is the ADR-0016 re-entry: `review <job> --pr N` then `start`. To re-run the BUILD, clear `~/.pi/supervisor/state/<name>.json` deliberately, or use a new job name; do not route around it by editing state mid-flight. |
+| review armed but the job closed `done` at round 1 instantly (old marker latched) | **RESOLVED — ADR-0016.** The marker gate is now inert while a campaign owns the loop. If you are on a pre-ADR-0016 daemon the workaround was a fresh marker + state dance; upgrade instead. |
+| manually armed review ran rounds but the campaign never checked threads/CI, and the job's MaxRounds applied instead of `--rounds` | **RESOLVED — ADR-0016.** `Start` now enters `reviewing` when a campaign is armed; on a pre-ADR-0016 daemon the manual campaign never owned the loop. Upgrade. |
 
 ## Pitfalls (from the bash era, still true)
 
@@ -460,6 +462,18 @@ plus a machine-readable `reason` from a closed enum.
   marker latch is sticky, so an unguarded re-arm would loop forever); re-arm
   explicitly with `review <job> --auto`. The PR number is parsed from the
   `pull/<N>` in the already-scraped `pr_url`; no second scrape.
+- **Re-entry on a DONE job (ADR-0016).** A campaign whose build phase already
+  finished (the job closed `done` earlier — e.g. new bot findings arrived on
+  the merged-gate PR) re-enters with TWO commands: `pi-supervisor review <job>
+  --pr N` then `pi-supervisor start <job>`. `Start` permits a done job when a
+  campaign is armed, enters `reviewing`, and the campaign owns the loop from
+  round 1 — its budget and its gate (0 threads && CI pass) govern. The
+  previous campaign's marker stays in the transcript and latched in state;
+  the marker gate is INERT while `reviewing`, so it cannot close the resumed
+  session done. Do NOT hand-delete the state file, restart the daemon, or
+  rewrite the marker for this — that dance predates ADR-0016 and destroys the
+  round counter, review baseline, and session pin. Without an armed campaign,
+  `start` on a done job still refuses (`already done; clear state to rerun`).
 - **Round economics: no-push is free.** Only pi-execution rounds consume
   `MaxRounds`. A round that replied to threads but did not push a new commit
   leaves the head SHA unchanged; the next round re-handles the stale threads

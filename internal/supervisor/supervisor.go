@@ -293,12 +293,31 @@ func (s *Supervisor) Start(name string) error {
 		r.mu.Unlock()
 		return fault.New(fault.KindAlreadyRunning, fmt.Errorf("job %q already running", name))
 	}
-	if r.state.State == "done" {
+	// ADR-0016: `done` + an ARMED review campaign is the supported manual
+	// re-entry (`review <job> --pr N` then `start`) — refusing here forced the
+	// hand state-file deletion + daemon restart dance. The campaign owns the
+	// loop from the first round: its budget (invariant 23) and its gate
+	// (reviewGate) govern, and the marker gate must not classify done
+	// mid-campaign (the sticky MarkerSeen latch of the PREVIOUS campaign would
+	// otherwise close the resumed session instantly).
+	if r.state.State == "done" && r.review == nil {
 		r.mu.Unlock()
 		return fault.New(fault.KindAlreadyDone, fmt.Errorf("job %q already done; clear state to rerun", name))
 	}
 	r.active = true
-	r.state.State = "running"
+	// A live campaign always runs under `reviewing`, never `running`: the
+	// loop's budget/gate selection keys off that state (ADR-0012 §4.2). A
+	// manual arm used to leave `running` here, so the campaign could never
+	// terminate itself and the job's MaxRounds applied instead.
+	enteringReviewing := r.review != nil
+	if enteringReviewing {
+		r.state.State = "reviewing"
+		// Mirror the auto handoff's stamp: the campaign's displayed round
+		// starts at the state round it takes over from.
+		r.review.round = r.state.Round
+	} else {
+		r.state.State = "running"
+	}
 	r.state.InstantExits = 0
 	if r.state.StartedAt == "" {
 		r.state.StartedAt = time.Now().Format(time.RFC3339)
@@ -309,6 +328,19 @@ func (s *Supervisor) Start(name string) error {
 	r.stopCh = stopCh
 	r.mu.Unlock()
 	r.persistState()
+
+	if enteringReviewing {
+		// ADR-0016: say the handoff out loud. The auto path emits `reviewing`
+		// at its done→reviewing hop; the manual re-entry must too, or a watch
+		// client cannot tell that the loop now belongs to the campaign (and
+		// `reviewing` is deliberately NOT terminal — the run is not over).
+		r.mu.Lock()
+		round := r.state.Round
+		wt := r.job.Worktree
+		r.mu.Unlock()
+		s.emit(name, "reviewing", round, 0, 0, "",
+			"manual review re-entry: the campaign owns the loop from here (worktree %s)", wt)
+	}
 
 	s.wg.Go(func() {
 		s.loop(r, stopCh)
@@ -703,6 +735,10 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			// say which: "round cap reached without marker" would be a lie for
 			// a review round (there is no marker in a review round).
 			if reviewing {
+				// Snapshot the campaign identity FIRST: finish() clears the
+				// campaign (ADR-0016), and the baseline needs its owner/repo/pr
+				// and last observed open count.
+				c := r.campaignSnapshot()
 				r.finish("fatal", "review round cap reached with threads still open")
 				s.logf(name, "FATAL: review round cap %d reached without a clean review", maxRounds)
 				s.emit(name, "review_exhausted", round, 0, 0, "",
@@ -711,10 +747,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				// Record the baseline on THIS path too. An exhausted campaign
 				// ends with threads STILL OPEN, and that count is the baseline:
 				// without it the next re-check has nothing to compare against,
-				// and every still-open thread reads as brand new. Recorded
-				// BEFORE finish() clears the campaign, so owner/repo/pr are
-				// still reachable.
-				if c := r.campaignSnapshot(); c != nil {
+				// and every still-open thread reads as brand new. Recorded AFTER
+				// finish(), because the re-check no-ops while the job is active.
+				if c != nil {
 					s.recordThreadBaseline(name, r, c.owner, c.repo, c.pr, c.lastOpenCount())
 					// Same reason as the clean-close path: finish() has cleared
 					// active and a baseline now exists, so this is a point where
@@ -1004,7 +1039,15 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			continue
 		}
 
-		if j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {
+		// ADR-0016: the marker gate is INERT while a live campaign owns the
+		// loop (`reviewing`). The sticky MarkerSeen latch plus the cumulative
+		// transcript scan find the PREVIOUS campaign's marker in a resumed
+		// session and would close the job done at the end of round 1 — the
+		// live mealime-rebase54 failure. A review round has no marker of its
+		// own; its exits are reviewGate (0 threads && CI pass) and
+		// review_exhausted only. The AUTO trigger path keeps this gate: there
+		// r.review is still nil (the handoff below CREATES the campaign).
+		if !reviewing && j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {
 			// ADR-0012 §4.1: the auto-trigger runs HERE, in the gate's tail —
 			// not "mid-round". There is no live round to fire from: the gate
 			// clears `active` below and Start refuses a done job. So the
@@ -1242,6 +1285,11 @@ func (r *runner) live() bool {
 func (r *runner) finish(state, diag string) {
 	r.mu.Lock()
 	r.state.State, r.state.LastDiag, r.active = state, diag, false
+	// A terminal state spends the campaign (ADR-0016): a later start must not
+	// re-enter `reviewing` with a stale budget. Operator stops do NOT go
+	// through finish (Stop writes its state directly), so a stopped campaign
+	// stays armed and resumes on the next start.
+	r.review = nil
 	name := r.job.Name
 	r.mu.Unlock()
 	r.persistState()

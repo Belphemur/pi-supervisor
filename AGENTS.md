@@ -172,7 +172,13 @@ Unix socket.
     `watchCtl` exit list must stay in sync with that decision.
 23. **A live campaign owns its round budget.** `loop` reads the campaign's
     `MaxRounds` while `state == "reviewing"`, not the build job's — otherwise a
-    5-round campaign runs to the job's default 200.
+    5-round campaign runs to the job's default 200. A MANUAL campaign reaches
+    that state the same way the auto trigger does: `Start` permits a done job
+    when a campaign is armed and enters `reviewing` (ADR-0016 — no state-file
+    dance), and the marker gate is INERT while `reviewing`, since the sticky
+    latch of the PREVIOUS campaign would otherwise close a resumed session
+    done at round 1. A campaign is spent at its terminal moments (`finish()`
+    and `reviewGate`'s clean close clear it); operator stops keep it armed.
 24. **Required-ness comes from branch protection, not GraphQL `isRequired`.**
     A live test showed `checkRun.isRequired(pullRequestId:)` returns empty check
     runs for a fork PR, so it silently degraded to fail-closed — every check

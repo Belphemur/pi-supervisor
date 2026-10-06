@@ -8,6 +8,20 @@ import (
 	"pi-supervisor/internal/review"
 )
 
+// reviewReader is the GitHub read surface the campaign gate consumes. An
+// interface so tests can stub GitHub without a network; production satisfies
+// it with *review.Client (method-for-method).
+type reviewReader interface {
+	ListThreads(ctx context.Context, owner, repo string, pr int) ([]review.Thread, error)
+	CheckCI(ctx context.Context, owner, repo string, pr int) (*review.CIRollup, error)
+}
+
+// gateReader acquires the gate's GitHub client. A package var mirroring
+// listOpenThreads so tests can stub it.
+var gateReader = func(s *Supervisor, ctx context.Context, owner, repo string) (reviewReader, error) {
+	return s.reviewClient(ctx, owner, repo)
+}
+
 // reviewGate is the campaign's exit condition, evaluated between rounds
 // (ADR-0012 §4.2): `0 open threads && CI pass`.
 //
@@ -37,7 +51,7 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	gh, err := s.reviewClient(ctx, owner, repo)
+	gh, err := gateReader(s, ctx, owner, repo)
 	if err != nil {
 		// A credential problem is NOT the campaign's verdict: leave it
 		// running and let the operator fix auth. Failing here would end a
@@ -83,6 +97,10 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 		r.mu.Lock()
 		r.state.State, r.active = "done", false
 		r.state.LastDiag = "review campaign clean: 0 open threads, CI passing"
+		// The campaign is spent. Leaving it armed would let a later `start`
+		// re-enter `reviewing` with a stale budget (ADR-0016): the terminal
+		// state must be reachable as done again.
+		r.review = nil
 		r.mu.Unlock()
 		r.persistState()
 		s.logf(name, "review campaign complete after %d round(s): 0 open threads, CI passing", used)
