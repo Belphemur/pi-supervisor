@@ -58,8 +58,8 @@ pi-supervisor steer <name> -n '...'  # don't wait for pi's ack
 pi-supervisor stop <name>        # SIGTERM the client group; session kept
 
 # Notifications: block until the supervisor sends an event (see below)
-pi-supervisor watch <name>       # exit after the first event
-pi-supervisor watch <name> -t    # exit only when the run is over (done/fatal/stopped)
+pi-supervisor watch <name> -t    # THE ARM: hold until the run is over (done/fatal/stopped);
+                                 # plain `watch` (no -t) is a one-shot probe only
 
 # Shell completion (idempotent; detects bash/zsh/fish/powershell on PATH)
 pi-supervisor completion install
@@ -218,12 +218,19 @@ background-completion notification is delivered **to the session that armed
 it**. It cannot go anywhere else.
 
 ```
-# Arm (Hermes): a background process that wakes this session on the next event
-terminal(command="pi-supervisor watch power-top", background=true, notify=true)
-
-# Or hold ONE process for the whole campaign; it wakes only when the run is over
-terminal(command="pi-supervisor watch power-top -t", background=true, notify=true)
+# THE ARM IS ALWAYS -t. A plain watch is one-shot: it exits after the FIRST
+# event (round_done/backoff) and every later event — including the terminal
+# one — is unwitnessed (live on mealime-restrictions: the armed plain watch
+# consumed a backoff, and the fatal 34s later reached nobody). -t holds ONE
+# process until the run is actually over and survives daemon restarts via
+# ADR-0015 reconnect.
+terminal(command="pi-supervisor watch power-top -t", background=true, notify=true, persist_on_release=true)
 ```
+
+`persist_on_release=true` matters when the arming session may end before the
+job does: without it, session teardown kills the watch too. A plain
+`watch <job>` (no `-t`) is a PROBE — "what happens next" — never the armed
+delivery path.
 
 Behavior:
 

@@ -61,6 +61,9 @@ Unix socket.
    exit message must always say how to re-arm / get status (ADR-0003). The
    only delivery path to Hermes is the blocking `pi-supervisor watch` client
    armed as a background run — no cronjob, no polling, no chat addressing.
+   The arm is ALWAYS `watch -t` (+ persist_on_release): a plain watch is a
+   one-shot probe that exits on the first event and leaves the terminal one
+   unwitnessed.
    A watch whose stream was LIVE (watch_ack received) reconnects on daemon
    restart with bounded backoff and re-derives the missed terminal state via
    the precheck (ADR-0015); a connection that never answered exits 1 at once.
