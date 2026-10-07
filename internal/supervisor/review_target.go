@@ -37,7 +37,11 @@ func remoteRepo(worktree string) (owner, repo string, ok bool) {
 	if worktree == "" {
 		return "", "", false
 	}
-	out, err := exec.Command("git", "-C", worktree, "remote", "get-url", "origin").Output()
+	out, err := func() ([]byte, error) {
+		cmd := exec.Command("git", "-C", worktree, "remote", "get-url", "origin")
+		cmd.Env = envWithoutGitVars() // GIT_DIR from a hook env redirects -C at the wrong repo
+		return cmd.Output()
+	}()
 	if err != nil {
 		return "", "", false
 	}

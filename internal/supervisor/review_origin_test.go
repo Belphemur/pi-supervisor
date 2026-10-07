@@ -118,19 +118,3 @@ func TestRecheckAllIncludesMatchingRepo(t *testing.T) {
 		t.Fatalf("expected the job to be checked, got %+v", m.Jobs)
 	}
 }
-
-// envWithoutGitVars is os.Environ() minus every GIT_* variable. Hooks run
-// with GIT_DIR set by git itself; inheriting it makes `git init` inside a
-// test temp dir act on the real repo instead (remote add then fails with
-// "remote origin already exists").
-func envWithoutGitVars() []string {
-	env := os.Environ()
-	out := env[:0]
-	for _, kv := range env {
-		if len(kv) >= 4 && kv[:4] == "GIT_" {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
-}
