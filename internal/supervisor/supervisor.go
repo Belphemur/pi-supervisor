@@ -1328,6 +1328,7 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	r.mu.Lock()
 	j := r.job
 	resume := j.SessionPath != ""
+	reviewing := r.state.State == "reviewing"
 	r.mu.Unlock()
 
 	// Stamp the launch time BEFORE spawning. Session discovery (below, and in
@@ -1428,6 +1429,11 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	promptPath := j.Brief
 	if resume {
 		promptPath = j.Cont
+	} else if reviewing && j.ReviewBrief != "" {
+		// ADR-0018: a campaign's round 1 LAUNCH is seeded with the review
+		// brief, never the build brief — the build brief asks for work the
+		// campaign's session must not redo.
+		promptPath = j.ReviewBrief
 	}
 	prompt, err := client.DefaultPromptFile(promptPath)
 	if err != nil {

@@ -23,14 +23,22 @@ func PiScripts() string {
 
 // Job is one supervised delegation. Fields map 1:1 to jobs/<name>.json.
 type Job struct {
-	Name        string   `json:"name"`
-	Brief       string   `json:"brief"`
-	Cont        string   `json:"cont"`
-	FinalReport string   `json:"final_report"`
-	Marker      string   `json:"marker"`
-	Worktree    string   `json:"worktree"`
-	SessionName string   `json:"session_name"`
-	SessionPath string   `json:"session_path"` // pinned/adopted session JSONL
+	Name        string `json:"name"`
+	Brief       string `json:"brief"`
+	Cont        string `json:"cont"`
+	FinalReport string `json:"final_report"`
+	Marker      string `json:"marker"`
+	Worktree    string `json:"worktree"`
+	SessionName string `json:"session_name"`
+	SessionPath string `json:"session_path"` // pinned/adopted session JSONL
+	// ReviewBrief is the entry prompt for a review campaign's OWN session
+	// (ADR-0018). When set, arming a campaign clears SessionPath so the
+	// campaign's round 1 LAUNCHes a fresh session seeded with this brief —
+	// resuming the finished build session instead made every campaign round
+	// re-verify old work and exit (the model's own context said the work
+	// was complete). When empty, a campaign resumes the build session
+	// (legacy) and the daemon logs a warning advising review_brief.
+	ReviewBrief string   `json:"review_brief,omitempty"`
 	MaxRounds   int      `json:"max_rounds"`
 	TimeoutS    int      `json:"timeout_s"`
 	Skills      []string `json:"skills"`

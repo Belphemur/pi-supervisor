@@ -107,6 +107,7 @@ func (s *Supervisor) autoReviewHandoff(name string, r *runner) bool {
 	r.mu.Lock()
 	r.review = camp
 	r.mu.Unlock()
+	s.freshCampaignSession(r, name)
 	s.logf(name, "auto review armed on %s/%s#%d with %d open thread(s), %d round(s)",
 		owner, repo, pr, len(openThreads), rounds)
 	s.emit(name, "review_armed", 0, 0, 0, "",

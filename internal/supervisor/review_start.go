@@ -2,9 +2,12 @@ package supervisor
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
+	"pi-supervisor/internal/job"
+	"pi-supervisor/internal/journal"
 	"pi-supervisor/internal/review"
 )
 
@@ -81,6 +84,49 @@ func (s *Supervisor) reviewClient(ctx context.Context, owner, repo string) (*rev
 	return s.ghClients.get(ctx, owner, repo)
 }
 
+// freshCampaignSession gives a newly armed campaign its OWN session (ADR-0018).
+//
+// With review_brief set, the build session pin is cleared and persisted, so
+// the campaign's round 1 LAUNCHes a fresh session seeded with the review
+// brief; every later campaign round resumes THAT session (invariant 1 holds
+// within the campaign). Without it the campaign would resume the finished
+// build session, whose own context says the work is complete — observed live
+// (mealime-search3, flambette#58): every round re-verified old work and
+// exited in ~40s, zero threads addressed, budget exhausted.
+//
+// With review_brief empty the pin stays (legacy behavior) and the daemon
+// warns: resuming a finished build session is the known-poison path.
+//
+// Called at ARM time only — never on a plain Start: a stop mid-campaign plus
+// a watch-driven resume (ADR-0017) must resume the campaign's own session,
+// not fork it.
+func (s *Supervisor) freshCampaignSession(r *runner, name string) {
+	r.mu.Lock()
+	brief := r.job.ReviewBrief
+	pinned := r.job.SessionPath
+	if brief != "" {
+		r.job.SessionPath = ""
+		updated := r.job
+		r.mu.Unlock()
+		// Persist BEFORE the first round reads the job: the cleared pin must
+		// survive a daemon restart between arm and round 1.
+		_ = job.Save(updated)
+		buildBytes := int64(0)
+		if fi, err := os.Stat(pinned); err == nil {
+			buildBytes = fi.Size()
+		}
+		s.logf(name, "campaign armed with its own session: cleared build pin (%s, %d bytes), round 1 will LAUNCH review brief %s",
+			pinned, buildBytes, brief)
+		return
+	}
+	r.mu.Unlock()
+	if pinned != "" {
+		journal.Subsys("job").Warn(
+			"campaign armed WITHOUT review_brief — resuming the build session; its own context says the work is complete, so rounds may re-verify and exit without addressing threads (ADR-0018). Add \"review_brief\" to the job def.",
+			"job", name)
+	}
+}
+
 // StartReview arms a review campaign on a job for a PR (ADR-0012 §4) and
 // LAUNCHES it in the same call (ADR-0016 owner correction): the campaign
 // takes over the job's round loop immediately, resuming the same session
@@ -109,6 +155,7 @@ func (s *Supervisor) StartReview(ctx context.Context, name string, pr, rounds in
 	camp := newReviewCampaign(owner, repo, target, rounds, kind)
 	r.review = camp
 	r.mu.Unlock()
+	s.freshCampaignSession(r, name)
 	_ = ctx
 	s.emit(name, "review_armed", 0, 0, 0, "",
 		"review armed on %s/%s#%d for %d round(s), type=%s", owner, repo, target, rounds, kind)

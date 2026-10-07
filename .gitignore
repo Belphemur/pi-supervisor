@@ -1,4 +1,7 @@
-/pi-supervisor          # the built binary (anchored: cmd/pi-supervisor/ is source)
+# the built binary (anchored: cmd/pi-supervisor/ is source). NOTE: '#' is
+# only a comment on its OWN line in .gitignore — an inline comment becomes
+# part of the pattern and silently matches nothing.
+/pi-supervisor
 *.new
 # pi agent scratch state (task lists) — never part of the repo
 .pi/

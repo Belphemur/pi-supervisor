@@ -407,10 +407,18 @@ plus a machine-readable `reason` from a closed enum.
    or the manual path: `review <job> --pr N`, which **arms and starts in one
    call** (ADR-0016 owner correction). Both paths end in the same state: the
    job is `reviewing` and the campaign owns the loop.
-3. **Campaign rounds** — each round resumes the pinned session; pi fixes,
-   triages and answers threads through the shim's six verbs; the daemon polls
-   threads/CI and decides "one more round?" within `--rounds`.
-4. **Terminal** — `review_done` (0 open threads && required CI pass) or
+3. **Campaign session (ADR-0018)** — with `review_brief` on the job, arming
+   clears the build session pin and the campaign's round 1 LAUNCHes a FRESH
+   session seeded with that brief; later campaign rounds resume it. Without
+   `review_brief` the campaign resumes the finished build session — whose
+   context says the work is complete — and rounds degenerate into
+   re-verifying old work (seen live: 5 rounds, ~40s each, zero threads,
+   `review_exhausted`). Set `review_brief` on every job that will run
+   campaigns; the daemon warns when it is missing.
+4. **Campaign rounds** — each round fixes, triages and answers threads
+   through the shim's six verbs; the daemon polls threads/CI and decides
+   "one more round?" within `--rounds`.
+5. **Terminal** — `review_done` (0 open threads && required CI pass) or
    `review_exhausted` (budget spent with findings left). Both close the
    campaign; the job leaves `reviewing` for good and the baseline is written.
 
