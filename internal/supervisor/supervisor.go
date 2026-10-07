@@ -879,6 +879,15 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			s.watchMarker(r, sess, marker, round, markerStop, stopCh)
 		}()
 
+		// Mid-round thread reminders (ADR-0019) run for EVERY round of a
+		// campaign — steer delivery needs a live round, not a transcript
+		// path, so round 1 of a fresh LAUNCH is covered too. No campaign
+		// armed: the watcher exits at once (no-op).
+		remStop, remExited := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(remExited)
+			s.watchThreadReminders(r, round, remStop, stopCh)
+		}()
 		if sess != "" {
 			watchStop, watchExited := make(chan struct{}), make(chan struct{})
 			go func() {
@@ -898,6 +907,8 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		} else {
 			rc, dur, runlogB = s.round(r, round, stopCh)
 		}
+		close(remStop)
+		<-remExited // reminder watcher likewise
 		close(markerStop)
 		<-markerExited // completion watcher likewise
 		// Adopt the transcript a fresh LAUNCH just created, so the gate below

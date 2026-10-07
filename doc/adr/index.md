@@ -24,3 +24,4 @@ add or revise an ADR, add or update its row here in the same commit.**
 | [0016](0016-manual-review-reentry.md) | Manual review re-entry on a done job | Accepted | `review --pr N` arms AND starts; campaign owns its round budget |
 | [0017](0017-watch-driven-resume.md) | Watch-driven resume across restarts | Accepted | Only actively watched jobs auto-resume; daemon's own stop stays stopped |
 | [0018](0018-review-own-session.md) | Review campaigns run in their own session | Accepted | `review_brief` clears the build pin at arm; campaign LAUNCHes fresh |
+| [0019](0019-mid-round-thread-reminders.md) | Mid-round thread reminders | Accepted | Open threads re-steered into the live reviewing round; plain steer, no interrupt |

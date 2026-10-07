@@ -417,7 +417,11 @@ plus a machine-readable `reason` from a closed enum.
    campaigns; the daemon warns when it is missing.
 4. **Campaign rounds** — each round fixes, triages and answers threads
    through the shim's six verbs; the daemon polls threads/CI and decides
-   "one more round?" within `--rounds`.
+   "one more round?" within `--rounds`. MID-ROUND, the daemon also steers
+   the live session whenever open threads have no answer yet (ADR-0019): a
+   digest of thread ids + last comments, repeated while the set stays open.
+   A round that drifts away from the threads gets pulled back within
+   minutes instead of after the client exits.
 5. **Terminal** — `review_done` (0 open threads && required CI pass) or
    `review_exhausted` (budget spent with findings left). Both close the
    campaign; the job leaves `reviewing` for good and the baseline is written.
