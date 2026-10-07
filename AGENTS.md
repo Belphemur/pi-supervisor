@@ -43,7 +43,12 @@ the same commit; this file links to it instead of duplicating it.
 1. **Never re-LAUNCH a session.** After the first round captures the session
    JSONL path, every later round RESUMEs it (`--session`). A second LAUNCH
    forks the session and splits the work. `loop()` enforces this via the
-   `pinned` check; keep it.
+   `pinned` check; keep it. The ONE sanctioned exception is at campaign ARM
+   time (ADR-0018): arming a review campaign with `review_brief` clears the
+   pin once, so the campaign's round 1 LAUNCHes a FRESH session seeded with
+   the review brief — and that session stays pinned for every campaign
+   round. Resuming the finished build session instead made campaign rounds
+   re-verify old work and exit (mealime-search3, flambette#58).
 2. **Instant-exit strike rule.** `rc != 0 && duration < 60s && runlog < 4KB`
    three times in a row ⇒ job goes `fatal` and the loop stops. This is the
    context-exhaustion death-spiral guard; do not turn it into an infinite
