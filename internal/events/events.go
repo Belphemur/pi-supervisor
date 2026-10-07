@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"pi-supervisor/internal/journal"
 	"pi-supervisor/internal/taskwatch"
 )
 
@@ -93,22 +94,49 @@ func Subscribe() (id int64, ch <-chan Event, cancel func()) {
 	id = nextSub
 	c := make(chan Event, subBuffer)
 	subs[id] = c
+	journal.Subsys("watch").Info("watch_subscribe", "job", "*")
 	return id, c, func() {
 		brokerMu.Lock()
 		defer brokerMu.Unlock()
 		delete(subs, id)
+		journal.Subsys("watch").Info("watch_unsubscribe", "job", "*")
 	}
+}
+
+// releaseKind reports whether event e releases a watch client: the terminal
+// set (done|fatal|stopped|review_done|review_exhausted) plus task_completed
+// and task_lookup_failed, which release a `watch -t` client per ADR-0014.
+func releaseKind(e Event) bool {
+	if e.Terminal() {
+		return true
+	}
+	switch e.Event {
+	case "task_completed", "task_lookup_failed":
+		return true
+	}
+	return false
 }
 
 // publish delivers e to every subscriber without ever blocking.
 func publish(e Event) {
 	brokerMu.Lock()
 	defer brokerMu.Unlock()
+	n := len(subs)
+	dropped := false
 	for _, c := range subs {
 		select {
 		case c <- e:
 		default:
+			dropped = true
 		}
+	}
+	if releaseKind(e) {
+		journal.Subsys("watch").Info("watch_release", "event_kind", e.Event,
+			"job", e.Job, "round", e.Round, "watchers", n)
+	}
+	if dropped {
+		journal.Subsys("watch").Warn("watch_drop", "job", e.Job,
+			"event_kind", e.Event)
 	}
 }
 
