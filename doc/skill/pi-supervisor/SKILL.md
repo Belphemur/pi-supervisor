@@ -251,6 +251,11 @@ Behavior:
 - **Finished run ⇒ immediate return.** If the job is already done/fatal/stopped
   when you arm, the watch does NOT block — it prints
   `THE RUN IS OVER — <job> <event>`, points at `status`, and says not to re-arm.
+  EXCEPTION (ADR-0017): a job whose LAST stop came from the daemon's own
+  shutdown (`stop_source: daemon`) RESUMES when you arm — the re-arm is the
+  intent signal, the pinned session continues with the round counter intact.
+  Only an explicit `pi-supervisor stop` stays stopped. So after any daemon
+  restart/install, just re-arm: `pi-supervisor watch <job> -t`.
 - **Every exit message is self-explanatory** (owner requirement): after a
   non-terminal event it prints the re-arm command (`pi-supervisor watch <job>`,
   background+notify) and the status command; after a terminal event it says the

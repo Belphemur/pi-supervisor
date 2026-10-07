@@ -95,6 +95,12 @@ type runner struct {
 	runlogB int64
 	stopCh  chan struct{}
 	active  bool
+	// stopSource records who asked for the CURRENT stop ("operator" via
+	// Stop(), "daemon" via Shutdown) so the loop's classification points can
+	// persist it and emit the right event (ADR-0017). Guarded by r.mu; set
+	// BEFORE closing stopCh so the loop can never observe a closed channel
+	// with an unset source.
+	stopSource string
 	// review is the live review campaign, if any (ADR-0012 §4). Separate from
 	// state so a review round never resets the build job's accounting.
 	review *reviewCampaign
@@ -318,6 +324,7 @@ func (s *Supervisor) Start(name string) error {
 	} else {
 		r.state.State = "running"
 	}
+	r.state.StopSource = "" // running again; the previous stop's source is spent
 	r.state.InstantExits = 0
 	if r.state.StartedAt == "" {
 		r.state.StartedAt = time.Now().Format(time.RFC3339)
@@ -361,6 +368,9 @@ func (s *Supervisor) Stop(name string) error {
 		// Mark inactive synchronously under the lock so a second Stop() is a
 		// no-op rather than a double-close of the stop channel.
 		r.active = false
+		// Operator stop (ADR-0017): recorded so a later watcher precheck
+		// does NOT auto-resume — an explicit stop stays stopped.
+		r.stopSource = "operator"
 		close(r.stopCh)
 		// Persist the terminal state HERE, not only in the loop's exit path.
 		// The loop sets State=stopped when the round returns, but Stop() returns
@@ -378,6 +388,7 @@ func (s *Supervisor) Stop(name string) error {
 			r.state.Round = 1
 		}
 		r.state.State = "stopped"
+		r.state.StopSource = "operator"
 	}
 	pid := r.pid
 	// Round the stop landed on, for the event payload. Read under the same lock
@@ -902,13 +913,21 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		select {
 		case <-stopCh:
 			r.mu.Lock()
-			r.state.State, r.state.LastRC, r.active = "stopped", rc, false
+			src := r.stopSource // "operator" or "daemon" (ADR-0017); set before close
+			r.state.State, r.state.LastRC, r.state.StopSource = "stopped", rc, src
+			r.active = false
 			name := r.job.Name
 			r.mu.Unlock()
 			r.persistState()
 			r.closeSessWatch()
-			s.logf(name, "loop stopped at round %d (client rc=%d)", round, rc)
-			s.emit(name, "stopped", round, rc, dur, "", "operator stop")
+			s.logf(name, "loop stopped at round %d (client rc=%d, stop source=%s)", round, rc, src)
+			// Daemon shutdown is not an operator stop: the info string feeds
+			// the watch footer, and "operator" would misread as intent.
+			info := "operator stop"
+			if src == "daemon" {
+				info = "daemon shutdown — a re-arming watcher will resume this job"
+			}
+			s.emit(name, "stopped", round, rc, dur, "", "%s", info)
 			return
 		default:
 		}
@@ -1169,11 +1188,16 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		select {
 		case <-stopCh:
 			r.mu.Lock()
-			r.state.State, r.active = "stopped", false
+			src := r.stopSource // "operator" or "daemon" (ADR-0017); set before close
+			r.state.State, r.state.StopSource, r.active = "stopped", src, false
 			r.mu.Unlock()
 			r.persistState()
 			r.closeSessWatch()
-			s.emit(name, "stopped", round, rc, dur, "", "operator stop during backoff")
+			info := "operator stop during backoff"
+			if src == "daemon" {
+				info = "daemon shutdown during backoff — a re-arming watcher will resume this job"
+			}
+			s.emit(name, "stopped", round, rc, dur, "", "%s", info)
 			return
 		case <-time.After(sleep):
 		}
@@ -1952,7 +1976,46 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 		if ok {
 			snap := r.snapshot()
 			switch snap.State {
-			case "done", "fatal", "stopped":
+			case "stopped":
+				// Watch-driven resume (ADR-0017): a stop recorded as coming
+				// from the DAEMON's own shutdown was never an intent to end
+				// the campaign — the daemon was merely going away. A watcher
+				// re-arming IS the proof someone still cares, so the daemon
+				// resumes the pinned session now. An OPERATOR stop stays
+				// stopped: someone explicitly halted it. Only one of two
+				// racing watchers performs the resume; the loser sees
+				// AlreadyRunning and proceeds as a normal running-watch.
+				r.mu.Lock()
+				stoppedByDaemon := r.state.StopSource == "daemon"
+				r.mu.Unlock()
+				if stoppedByDaemon {
+					if err := s.Start(jobName); err != nil {
+						// Not AlreadyRunning: a genuine refusal (unknown job,
+						// done without campaign, ...). Report it as the
+						// precheck instead of silently subscribing to a job
+						// that will never run — same fail-loud contract the
+						// old precheck had.
+						if fault.KindOf(err) != fault.KindAlreadyRunning {
+							ev := events.Event{
+								TS: time.Now().UTC().Format(time.RFC3339), Job: jobName,
+								Event: "fatal", Round: snap.Round,
+								Info:     "resume refused: " + err.Error(),
+								Worktree: r.job.Worktree, SessionPath: r.job.SessionPath,
+							}
+							cancel()
+							return nil, func() {}, &ev
+						}
+					} else {
+						s.logf(jobName, "watch-driven resume (daemon-shutdown stop): resuming pinned session")
+						s.emit(jobName, "job_started", snap.Round, 0, 0, "",
+							"resumed by a re-arming watcher after daemon shutdown (ADR-0017)")
+					}
+					// Either way: the job is now running (or was already) —
+					// fall through to the normal running-watch path below.
+					break
+				}
+				fallthrough
+			case "done", "fatal":
 				r.mu.Lock()
 				// Fields read under the same lock as the baseline check below.
 				ev := events.Event{
@@ -2091,8 +2154,12 @@ func (s *Supervisor) Shutdown() {
 		active, pid := r.active, r.pid
 		if active {
 			// Same guarded close as Stop(): a concurrent operator Stop() must
-			// not turn this into a double-close of the channel.
+			// not turn this into a double-close of the stop channel.
 			r.active = false
+			// Daemon shutdown (ADR-0017): recorded so a re-arming watcher can
+			// RESUME this job — unlike an operator stop, nobody asked for the
+			// campaign to end; the daemon is merely going away.
+			r.stopSource = "daemon"
 			close(r.stopCh)
 		}
 		r.mu.Unlock()

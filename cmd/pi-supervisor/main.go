@@ -380,8 +380,11 @@ func watchFooter(ev map[string]any) {
 		fmt.Printf("LLM: review `/tmp/pi_%s_run.log` + final report; resume later with\n", name)
 		fmt.Printf("`pi-supervisor start %s` after correcting, or kill if settled. No re-arm.\n", name)
 	case "stopped":
-		fmt.Printf("operator stop — %s paused at round %.0f.\n", name, round)
-		fmt.Printf("Re-arm: pi-supervisor start %s ; pi-supervisor watch %s\n", name, name)
+		// The info string carries WHO stopped it (ADR-0017): an operator
+		// stop reads as intent, a daemon shutdown as "nobody ended the
+		// campaign — a re-arming watch will resume it". Never hardcode.
+		fmt.Printf("%s — %s paused at round %.0f.\n", info, name, round)
+		fmt.Printf("Re-arm: pi-supervisor watch %s   (background+notify=true) — re-arming resumes a daemon-shutdown job.\n", name)
 	case "task_completed":
 		// Non-terminal (ADR-0014 §5): the job keeps running. Task text is
 		// DATA: escape terminal control characters, never execute it, and

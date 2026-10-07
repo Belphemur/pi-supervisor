@@ -67,6 +67,9 @@ Unix socket.
    A watch whose stream was LIVE (watch_ack received) reconnects on daemon
    restart with bounded backoff and re-derives the missed terminal state via
    the precheck (ADR-0015); a connection that never answered exits 1 at once.
+   The daemon's OWN shutdown records `stop_source: daemon` (ADR-0017), and a
+   re-arming watch RESUMES such a job (pinned session, round intact) — an
+   operator stop stays stopped. A campaign only ends when someone asks.
 7. **Shutdown stops the loops, not just the children.** `Supervisor.Shutdown`
    closes each active runner's stop channel (under `r.mu`, so a concurrent
    `Stop` cannot double-close) before signalling the client groups, so the

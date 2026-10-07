@@ -151,6 +151,13 @@ type State struct {
 	// to the gate — otherwise a finished job livelocks to MaxRounds and ends
 	// fatal (exactly what happened to mealime-roomux on PR #43).
 	MarkerSeen bool `json:"marker_seen,omitempty"`
+	// StopSource records WHO stopped the job at its last stop: "operator"
+	// (explicit `pi-supervisor stop`) or "daemon" (the daemon's own SIGTERM
+	// shutdown, e.g. a systemd restart during install). It is the whole
+	// basis of watch-driven resume (ADR-0017): a watcher reconnecting to a
+	// daemon-stopped job gets it resumed automatically; an operator stop
+	// stays stopped. Empty on a job that never stopped or is running.
+	StopSource string `json:"stop_source,omitempty"`
 	// ReviewBaseline is the post-completion thread baseline (ADR-0012
 	// follow-up). It lives on State, NOT on the in-memory reviewCampaign,
 	// because its whole purpose is to outlive the campaign: bots re-review the
