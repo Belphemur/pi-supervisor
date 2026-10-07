@@ -48,6 +48,12 @@ func TestOriginRepoParsesOwnerAndName(t *testing.T) {
 				{"remote", "add", "origin", tc.remote},
 			} {
 				cmd := exec.Command("git", append([]string{"-C", wt}, args...)...)
+				// git exports GIT_DIR (and friends) into hook environments —
+				// this test RUNS under pre-push — and an inherited GIT_DIR
+				// redirects `git init`/`git remote add` at the REAL repo,
+				// failing with "remote origin already exists". Scrub every
+				// GIT_* variable so the commands see only the temp dir.
+				cmd.Env = envWithoutGitVars()
 				if out, err := cmd.CombinedOutput(); err != nil {
 					t.Fatalf("git %v: %v\n%s", args, err, out)
 				}
@@ -111,4 +117,20 @@ func TestRecheckAllIncludesMatchingRepo(t *testing.T) {
 	if len(m.Jobs) != 1 {
 		t.Fatalf("expected the job to be checked, got %+v", m.Jobs)
 	}
+}
+
+// envWithoutGitVars is os.Environ() minus every GIT_* variable. Hooks run
+// with GIT_DIR set by git itself; inheriting it makes `git init` inside a
+// test temp dir act on the real repo instead (remote add then fails with
+// "remote origin already exists").
+func envWithoutGitVars() []string {
+	env := os.Environ()
+	out := env[:0]
+	for _, kv := range env {
+		if len(kv) >= 4 && kv[:4] == "GIT_" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
