@@ -207,8 +207,13 @@ type ReviewBaseline struct {
 
 // Status is the live snapshot served over the socket / written to disk.
 type Status struct {
-	Name         string  `json:"name"`
-	State        string  `json:"state"`
+	Name  string `json:"name"`
+	State string `json:"state"`
+	// StopSource names who ordered the last stop: "operator", "daemon"
+	// (ADR-0017 — a re-arming watch resumes this job), or "" (never
+	// stopped / running). Surfaced so a parked daemon-stopped job is
+	// visible in status, not just in the state file.
+	StopSource   string  `json:"stop_source,omitempty"`
 	Round        int     `json:"round"`
 	MaxRounds    int     `json:"max_rounds"`
 	SessionPath  string  `json:"session_path"`

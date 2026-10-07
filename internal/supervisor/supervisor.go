@@ -214,7 +214,8 @@ func (r *runner) snapshot() job.Status {
 	r.mu.Lock()
 	st := job.Status{
 		Name: r.job.Name, State: r.state.State, Round: r.state.Round,
-		MaxRounds: r.job.MaxRounds, SessionPath: r.job.SessionPath,
+		StopSource: r.state.StopSource,
+		MaxRounds:  r.job.MaxRounds, SessionPath: r.job.SessionPath,
 		ClientPID: r.pid, LastRC: r.state.LastRC, LastDurS: r.state.LastDurS,
 		LastRunlogB: r.runlogB, InstantExits: r.state.InstantExits,
 		CIStalls: r.state.CIStalls,
