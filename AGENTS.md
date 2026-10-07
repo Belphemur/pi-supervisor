@@ -6,6 +6,10 @@ bash `pi_supervisor.sh` resume loop with a systemd `--user` service that survive
 agent lifecycle teardown, monitors session growth, and answers queries over a
 Unix socket.
 
+Architecture decisions: [doc/adr/index.md](doc/adr/index.md) — the table of
+contents for every ADR. When adding or revising an ADR, update that index in
+the same commit; this file links to it instead of duplicating it.
+
 ## Layout
 
 | Path | Role |
