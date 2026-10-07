@@ -263,9 +263,10 @@ Behavior:
   plus `task_id`/`tool_call_id`/`task_file`. The JSON — not result prose — is
   the source: a lookup that cannot confirm the task emits one
   `task_lookup_failed` with a machine `reason` (`task-store-missing`,
-  `task-not-completed`, `task-store-invalid`, …). Both stay non-terminal: the
-  JOB keeps running, ordinary watch exits after printing the event and its
-  re-arm footer, `watch -t` keeps waiting. A completion is plugin-reported
+  `task-not-completed`, `task-store-invalid`, …). Both RELEASE the watch even
+  under `-t` (exit 0, re-arm footer): the LLM wakes to trust-but-verify while
+  the JOB keeps running in the background, then re-arms. Only `done` says
+  "THE RUN IS OVER". A completion is plugin-reported
   state, never independent verification of the work.
 - **`status` shows the task list's current progress.** Every status (single
   job and all) carries `tasks: {completed, total}` read on demand from the

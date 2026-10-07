@@ -337,6 +337,48 @@ func TestWatchTerminalFlagKeepsStreaming(t *testing.T) {
 	}
 }
 
+// A task completion RELEASES the watch even under -t (ADR-0014, owner
+// decision): exit 0 with the re-arm footer while the JOB keeps running in
+// the background — the LLM wakes, trust-but-verifies, re-arms. It must never
+// read as the run being over (that is `done`'s footer only).
+func TestWatchTaskCompletedReleases(t *testing.T) {
+	ev := map[string]any{
+		"job": "j", "event": "task_completed", "round": 2,
+		"task_id": "t1", "task": map[string]any{"subject": "wire the gate"},
+	}
+	sock := fakeDaemon(t,
+		respJSON(t, map[string]any{"ok": true, "data": map[string]any{"type": "watch_ack", "watching": "j"}}),
+		respJSON(t, map[string]any{"ok": true, "data": ev}),
+	)
+	got := runCLI(t, sock, "watch", "j", "-t")
+	if got.code != 0 {
+		t.Fatalf("exit %d, want 0 (stdout %q)", got.code, got.stdout)
+	}
+	if !strings.Contains(got.stdout, "TASK COMPLETED") || !strings.Contains(got.stdout, "re-arm") {
+		t.Fatalf("missing release footer: %q", got.stdout)
+	}
+	if strings.Contains(got.stdout, "THE RUN IS OVER") {
+		t.Fatalf("task completion must not read as the run being over: %q", got.stdout)
+	}
+}
+
+// Same release for a FAILED confirmation: the LLM must still wake to check
+// the task list, and the job keeps running either way.
+func TestWatchTaskLookupFailedReleases(t *testing.T) {
+	ev := map[string]any{"job": "j", "event": "task_lookup_failed", "round": 2, "task_id": "t1", "reason": "task-store-missing"}
+	sock := fakeDaemon(t,
+		respJSON(t, map[string]any{"ok": true, "data": map[string]any{"type": "watch_ack", "watching": "j"}}),
+		respJSON(t, map[string]any{"ok": true, "data": ev}),
+	)
+	got := runCLI(t, sock, "watch", "j", "-t")
+	if got.code != 0 {
+		t.Fatalf("exit %d, want 0 (stdout %q)", got.code, got.stdout)
+	}
+	if !strings.Contains(got.stdout, "NOT CONFIRMED") {
+		t.Fatalf("missing lookup-failed footer: %q", got.stdout)
+	}
+}
+
 // runDaemon (ExecStart) boots: it loads jobs, serves the socket, reports
 // READY, answers a ctl, and exits 0 on SIGTERM. Driven as a subprocess in a
 // temp HOME + temp socket so the live daemon is never involved.

@@ -2,3 +2,4 @@
 *.new
 # pi agent scratch state (task lists) — never part of the repo
 .pi/
+pi-supervisor

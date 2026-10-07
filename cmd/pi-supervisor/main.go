@@ -541,7 +541,14 @@ func watchCtl(req control.Request, terminal bool) {
 			kind, _ := ev["event"].(string)
 			watchFooter(ev)
 			switch kind {
-			case "done", "fatal", "stopped", "review_done", "review_exhausted":
+			case "done", "fatal", "stopped", "review_done", "review_exhausted",
+				// ADR-0014 (owner decision): a task completion RELEASES the
+				// watch even under -t — the LLM wakes, trust-but-verifies the
+				// task, and re-arms while the job continues in the background.
+				// Deliberately NOT in events.Terminal(): the job is not done,
+				// the daemon keeps streaming; only this client exits. The
+				// footer below always says re-arm, never "run over".
+				"task_completed", "task_lookup_failed":
 				os.Exit(0)
 			default:
 				if !terminal {

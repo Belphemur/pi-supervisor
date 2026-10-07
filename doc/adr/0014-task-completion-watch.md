@@ -182,9 +182,12 @@ longer completed. New reason values belong in the existing `internal/fault`
 vocabulary with its inventory/exit-code tests, not a second reason registry.
 No raw task file contents or credentials in diagnostics.
 
-Both new events are NON-TERMINAL. Ordinary watch returns on the first event and
-prints re-arm/status instructions; watch --terminal prints progress and keeps
-waiting. Terminal prechecks and exit codes retain their current behavior.
+Both new events are NON-TERMINAL: the JOB keeps running. The watch CLIENT
+still RELEASES on them (exit 0, re-arm footer — owner decision): the LLM must
+wake on every completion, trust-but-verify the task, and re-arm while the job
+continues in the background. Only `done`/`fatal`/`stopped`/review terminals
+say the run itself changed state. Terminal prechecks and exit codes retain
+their current behavior.
 No new watch replay/cursor or guarantee of delivery between re-arms is added.
 Existing slow-subscriber drops remain possible; the audit retains published
 observations subject to the existing best-effort write contract.

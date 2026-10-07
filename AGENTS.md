@@ -228,6 +228,9 @@ Unix socket.
     `end` correlated by toolCallId, `args.status == "completed"`, non-error
     end); the plugin's tasks JSON confirms it, and `task_completed`/
     `task_lookup_failed` are NON-TERMINAL events through the one emit funnel.
+    Non-terminal means the JOB keeps running — never that the watch holds:
+    the watch CLIENT releases on both (exit 0, re-arm footer) so the LLM
+    wakes, trust-but-verifies the task, and re-arms (owner decision).
     The store adapter (internal/taskwatch) mirrors pi-tasks 0.9.0's resolver
     exactly — PI_TASKS off/absolute/dot/named, tasks-config merge, scope
     session/project/session-global, PI_CODING_AGENT_DIR — and never guesses a
