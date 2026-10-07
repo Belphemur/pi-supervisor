@@ -398,6 +398,22 @@ arms the review phase. **Every command here is consumed by another LLM, not a
 human**: nothing prompts, nothing pages, and every failure is a non-zero exit
 plus a machine-readable `reason` from a closed enum.
 
+**Campaign lifecycle, end to end:**
+
+1. **Build phase** — ordinary job rounds until the marker AND final report
+   land in the session transcript (ADR-0011). The gate scrapes `pr_url`.
+2. **Trigger** — either the gate's auto path (`auto_review` on the job +
+   open PR: CodeRabbit comment → warmup → thread check → `done → reviewing`)
+   or the manual path: `review <job> --pr N`, which **arms and starts in one
+   call** (ADR-0016 owner correction). Both paths end in the same state: the
+   job is `reviewing` and the campaign owns the loop.
+3. **Campaign rounds** — each round resumes the pinned session; pi fixes,
+   triages and answers threads through the shim's six verbs; the daemon polls
+   threads/CI and decides "one more round?" within `--rounds`.
+4. **Terminal** — `review_done` (0 open threads && required CI pass) or
+   `review_exhausted` (budget spent with findings left). Both close the
+   campaign; the job leaves `reviewing` for good and the baseline is written.
+
 - **Surface.** `pi-supervisor review <job> --pr <N> [--rounds N=5] [--type acceptance|rebuttal] [--json]` / `review <job> --auto` / `ack --event <ack_id>`. `--pr` and `--auto` are mutually exclusive. `--rounds` is the campaign's `MaxRounds` — **default 5** (a review round is hours-long; an operator count beats a heuristic); `--rounds 0` auto-derives `ceil(open / review.per_round)` (`per_round` 12) capped by `review.max_rounds` (12). `--type` is the campaign's round character, uniform across its rounds and recorded per round so `watch`/`status` surface `#acceptance` vs `#rebuttal`; mixed campaigns are two campaigns.
 - **One instruction source, not two.** `--skill` defaults to
   **`pi_supervisor_review`**, which carries the triage vocabulary (fix /
@@ -475,18 +491,28 @@ plus a machine-readable `reason` from a closed enum.
   marker latch is sticky, so an unguarded re-arm would loop forever); re-arm
   explicitly with `review <job> --auto`. The PR number is parsed from the
   `pull/<N>` in the already-scraped `pr_url`; no second scrape.
-- **Re-entry on a DONE job (ADR-0016).** A campaign whose build phase already
-  finished (the job closed `done` earlier — e.g. new bot findings arrived on
-  the merged-gate PR) re-enters with TWO commands: `pi-supervisor review <job>
-  --pr N` then `pi-supervisor start <job>`. `Start` permits a done job when a
-  campaign is armed, enters `reviewing`, and the campaign owns the loop from
-  round 1 — its budget and its gate (0 threads && CI pass) govern. The
-  previous campaign's marker stays in the transcript and latched in state;
-  the marker gate is INERT while `reviewing`, so it cannot close the resumed
-  session done. Do NOT hand-delete the state file, restart the daemon, or
-  rewrite the marker for this — that dance predates ADR-0016 and destroys the
-  round counter, review baseline, and session pin. Without an armed campaign,
-  `start` on a done job still refuses (`already done; clear state to rerun`).
+- **Re-entry on a DONE job (ADR-0016, one command since the 2026-10-07 owner
+  correction).** A campaign whose build phase already finished (the job closed
+  `done` earlier — e.g. new bot findings arrived on the merged-gate PR)
+  re-enters with `pi-supervisor review <job> --pr N` ALONE: arming now LAUNCHES
+  the campaign in the same call (it was arm-then-`start`; the two-step read as
+  a dead button). `Start` enters `reviewing` because the campaign is armed, and
+  the campaign owns the loop from round 1 — its budget and its gate (0 threads
+  && CI pass) govern. The previous campaign's marker stays in the transcript
+  and latched in state; the marker gate is INERT while `reviewing`, so it
+  cannot close the resumed session done. Do NOT hand-delete the state file,
+  restart the daemon, or rewrite the marker for this — that dance predates
+  ADR-0016 and destroys the round counter, review baseline, and session pin.
+  Without an armed campaign, `start` on a done job still refuses
+  (`already done; clear state to rerun`).
+- **Watching a campaign.** Arm BEFORE the trigger when you can
+  (`pi-supervisor watch <job> -t`, background+notify): the `reviewing`
+  transition and every campaign round emit events, and `-t` holds through
+  non-terminals. `review_done` / `review_exhausted` ARE terminal — the watch
+  exits and the footer says the campaign is over (`reviewing` alone is not:
+  printing "run over" there would stop the watch mid-campaign). Arming a watch
+  after the fact still works: the precheck reports the campaign state, and a
+  `reviewing` job streams its remaining rounds.
 - **Round economics: no-push is free.** Only pi-execution rounds consume
   `MaxRounds`. A round that replied to threads but did not push a new commit
   leaves the head SHA unchanged; the next round re-handles the stale threads
