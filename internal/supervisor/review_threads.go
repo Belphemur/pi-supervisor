@@ -277,7 +277,14 @@ func parseGitHubRemote(wt string) (owner, repo string) {
 	if wt == "" {
 		return "", ""
 	}
-	out, err := exec.Command("git", "-C", wt, "remote", "get-url", "origin").Output()
+	// git -C does NOT override an inherited GIT_DIR: the hook environment
+	// exports GIT_DIR (pre-push runs this via review-recheck), and without
+	// scrubbing, every probe would read the SUPERVISOR's repo instead of the
+	// job's worktree — scoping every job to the wrong remote. Same GIT_*
+	// class as the test bug fixed in review_origin_test.go.
+	cmd := exec.Command("git", "-C", wt, "remote", "get-url", "origin")
+	cmd.Env = envWithoutGitVars()
+	out, err := cmd.Output()
 	if err != nil {
 		return "", ""
 	}

@@ -41,7 +41,7 @@ The three defects:
 ## Decision
 
 **A done job with an ARMED campaign is the supported manual re-entry:**
-`review <job> --pr N` then `pi-supervisor start <job>`. No state-file
+`review <job> --pr N` — one command: arming launches the campaign directly (2026-10-07 owner correction: the arm-then-start two-step read as a dead button). No state-file
 deletion, no daemon restart, no marker rewrite.
 
 - **`Start` refuses `done` only when NO campaign is armed.** With a campaign

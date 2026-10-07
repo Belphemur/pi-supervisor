@@ -81,11 +81,11 @@ func (s *Supervisor) reviewClient(ctx context.Context, owner, repo string) (*rev
 	return s.ghClients.get(ctx, owner, repo)
 }
 
-// StartReview arms a review campaign on a job for a PR (ADR-0012 §4).
-//
-// It does not start a round: the campaign takes over the job's EXISTING round
-// loop, resuming the same session (never re-launching — a second LAUNCH forks
-// the session and splits the work).
+// StartReview arms a review campaign on a job for a PR (ADR-0012 §4) and
+// LAUNCHES it in the same call (ADR-0016 owner correction): the campaign
+// takes over the job's round loop immediately, resuming the same session
+// (never re-launching — a second LAUNCH forks the session and splits the
+// work). An armed-but-not-started state no longer exists.
 func (s *Supervisor) StartReview(ctx context.Context, name string, pr, rounds int, kind string) (any, error) {
 	s.mu.Lock()
 	r, ok := s.jobs[name]
@@ -118,6 +118,15 @@ func (s *Supervisor) StartReview(ctx context.Context, name string, pr, rounds in
 		if open, err := gh.PROpen(ctx, owner, repo, target); err == nil && !open {
 			return nil, review.ErrUsage("PR %s/%s#%d is not open", owner, repo, target)
 		}
+	}
+	// ADR-0016 (owner correction): arming LAUNCHES the campaign directly.
+	// The old two-step (arm, then a separate `start`) read as a dead button —
+	// the arm answered, nothing ran, and the operator had to know the secret
+	// second command. The auto-review path already went gate→reviewing in one
+	// step; the manual path now does too. Start() enters `reviewing` because
+	// r.review is set (invariant 23), resuming the pinned session.
+	if err := s.Start(name); err != nil {
+		return nil, review.ErrUsage("campaign armed but the round loop refused to start: %v", err)
 	}
 	return map[string]any{
 		"job": name, "owner": owner, "repo": repo, "pr": target,

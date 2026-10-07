@@ -116,8 +116,10 @@ func TestReviewReentryDoneJobRunsCampaign(t *testing.T) {
 	if _, err := s.StartReview(context.Background(), "reentry", 54, 1, "acceptance"); err != nil {
 		t.Fatalf("arming on a done job must work: %v", err)
 	}
-	if err := s.Start("reentry"); err != nil {
-		t.Fatalf("start on a done job with an armed campaign must succeed: %v", err)
+	// ADR-0016 owner correction: arming LAUNCHES the campaign — no separate
+	// start. Assert the loop came up instead of calling Start by hand.
+	if st := mustState(t, "reentry"); st.State != "reviewing" {
+		t.Fatalf("state after StartReview = %q, want reviewing (arm must start)", st.State)
 	}
 
 	// The loop must end on the CAMPAIGN's verdict, never on the old marker.
@@ -220,14 +222,15 @@ func TestStartWithCampaignEntersReviewing(t *testing.T) {
 	r.state.PRURL = "https://github.com/Belphemur/flambette/pull/54"
 	r.mu.Unlock()
 
+	// Subscribe BEFORE arming: StartReview now LAUNCHES the campaign
+	// (ADR-0016 owner correction), so the reviewing event fires inside it —
+	// a subscription after the arm would miss it.
+	ch, cancel, _ := s.Watch("enterreview")
+	defer cancel()
 	if _, err := s.StartReview(context.Background(), "enterreview", 54, 1, "acceptance"); err != nil {
 		t.Fatalf("arming: %v", err)
 	}
-	ch, cancel, _ := s.Watch("enterreview")
-	defer cancel()
-	if err := s.Start("enterreview"); err != nil {
-		t.Fatalf("start: %v", err)
-	}
+	// Arming launched the loop; no separate Start exists any more.
 
 	// The first event after job_started must be the campaign's, and the run
 	// must end review_done (0 threads + CI pass) — not run as a build job.

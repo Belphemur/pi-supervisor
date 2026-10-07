@@ -30,7 +30,7 @@ func journalCapture(t *testing.T) *bytes.Buffer {
 
 // field extracts a key=value pair from a journal line, unquoting it.
 func field(line, key string) (string, bool) {
-	for _, tok := range strings.Fields(line) {
+	for tok := range strings.FieldsSeq(line) {
 		if !strings.HasPrefix(tok, key+"=") {
 			continue
 		}
@@ -50,7 +50,7 @@ func field(line, key string) (string, bool) {
 // hasLine reports whether the captured journal contains a line matching
 // every one of the required tokens (space-separated, order-independent).
 func hasLine(b *bytes.Buffer, want ...string) bool {
-	for _, l := range strings.Split(strings.TrimSpace(b.String()), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(b.String()), "\n") {
 		ok := true
 		for _, w := range want {
 			if !strings.Contains(l, w) {
@@ -193,7 +193,7 @@ func TestWatchSubscribeUnsubscribeLogging(t *testing.T) {
 
 	// Count unsubscribe lines: one for the first cancel, one for cancel2.
 	unsubCount := 0
-	for _, l := range strings.Split(strings.TrimSpace(b.String()), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(b.String()), "\n") {
 		if strings.Contains(l, "event=watch_unsubscribe") {
 			unsubCount++
 		}
@@ -246,13 +246,13 @@ func TestWatchDropLogs(t *testing.T) {
 	defer cancel()
 
 	// Fill the buffer and publish one more: default branch drops it.
-	for i := 0; i < subBuffer+1; i++ {
+	for range subBuffer + 1 {
 		Emit(Event{Job: "j-drop", Event: "round_done", Round: 1})
 	}
 
 	// Verify at least one watch_drop line with correct fields.
 	found := false
-	for _, l := range strings.Split(strings.TrimSpace(b.String()), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(b.String()), "\n") {
 		if !strings.Contains(l, "event=watch_drop") {
 			continue
 		}

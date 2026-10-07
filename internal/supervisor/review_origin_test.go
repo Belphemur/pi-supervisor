@@ -48,6 +48,12 @@ func TestOriginRepoParsesOwnerAndName(t *testing.T) {
 				{"remote", "add", "origin", tc.remote},
 			} {
 				cmd := exec.Command("git", append([]string{"-C", wt}, args...)...)
+				// git exports GIT_DIR (and friends) into hook environments —
+				// this test RUNS under pre-push — and an inherited GIT_DIR
+				// redirects `git init`/`git remote add` at the REAL repo,
+				// failing with "remote origin already exists". Scrub every
+				// GIT_* variable so the commands see only the temp dir.
+				cmd.Env = envWithoutGitVars()
 				if out, err := cmd.CombinedOutput(); err != nil {
 					t.Fatalf("git %v: %v\n%s", args, err, out)
 				}
