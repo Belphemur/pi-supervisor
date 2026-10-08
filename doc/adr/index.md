@@ -25,3 +25,4 @@ add or revise an ADR, add or update its row here in the same commit.**
 | [0017](0017-watch-driven-resume.md) | Watch-driven resume across restarts | Accepted | Only actively watched jobs auto-resume; daemon's own stop stays stopped |
 | [0018](0018-review-own-session.md) | Review campaigns run in their own session | Accepted | `review_brief` clears the build pin at arm; campaign LAUNCHes fresh |
 | [0019](0019-mid-round-thread-reminders.md) | Mid-round thread reminders | Accepted | Open threads re-steered into the live reviewing round; plain steer, no interrupt |
+| [0020](0020-report-is-the-completion-signal.md) | Report is the completion signal | Accepted | Supersedes ADR-0011's conjunction: full report = done; marker-but-no-report = 2 asks, then fatal |
