@@ -93,14 +93,15 @@ type Supervisor struct {
 }
 
 type runner struct {
-	mu      sync.Mutex
-	job     job.Job
-	state   job.State
-	pid     int
-	started time.Time
-	runlogB int64
-	stopCh  chan struct{}
-	active  bool
+	mu       sync.Mutex
+	job      job.Job
+	state    job.State
+	pid      int
+	started  time.Time
+	runlogB  int64
+	lastText string // the round's streamed assistant text (ADR-0020 budget)
+	stopCh   chan struct{}
+	active   bool
 	// stopSource records who asked for the CURRENT stop ("operator" via
 	// Stop(), "daemon" via Shutdown) so the loop's classification points can
 	// persist it and emit the right event (ADR-0017). Guarded by r.mu; set
@@ -827,15 +828,25 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// marker/report gate governs them).
 		campaignExhausted := false
 		if reviewing {
-			if c := r.review; c != nil {
+			// Snapshot the campaign pointer UNDER r.mu (kody PR#9 finding 3):
+			// r.review is written by StartReview/ArmAutoReview/finish/reviewGate
+			// under r.mu, so an unlocked read here races those writes.
+			r.mu.Lock()
+			c := r.review
+			r.mu.Unlock()
+			if c != nil {
 				c.mu.Lock()
-				// Two exhaustion conditions: the budget is SPENT on real
-				// rounds, or the raw loop ran to 3× the budget — the
-				// backstop against a provider that returns rc=0 empty
-				// responses forever (free rounds must not mean infinite
-				// rounds).
+				// Two exhaustion conditions, BOTH campaign-scoped: the
+				// budget is SPENT on real rounds, or the campaign's own
+				// raw round count ran to 3× the budget — the backstop
+				// against a provider that returns rc=0 empty responses
+				// forever (free rounds must not mean infinite rounds).
+				// r.state.Round is deliberately NOT used: it is the job's
+				// lifetime counter and is never reset on the
+				// build→reviewing transition, so a long build would
+				// exhaust a fresh campaign before its first round.
 				campaignExhausted = c.maxRound > 0 &&
-					(c.spent >= c.maxRound || round >= c.maxRound*3)
+					(c.spent >= c.maxRound || c.rawRound >= c.maxRound*3)
 				c.mu.Unlock()
 			}
 		}
@@ -1058,13 +1069,25 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			}
 		}
 		// Budget accounting: a campaign round counts against the budget only
-		// when the agent actually produced something. An empty round (provider
-		// returned a 0-token response; runlog empty, nothing on the transcript)
-		// is free — the operator's budget is for work, not for flakes.
-		if reviewing && runlogB > 0 {
-			if c := r.review; c != nil {
+		// when the agent actually produced something — assistant TEXT on the
+		// round's result, not the runlog size (the runlog also mirrors client
+		// diagnostics, so a forwarded steer's diag line would count an empty
+		// turn as work — qodo PR#9 finding 3). An empty round (provider
+		// returned a 0-token response) is free — the operator's budget is for
+		// work, not for flakes. The raw counter bumps regardless: the 3x
+		// backstop must bound even all-empty rounds. The campaign pointer is
+		// snapshotted under r.mu (kody PR#9 finding 3).
+		if reviewing {
+			r.mu.Lock()
+			produced := strings.TrimSpace(r.lastText) != ""
+			c := r.review
+			r.mu.Unlock()
+			if c != nil {
 				c.mu.Lock()
-				c.spent++
+				c.rawRound++
+				if produced {
+					c.spent++
+				}
 				c.mu.Unlock()
 			}
 		}
@@ -1814,8 +1837,12 @@ func (s *Supervisor) writeCampaignRoundPrompt(name, briefPath string) (string, e
 	b.WriteString(campaignReplyContract)
 	b.WriteString("\n---\n\n")
 	b.Write(body)
-	p := filepath.Join(os.TempDir(), "pi_"+name+"_review_round_prompt.md")
-	if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
+	// 0600, not the world-readable default (qodo PR#9 finding 4): the prompt
+	// quotes open review findings — attacker-controllable text — and a
+	// world-readable file under /tmp invites both reads and symlink
+	// redirection on a multi-user host.
+	p := "/tmp/pi_" + name + "_review_round_prompt.md"
+	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
 		return "", fmt.Errorf("write round prompt: %w", err)
 	}
 	return p, nil
@@ -2013,6 +2040,9 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	select {
 	case o := <-doneCh:
 		clearPID()
+		r.mu.Lock()
+		r.lastText = o.res.Text // the budget reads THIS, not the runlog
+		r.mu.Unlock()
 		if o.res.Err != "" {
 			s.logf(j.Name, "round %d: client error: %s", round, o.res.Err)
 		}

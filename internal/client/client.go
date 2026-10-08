@@ -343,17 +343,20 @@ func reap(cmd *exec.Cmd, grace time.Duration) error {
 
 // stream correlates pi's JSONL event stream.
 type stream struct {
-	mu      sync.Mutex
-	buf     strings.Builder
-	errMsg  string
-	sawEnd  bool
-	holdEnd bool // an abort is in flight: the next agent_end is the aborted turn
-	drain   bool // hold further control frames until the aborted turn ends
-	turnEnd bool // reader flagged the aborted turn's agent_end
-	busy    bool // a turn is in flight: prompt forwarded, agent_end not yet seen
-	held    []any
-	out     *bufio.Writer
-	diagf   func(string, ...any)
+	mu     sync.Mutex
+	buf    strings.Builder
+	errMsg string
+	// steerErr holds a refused STEER's error: diagnostic only, never the
+	// round's verdict (see the success:false handler below).
+	steerErr string
+	sawEnd   bool
+	holdEnd  bool // an abort is in flight: the next agent_end is the aborted turn
+	drain    bool // hold further control frames until the aborted turn ends
+	turnEnd  bool // reader flagged the aborted turn's agent_end
+	busy     bool // a turn is in flight: prompt forwarded, agent_end not yet seen
+	held     []any
+	out      *bufio.Writer
+	diagf    func(string, ...any)
 	// taskwatch state (ADR-0014): pending completions keyed by toolCallId,
 	// plus the identity/observation handoffs. All guarded by mu; sends are
 	// non-blocking so the reader never stalls on a slow consumer.
@@ -399,7 +402,7 @@ func (s *stream) read(r io.Reader) {
 			}
 		case "agent_end":
 			s.mu.Lock()
-			s.busy = false // the turn is over; a plain prompt is deliverable again
+			s.busy = false // the turn ended; a plain prompt is deliverable again
 			if s.holdEnd {
 				// This agent_end closes the ABORTED turn, not our job.
 				s.turnEnd = true
@@ -428,6 +431,21 @@ func (s *stream) read(r io.Reader) {
 					msg = "command failed"
 				}
 				s.mu.Lock()
+				// A STEER whose delivery pi refused ("Agent is already
+				// processing", a stale id, a transient provider hiccup) is
+				// not the round's verdict: the round's own prompt (r1) ran
+				// and the turn may be perfectly healthy. Failing the round
+				// on it is what let one bad reminder kill a whole campaign
+				// round (flambette#65 rounds 7-8). Record it for the diag
+				// only — unless the round's OWN prompt was never accepted
+				// (no successful turn yet), in which case this IS the
+				// round's failure.
+				if s.steerErr == "" && strings.Contains(msg, "already processing") {
+					s.steerErr = msg
+					s.mu.Unlock()
+					s.diagf("[control] steer refused by pi (%s); the steer is dropped, the round continues", msg)
+					continue
+				}
 				if s.errMsg == "" {
 					s.errMsg = msg
 				}
@@ -600,13 +618,26 @@ func (s *stream) text() string {
 // not yet seen). Mid-turn prompt frames need pi's streamingBehavior field —
 // a plain prompt while processing is rejected ("Agent is already processing")
 // and that error was killing whole rounds (flambette#65 campaign, 2026-10-08).
+// Every prompt SEND goes through markPromptSent and every turn END (agent_end,
+// either kind) through markTurnEnded, so busy tracks the actual wire state —
+// including the replacement turn an interrupt-steer starts, which a reader-
+// only lifecycle missed (the replacement turn's prompt is sent by pump, not
+// by the r1 path, so its agent_end would otherwise leave busy stuck false).
 func (s *stream) setBusy(b bool) {
 	s.mu.Lock()
 	s.busy = b
 	s.mu.Unlock()
 }
 
-// processing reports whether a turn is in flight.
+// markPromptSent records that a prompt frame just went out on stdin: from this
+// instant a turn is (or is again) in flight until its agent_end arrives.
+func (s *stream) markPromptSent() {
+	s.mu.Lock()
+	s.busy = true
+	s.mu.Unlock()
+}
+
+// processing reports whether a turn is believed in flight.
 func (s *stream) processing() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -747,6 +778,13 @@ func (c *controlReader) pump(send func(any) error, st *stream, diagOut io.Writer
 				c.ack.record(frameID(f), job.AckSendFail, frameType(f), err.Error(), 0)
 				continue
 			}
+			if frameType(f) == "prompt" {
+				// qodo PR#9 finding 1: this prompt STARTS the replacement
+				// turn after the interrupt — busy must rise here or a
+				// further mid-turn prompt would go out unmarked and be
+				// rejected.
+				st.markPromptSent()
+			}
 			fmt.Fprintf(diagOut, "[control] delivered after abort: %s\n", frameType(f))
 			delay := time.Duration(0)
 			if !at.IsZero() {
@@ -792,6 +830,13 @@ func (c *controlReader) deliver(ln string, send func(any) error, st *stream, dia
 		fmt.Fprintf(diagOut, "[control] send failed: %v\n", err)
 		c.ack.record(frameID(frame), job.AckSendFail, frameType(frame), err.Error(), 0)
 		return
+	}
+	if frameType(frame) == "prompt" {
+		// The send succeeded: a turn is now in flight (started or
+		// restarted), whatever the reader goroutine has consumed so far.
+		// Tracking the WIRE state, not the read state, is what keeps the
+		// enrichment honest across interrupt boundaries.
+		st.markPromptSent()
 	}
 	fmt.Fprintf(diagOut, "[control] forwarded: %s\n", frameType(frame))
 	c.ack.record(frameID(frame), job.AckForwarded, frameType(frame), "", 0)
