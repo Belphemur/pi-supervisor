@@ -4,8 +4,10 @@ Description=pi RPC supervisor daemon (round loops, session monitoring, control s
 [Service]
 Type=notify
 NotifyAccess=main
-# pi and other user tools live in ~/.local/bin; systemd's default PATH omits it.
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# pi and other user tools live in ~/.local/bin; pi's own agent dir holds the
+# real binary (~/.pi/agent/bin/pi, where ~/.local/bin/pi symlinks). systemd's
+# default PATH omits both.
+Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/pi-supervisor run
 Restart=on-failure
 RestartSec=5
