@@ -97,10 +97,41 @@ def emit_taskwatch(prompt):
     out({"type": "agent_end"})
 
 
+def emit_replay(prompt):
+    """ADR-0020 replay fixture: stream a PAST session back into the transcript.
+
+    The test pins a session path and bakes it (plus the fixture path) into a
+    wrapper script that sets REPLAY_SESSION / REPLAY_FIXTURE before exec'ing
+    this file. On a TEST_REPLAY prompt we APPEND the fixture's records to the
+    pinned session, exactly like a real pi resume would have written them,
+    then end the turn. No real pi, no network: the supervisor under test sees
+    the real problematic session's shape (marker in thinking blocks and a
+    toolCall argument, never in assistant text).
+
+    REPLAY_SLEEP keeps the turn open that many seconds first, so a report
+    steer delivered into the round has time to be polled off the control
+    file (the ask-twice test needs this; the done test does not).
+    """
+    time.sleep(float(os.environ.get("REPLAY_SLEEP", "0.1")))
+    sess = os.environ.get("REPLAY_SESSION", "")
+    fix = os.environ.get("REPLAY_FIXTURE", "")
+    if sess and fix and os.path.exists(fix):
+        os.makedirs(os.path.dirname(sess) or ".", exist_ok=True)
+        with open(sess, "a") as fh:
+            for line in open(fix):
+                if line.strip():
+                    fh.write(line if line.endswith("\n") else line + "\n")
+    delta("replayed fixture ")
+    out({"type": "agent_end"})
+
+
 def emit(prompt):
     if "TEST_FRAMELOG" in prompt:
         # Deliberately silent and never agent_end: the round stays live so a
         # steer can be delivered into it.
+        return
+    if "TEST_REPLAY" in prompt:
+        emit_replay(prompt)
         return
     if "TEST_TASKWATCH" in prompt:
         emit_taskwatch(prompt)

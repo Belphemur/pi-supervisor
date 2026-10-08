@@ -62,6 +62,12 @@ var controlPollInterval = client.PollInterval
 // frame is picked up within one poll, then acked in the same pass.
 const steerWaitMargin = 2 * time.Second
 
+// reportSteerMax is the ADR-0020 budget for "marker seen, report missing":
+// the daemon asks twice, then closes the job fatal. A third ask would just
+// burn rounds; the fatal names the missing artifact so the remedy is a
+// copy-paste, not a diagnosis.
+const reportSteerMax = 2
+
 type Supervisor struct {
 	mu   sync.Mutex
 	jobs map[string]*runner
@@ -107,6 +113,13 @@ type runner struct {
 	// autoReview is the one-shot intent to arm a review when the completion
 	// gate closes on an open PR.
 	autoReview *autoReviewSpec
+	// pendingReportSteer arms an ADR-0020 report request: the marker was
+	// seen on some surface but the final report is missing, so the NEXT live
+	// round gets an abort+prompt asking for the report. In-memory on purpose:
+	// the durable ask-count lives in state.ReportSteers (incremented on
+	// actual delivery), so a daemon restart loses only the pending flag and
+	// the next boundary re-arms it.
+	pendingReportSteer bool
 	// prScanner is the incremental PR-URL scanner for this job's transcript
 	// (ADR-0006). Held per runner rather than recreated per gate, so the scrape
 	// only ever reads bytes appended since the last call instead of re-reading a
@@ -218,7 +231,7 @@ func (r *runner) snapshot() job.Status {
 		MaxRounds:  r.job.MaxRounds, SessionPath: r.job.SessionPath,
 		ClientPID: r.pid, LastRC: r.state.LastRC, LastDurS: r.state.LastDurS,
 		LastRunlogB: r.runlogB, InstantExits: r.state.InstantExits,
-		CIStalls: r.state.CIStalls,
+		CIStalls: r.state.CIStalls, ReportSteers: r.state.ReportSteers,
 		LastDiag: r.state.LastDiag, PRURL: r.state.PRURL,
 		LastUpdate: time.Now().Format(time.RFC3339),
 	}
@@ -462,6 +475,13 @@ func (s *Supervisor) Restart(name string) error {
 	}
 	r.mu.Lock()
 	r.state.Round = 0
+	// A fresh restart is a NEW RUN: the previous run's completion latch,
+	// report-ask count, and start floor must not leak into it — a stale
+	// marker latch plus the previous run's report would otherwise close the
+	// fresh run done at round 1 before a single round of work (ADR-0020).
+	r.state.MarkerSeen = false
+	r.state.ReportSteers = 0
+	r.state.StartedAt = ""
 	oldSession := r.job.SessionPath
 	r.job.SessionPath = ""
 	adopted := r.job
@@ -720,6 +740,20 @@ func (s *Supervisor) Reload() error { return s.LoadJobs() }
 // loop is the round loop for one job.
 func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 	for {
+		// An operator/daemon stop that landed between Start() and this
+		// goroutine's first step already closed stopCh AND applied the round
+		// floor (state.Round >= 1). Without this check the cap classification
+		// below runs on the floor value: a 1-round job stopped pre-round read
+		// round=2 > maxRounds=1 and fired "round cap reached without marker",
+		// overwriting the stopped state with fatal (TestWatchSeesStoppedOn
+		// OperatorStop leaked exactly that fatal after its clean stop).
+		// A stop is terminal: classify nothing, return silently — Stop() has
+		// already persisted the terminal state and emitted the event.
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
 		r.mu.Lock()
 		round := r.state.Round + 1
 		maxRounds := r.job.MaxRounds
@@ -784,33 +818,20 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			// Name the ACTUAL missing artifact so the next run is one copy-paste
 			// instead of a diagnosis.
 			r.mu.Lock()
-			latched := r.state.MarkerSeen
 			report := r.job.FinalReport
-			sess := r.job.SessionPath
-			marker := r.job.Marker
 			r.mu.Unlock()
-			// Use the SAME marker surfaces the completion gate uses, not just
-			// the streaming latch. The gate (below) accepts a marker found by a
-			// cumulative transcript scan or by the current round's run log
-			// WITHOUT writing either result back to r.state.MarkerSeen. Reading
-			// only the latch therefore reports "marker NOT seen" for a marker
-			// the gate accepted via stdout — reintroducing exactly the
-			// wrong-cause diagnosis this switch exists to eliminate.
-			markerSeen := latched
-			if !markerSeen && marker != "" && sess != "" {
-				markerSeen = job.TranscriptContains(sess, marker)
-			}
-			if !markerSeen && marker != "" {
-				markerSeen = job.RunlogContains(job.Runlog(name), marker)
-			}
+			// ONE funnel with the completion gate (DRY): the two must never
+			// disagree about what "seen" means.
+			markerSeen := s.markerSeenNow(r)
 			switch {
 			case !markerSeen && report != "" && !job.Exists(report):
-				msg := fmt.Sprintf("round cap %d reached: marker NOT seen AND final report missing (%s)", maxRounds, report)
+				msg := fmt.Sprintf("round cap %d reached: marker NOT seen AND final report missing (%s)%s",
+					maxRounds, report, s.markerSurfaceDiag(r))
 				r.finish("fatal", msg)
 				s.logf(name, "FATAL: %s", msg)
 				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
 			case !markerSeen:
-				msg := fmt.Sprintf("round cap %d reached without marker", maxRounds)
+				msg := fmt.Sprintf("round cap %d reached without marker%s", maxRounds, s.markerSurfaceDiag(r))
 				r.finish("fatal", msg)
 				s.logf(name, "FATAL: %s", msg)
 				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
@@ -879,6 +900,15 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			s.watchMarker(r, sess, marker, round, markerStop, stopCh)
 		}()
 
+		// ADR-0020 report-request delivery: armed by the gate when the
+		// completion signal arrived without a report. No-op when nothing is
+		// pending; round-scoped like every other watcher.
+		steerStop, steerExited := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(steerExited)
+			s.deliverPendingReportSteer(r, round, steerStop, stopCh)
+		}()
+
 		// Mid-round thread reminders (ADR-0019) run for EVERY round of a
 		// campaign — steer delivery needs a live round, not a transcript
 		// path, so round 1 of a fresh LAUNCH is covered too. No campaign
@@ -909,6 +939,8 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		}
 		close(remStop)
 		<-remExited // reminder watcher likewise
+		close(steerStop)
+		<-steerExited // report-request delivery likewise
 		close(markerStop)
 		<-markerExited // completion watcher likewise
 		// Adopt the transcript a fresh LAUNCH just created, so the gate below
@@ -1007,13 +1039,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// The run log alone can never be sufficient across rounds (it is
 		// truncated each round, which is the bug), but within the round that
 		// produced it, it is a valid signal and costs nothing.
-		markerSeen := r.stateSnapshot().MarkerSeen
-		if !markerSeen && j.Marker != "" && sess != "" {
-			markerSeen = job.TranscriptContains(sess, j.Marker)
-		}
-		if !markerSeen && j.Marker != "" {
-			markerSeen = job.RunlogContains(job.Runlog(name), j.Marker)
-		}
+		// ONE funnel with the cap switch (DRY): the sticky transcript latch,
+		// the cumulative transcript scan, and the current round's run log.
+		markerSeen := s.markerSeenNow(r)
 		// Scrape the PR URL from the transcript at the gate, not only from the
 		// stall watchers (ADR-0006). Those watchers start only once a transcript
 		// path is pinned, so on a fresh LAUNCH — where the round that opens the
@@ -1078,7 +1106,20 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// own; its exits are reviewGate (0 threads && CI pass) and
 		// review_exhausted only. The AUTO trigger path keeps this gate: there
 		// r.review is still nil (the handoff below CREATES the campaign).
-		if !reviewing && j.Marker != "" && markerSeen && job.Exists(j.FinalReport) {
+		//
+		// ADR-0020 (supersedes the ADR-0011 marker AND report conjunction):
+		// the fully written final report IS the completion signal. The marker
+		// stays as the streaming early-warning and as the trigger for a
+		// report request, but a report that exists, does not declare itself
+		// incomplete (checked above), and was written during this run closes
+		// the job done on its own. The marker is a completion INTENT: when it
+		// appears anywhere but the report never does, the daemon asks for the
+		// report — twice — and then closes fatal rather than burning rounds.
+		startedAt := r.stateSnapshot().StartedAt
+		reportOK := j.FinalReport != "" && reportReady(j.FinalReport, startedAt)
+		markerAnywhere := s.markerAnywhere(r)
+		switch {
+		case !reviewing && j.Marker != "" && reportOK:
 			// ADR-0012 §4.1: the auto-trigger runs HERE, in the gate's tail —
 			// not "mid-round". There is no live round to fire from: the gate
 			// clears `active` below and Start refuses a done job. So the
@@ -1109,7 +1150,11 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			if closedJob {
 				go s.recheckThreads(name)
 			}
-			s.logf(name, "round %d: marker %q detected in session transcript — done", round, j.Marker)
+			if markerSeen {
+				s.logf(name, "round %d: marker %q detected in session transcript — done", round, j.Marker)
+			} else {
+				s.logf(name, "round %d: final report %s complete — done (ADR-0020)", round, j.FinalReport)
+			}
 			if autoArmed {
 				// Emit `reviewing`, NOT `done`. `done` is a TERMINAL event
 				// (events.Event.Terminal), so a `watch` client would print
@@ -1118,15 +1163,43 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				// on state for the final report; the LIVE verdict is the
 				// campaign's.
 				s.emit(name, "reviewing", round, 0, dur, "",
-					"marker %q reached — build job done, entering the review campaign (ADR-0012 §4.1)",
-					j.Marker)
+					"completion gate closed (marker=%t, report=%s) — build job done, entering the review campaign (ADR-0012 §4.1, ADR-0020)",
+					markerSeen, j.FinalReport)
 				r.closeSessWatch() // terminal from the loop's perspective; reap the watcher
 				return
 			}
-			s.emit(name, "done", round, 0, dur, "",
-				"marker %q detected in session transcript — run is over", j.Marker)
+			if markerSeen {
+				s.emit(name, "done", round, 0, dur, "",
+					"marker %q detected in session transcript — run is over", j.Marker)
+			} else {
+				s.emit(name, "done", round, 0, dur, "",
+					"final report %s complete — run is over (ADR-0020)", j.FinalReport)
+			}
 			r.closeSessWatch() // terminal: reap the watcher (a run-log-only marker may never have pinned a transcript)
 			return
+		case !reviewing && j.Marker != "" && j.FinalReport != "" && markerAnywhere:
+			// The agent signaled completion on SOME surface — assistant text,
+			// a thinking block, a toolCall argument, the report file itself —
+			// but the report never appeared. Ask for it, twice at most
+			// (ADR-0020): a third ask just burns rounds, and the fatal names
+			// the missing artifact so the remedy is a copy-paste.
+			r.mu.Lock()
+			asked := r.state.ReportSteers
+			r.mu.Unlock()
+			if asked >= reportSteerMax {
+				msg := fmt.Sprintf("final report %s still missing after %d report requests — the agent keeps signaling completion without writing it", j.FinalReport, asked)
+				r.finish("fatal", msg)
+				s.logf(name, "FATAL: %s", msg)
+				s.emit(name, "fatal", round, 0, 0, "", "%s", msg)
+				return
+			}
+			r.mu.Lock()
+			r.pendingReportSteer = true
+			r.mu.Unlock()
+			s.logf(name, "round %d: completion signal without report %s — report request #%d armed", round, j.FinalReport, asked+1)
+			s.emit(name, "report_requested", round, 0, 0, "",
+				"completion marker seen but final report %s missing — steering the agent to write it (request #%d; fatal after %d unanswered)",
+				j.FinalReport, asked+1, reportSteerMax)
 		}
 
 		// A CI-stall cap intervention may have closed the run mid-round
@@ -1214,6 +1287,176 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		case <-time.After(sleep):
 		}
 	}
+}
+
+// markerSeenNow is the ONE funnel for the completion gate's marker surfaces:
+// the sticky transcript latch, the cumulative transcript scan, and the current
+// round's run log. The cap switch and the gate both call this, so they can
+// never disagree about what "seen" means — the pre-funnel copies were exactly
+// the drift the cap switch's own comment warned against ("Use the SAME marker
+// surfaces the completion gate uses"), re-implemented instead of shared.
+func (s *Supervisor) markerSeenNow(r *runner) bool {
+	r.mu.Lock()
+	latched := r.state.MarkerSeen
+	marker := r.job.Marker
+	sess := r.job.SessionPath
+	name := r.job.Name
+	r.mu.Unlock()
+	if latched {
+		return true
+	}
+	if marker == "" {
+		return false
+	}
+	if sess != "" && job.TranscriptContains(sess, marker) {
+		return true
+	}
+	return job.RunlogContains(job.Runlog(name), marker)
+}
+
+// markerAnywhere (ADR-0020) reports whether the agent PRODUCED the marker on
+// any surface — assistant text (markerSeenNow), the final report file's last
+// line, or a non-text transcript surface (thinking block, toolCall argument).
+// It is a completion-INTENT signal, never a completion signal: it may trigger
+// a report request, never a done (invariant 15 — only assistant text counts).
+func (s *Supervisor) markerAnywhere(r *runner) bool {
+	if s.markerSeenNow(r) {
+		return true
+	}
+	r.mu.Lock()
+	marker := r.job.Marker
+	report := r.job.FinalReport
+	sess := r.job.SessionPath
+	r.mu.Unlock()
+	if marker == "" {
+		return false
+	}
+	if job.ReportEndsWithMarker(report, marker) {
+		return true
+	}
+	if sess != "" {
+		return !job.ScanMarkerSurfaces(sess, marker).Empty()
+	}
+	return false
+}
+
+// reportReady (ADR-0020) reports whether the final report exists and was
+// written during THIS run. The mtime floor keeps a report left behind by a
+// previous run from closing a fresh restart done before a single round runs;
+// Restart clears StartedAt so the floor moves with the new run.
+func reportReady(path, startedAtRFC string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if startedAtRFC == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339, startedAtRFC)
+	if err != nil {
+		return true
+	}
+	return !fi.ModTime().Before(t.Add(-time.Minute))
+}
+
+// markerSurfaceDiag names where the marker lives when no assistant text block
+// emitted it. position-restore (2026-10-08, PR #203) ended fatal with "round
+// cap 12 reached without marker" while the agent had written the marker into
+// 3 thinking blocks, a toolCall argument, and the final report file — the
+// message sent the operator hunting a marker that was never missing, only in
+// the wrong place. "" when the marker is genuinely nowhere.
+func (s *Supervisor) markerSurfaceDiag(r *runner) string {
+	r.mu.Lock()
+	marker := r.job.Marker
+	report := r.job.FinalReport
+	sess := r.job.SessionPath
+	r.mu.Unlock()
+	if marker == "" {
+		return ""
+	}
+	var parts []string
+	if job.ReportEndsWithMarker(report, marker) {
+		parts = append(parts, "the final report FILE ends with it")
+	}
+	if sess != "" {
+		if srf := job.ScanMarkerSurfaces(sess, marker); !srf.Empty() {
+			if srf.Thinking > 0 {
+				parts = append(parts, fmt.Sprintf("%d assistant thinking block(s)", srf.Thinking))
+			}
+			if srf.ToolArgs > 0 {
+				parts = append(parts, fmt.Sprintf("%d toolCall argument(s)", srf.ToolArgs))
+			}
+			if srf.ToolResult > 0 {
+				parts = append(parts, fmt.Sprintf("%d toolResult quote(s)", srf.ToolResult))
+			}
+			if srf.User > 0 {
+				parts = append(parts, fmt.Sprintf("%d user-message quote(s)", srf.User))
+			}
+			if srf.Compaction > 0 {
+				parts = append(parts, fmt.Sprintf("%d compaction summary quote(s)", srf.Compaction))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " — but the marker WAS written: " + strings.Join(parts, ", ") +
+		"; only an assistant TEXT block counts (ADR-0011/ADR-0020): steer the agent to end a message with the marker line"
+}
+
+// deliverPendingReportSteer delivers the ADR-0020 report request into a live
+// round: once the client has published its pid, an abort+prompt pair asks the
+// agent to write the missing final report. Round-scoped like the other
+// watchers; a no-op when nothing is pending. The pending flag is cleared only
+// on a successful write, so a failed delivery retries next round without
+// double-counting (state.ReportSteers increments on actual delivery).
+func (s *Supervisor) deliverPendingReportSteer(r *runner, round int, watchStop, stopCh chan struct{}) {
+	r.mu.Lock()
+	pending := r.pendingReportSteer
+	report := r.job.FinalReport
+	marker := r.job.Marker
+	name := r.job.Name
+	r.mu.Unlock()
+	if !pending || marker == "" || report == "" {
+		return
+	}
+	deadline := time.Now().Add(90 * time.Second)
+	pid := 0
+	for {
+		r.mu.Lock()
+		pid = r.pid
+		r.mu.Unlock()
+		if pid > 0 {
+			break
+		}
+		select {
+		case <-watchStop:
+			return
+		case <-stopCh:
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			// The round never went live; leave pending armed so the next
+			// round delivers it. No ask was counted.
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	steer := "Your work looks complete (the completion marker was seen), but the final report is missing. " +
+		"Write the final report NOW to " + report + ": what landed, files changed, gate/test results, PR URL. " +
+		"Then end your assistant message with the marker line " + marker + "."
+	if err := s.interruptWith(name, steer); err != nil {
+		s.logf(name, "ERROR: report-request steer not delivered: %v", err)
+		return // still pending; next round retries
+	}
+	r.mu.Lock()
+	r.pendingReportSteer = false
+	asked := r.state.ReportSteers + 1
+	r.state.ReportSteers = asked
+	r.mu.Unlock()
+	r.persistState()
+	s.logf(name, "round %d: report-request steer delivered (ask %d/%d)", round, asked, reportSteerMax)
 }
 
 // stateSnapshot copies the runner's persisted state under its lock.
@@ -2179,8 +2422,23 @@ func (s *Supervisor) Shutdown() {
 			// campaign to end; the daemon is merely going away.
 			r.stopSource = "daemon"
 			close(r.stopCh)
+			// Persist the terminal state HERE, exactly like Stop() does
+			// (state-durability invariant). Shutdown races the loop
+			// goroutine's first step: if the loop sees an already-closed
+			// stop channel it returns silently without classifying, so this
+			// write is the only durable record of the stop — without it the
+			// state file kept saying "running" and the ADR-0017 resume
+			// never armed (TestWatchResumesDaemonStoppedJob).
+			if r.state.Round < 1 {
+				r.state.Round = 1
+			}
+			r.state.State = "stopped"
+			r.state.StopSource = "daemon"
 		}
 		r.mu.Unlock()
+		if active {
+			r.persistState()
+		}
 		if active && pid > 0 {
 			_ = syscall.Kill(-pid, syscall.SIGTERM)
 		}

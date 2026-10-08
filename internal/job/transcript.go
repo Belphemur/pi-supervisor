@@ -281,6 +281,128 @@ var markerRefusalRes = []*regexp.Regexp{
 // readable at the call site.
 var markerRefusalRe = regexp.MustCompile(`(?i)\bnot\s+emitted\b`)
 
+// MarkerSurfaces classifies where a marker string appears across the WHOLE
+// transcript when no assistant text block emitted it. The completion gate
+// (ADR-0011) counts assistant TEXT blocks only, so a job can reach its round
+// cap "without marker" while the marker is in fact all over the transcript —
+// in the agent's THINKING blocks, in toolCall arguments, in the brief the user
+// message quotes. Real case (position-restore, 2026-10-08, PR #203): the agent
+// appended the marker to the final report file and wrote it in 3 thinking
+// blocks, and the fatal said only "round cap 12 reached without marker", which
+// sent the operator hunting a marker that was never emitted as visible text.
+//
+// This is a DIAGNOSTIC surface, not a completion surface: presence in thinking
+// or tool args must never satisfy the gate (invariant 15 — only text counts),
+// it only names where the string lives so the fatal message can say what the
+// agent actually did instead of what it failed to do.
+type MarkerSurfaces struct {
+	Thinking   int // assistant thinking blocks containing the marker
+	ToolArgs   int // assistant toolCall arguments containing it
+	ToolResult int // toolResult payloads quoting it
+	User       int // user messages (brief, steers) quoting it
+	Compaction int // compaction summaries quoting it
+}
+
+// Empty reports whether no non-text surface saw the marker at all.
+func (s *MarkerSurfaces) Empty() bool {
+	return s.Thinking == 0 && s.ToolArgs == 0 && s.ToolResult == 0 &&
+		s.User == 0 && s.Compaction == 0
+}
+
+// ScanMarkerSurfaces scans the whole transcript and counts, per surface, the
+// records that CONTAIN the marker string outside assistant text blocks. It is
+// the mirror image of the gate: where the gate narrows to text blocks, this
+// deliberately looks everywhere else. Whole-file on purpose — it runs once, at
+// the terminal diagnosis, on a file that is already written.
+func ScanMarkerSurfaces(path, marker string) *MarkerSurfaces {
+	out := &MarkerSurfaces{}
+	if marker == "" || path == "" {
+		return out
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for line := range strings.Lines(string(raw)) {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, marker) {
+			continue
+		}
+		var rec struct {
+			Type    string          `json:"type"`
+			Summary string          `json:"summary"`
+			Message json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		switch rec.Type {
+		case "compaction":
+			if strings.Contains(rec.Summary, marker) {
+				out.Compaction++
+			}
+		case "message":
+			var m struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			}
+			if json.Unmarshal(rec.Message, &m) != nil {
+				continue
+			}
+			switch m.Role {
+			case "assistant":
+				var blocks []map[string]json.RawMessage
+				if json.Unmarshal(m.Content, &blocks) != nil {
+					continue
+				}
+				for _, blk := range blocks {
+					switch string(blk["type"]) {
+					case `"thinking"`:
+						var t string
+						if json.Unmarshal(blk["thinking"], &t) == nil && strings.Contains(t, marker) {
+							out.Thinking++
+						}
+					case `"toolCall"`:
+						if strings.Contains(string(blk["arguments"]), marker) {
+							out.ToolArgs++
+						}
+					}
+				}
+			case "user":
+				out.User++
+			case "toolResult":
+				out.ToolResult++
+			}
+		}
+	}
+	return out
+}
+
+// ReportEndsWithMarker reports whether the final report FILE ends with the
+// marker line. The position-restore agent read the brief's "end your LAST
+// assistant message with the marker line" as "end the REPORT with it" and
+// appended the marker to /tmp/pi_position_restore_final_report.md — so the
+// file existed, ended with the marker, and the gate still could not close,
+// because only an assistant text block counts. Naming this in the diagnosis
+// turns "no marker" into "the marker is in the wrong place".
+func ReportEndsWithMarker(path, marker string) bool {
+	if marker == "" || path == "" {
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	text := strings.TrimRight(string(raw), " \t\r\n")
+	last := ""
+	for line := range strings.Lines(text) {
+		if t := strings.TrimRight(line, " \t\r\n"); t != "" {
+			last = t
+		}
+	}
+	return last == strings.TrimSpace(marker)
+}
+
 // TranscriptWatcher incrementally tails a transcript and latches when the
 // marker first appears in assistant text. It is the streaming form of
 // TranscriptContains: bytes are consumed once, in order, and never re-read.

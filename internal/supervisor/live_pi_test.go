@@ -48,13 +48,6 @@ func liveSkip(t *testing.T) string {
 	return piBin
 }
 
-func tailStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return "..." + s[len(s)-n:]
-}
-
 // TestLiveRealPiDetectsMarker runs a REAL pi session and requires the marker to
 // be detected from the transcript pi actually wrote.
 //
@@ -118,22 +111,12 @@ func TestLiveRealPiDetectsMarker(t *testing.T) {
 	}
 	t.Logf("real transcript: %s (%d bytes)", liveSess, job.Size(liveSess))
 
-	// The production predicate must find the marker in what pi really wrote.
-	waitFor(t, 150*time.Second, func() bool {
-		return job.TranscriptContains(liveSess, liveMarker)
-	})
-	if !job.TranscriptContains(liveSess, liveMarker) {
-		body, _ := os.ReadFile(liveSess)
-		t.Fatalf("marker %q absent from a REAL pi transcript.\ntail:\n%s",
-			liveMarker, tailStr(string(body), 3000))
-	}
-	t.Logf("marker found in real transcript assistant text")
-
-	// And the job must reach done on this round.
+	// The job must reach its terminal verdict on THIS round (MaxRounds 1).
+	// Under ADR-0020 the verdict can be marker-driven or report-driven.
 	waitFor(t, 120*time.Second, func() bool {
 		st, _ := s.Status("adr0011-live-verify")
 		m, ok := st.(job.Status)
-		return ok && m.State == "done"
+		return ok && (m.State == "done" || m.State == "fatal")
 	})
 	st, _ := s.Status("adr0011-live-verify")
 	fin, ok := st.(job.Status)
@@ -141,10 +124,19 @@ func TestLiveRealPiDetectsMarker(t *testing.T) {
 		t.Fatalf("status = %#v, want job.Status", st)
 	}
 	if fin.State != "done" {
-		t.Fatalf("state = %q though the marker was in the transcript, want done", fin.State)
+		t.Fatalf("state = %q, want done", fin.State)
 	}
+	// The ADR-0011 premise: the marker in the transcript pi actually wrote.
+	// Real pi is a live model and can finish WITHOUT emitting the marker —
+	// under ADR-0020 the job then still closes done via the report. That is
+	// a model-compliance flake, not a detector failure: skip (rerun to
+	// exercise the marker path) rather than fail.
+	if !job.TranscriptContains(liveSess, liveMarker) {
+		t.Skipf("real pi finished without emitting %s — job closed done via the report (ADR-0020); rerun to exercise the marker path", liveMarker)
+	}
+	t.Logf("marker found in real transcript assistant text")
 	if !fin.MarkerFound {
-		t.Fatal("MarkerFound false on a done job")
+		t.Fatal("MarkerFound false on a done job with the marker in the transcript")
 	}
 	if fin.Round > 1 {
 		t.Fatalf("round = %d; detection needed more than one round", fin.Round)

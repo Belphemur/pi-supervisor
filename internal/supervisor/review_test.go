@@ -356,9 +356,15 @@ func TestMonitorWritesStatusFileAndShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, _, statusPath := job.Paths("mon")
+	// Wait for THIS run's Monitor tick, not for any file that mentions the
+	// job: /tmp/pi_<name>_status.json is a fixed path shared across test
+	// processes, so a stale file from a previous run (e.g. left "stopped" by
+	// that run's Shutdown) otherwise satisfies the name check and the read
+	// below races this run's first 2s tick.
 	waitFor(t, 30*time.Second, func() bool {
 		data, err := os.ReadFile(statusPath)
-		return err == nil && strings.Contains(string(data), `"name": "mon"`)
+		return err == nil && strings.Contains(string(data), `"name": "mon"`) &&
+			strings.Contains(string(data), `"state": "running"`)
 	})
 	data, err := os.ReadFile(statusPath)
 	if err != nil {
