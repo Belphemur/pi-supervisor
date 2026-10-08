@@ -100,8 +100,13 @@ type runner struct {
 	started  time.Time
 	runlogB  int64
 	lastText string // the round's streamed assistant text (ADR-0020 budget)
-	stopCh   chan struct{}
-	active   bool
+	// reviewPromptDir is the unguessable 0700 per-campaign directory the
+	// wrapped review round prompt is written into (kody PR#9: even a
+	// per-job FIXED path under /tmp is symlink-plantable). Created once
+	// with os.MkdirTemp and reused every round; guarded by r.mu.
+	reviewPromptDir string
+	stopCh          chan struct{}
+	active          bool
 	// stopSource records who asked for the CURRENT stop ("operator" via
 	// Stop(), "daemon" via Shutdown) so the loop's classification points can
 	// persist it and emit the right event (ADR-0017). Guarded by r.mu; set
@@ -1827,8 +1832,8 @@ const campaignReplyContract = "<!-- daemon-mandatory: the supervisor injected th
 // writeCampaignRoundPrompt regenerates the campaign round prompt: the
 // operator's review brief wrapped by the daemon's mandatory-reply contract.
 // Regenerated EVERY round so a brief edit mid-campaign lands on the next
-// round; the file lives at the canonical per-job path.
-func (s *Supervisor) writeCampaignRoundPrompt(name, briefPath string) (string, error) {
+// round; the file lives in the runner's private per-campaign dir.
+func (s *Supervisor) writeCampaignRoundPrompt(r *runner, name, briefPath string) (string, error) {
 	body, err := os.ReadFile(briefPath)
 	if err != nil {
 		return "", fmt.Errorf("read review brief: %w", err)
@@ -1837,22 +1842,30 @@ func (s *Supervisor) writeCampaignRoundPrompt(name, briefPath string) (string, e
 	b.WriteString(campaignReplyContract)
 	b.WriteString("\n---\n\n")
 	b.Write(body)
-	// Private per-job directory (kody PR#9 re-review): a fixed predictable
-	// path under the shared /tmp is either a symlink-truncation hazard
-	// (O_NOFOLLOW) or — once the open fails loudly — a one-time plant that
-	// denies the campaign forever. A 0700 directory with a random suffix
-	// removes both: nothing predictable can be pre-planted, and the write
-	// is owner-only. The directory persists across rounds (the prompt is
-	// regenerated into it every round, and round N+1 overwrites the same
-	// file), so no temp litter accumulates.
-	dir := "/tmp/pi_" + name + "_review"
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create review prompt dir: %w", err)
+	// Unguessable per-job directory (kody PR#9 re-review round 2): even the
+	// per-job PARENT path was predictable — a local user pre-plants
+	// /tmp/pi_<job>_review as a symlink and MkdirAll follows it, redirecting
+	// the write into an attacker-chosen directory. os.MkdirTemp creates a
+	// dir whose NAME nobody can pre-plant (random suffix, 0700, created
+	// atomically by the kernel). The path is recorded on the runner so every
+	// round reuses the SAME dir (one dir per campaign, no temp litter); it
+	// lives with the daemon process and the kernel reclaims /tmp on reboot.
+	r.mu.Lock()
+	dir := r.reviewPromptDir
+	if dir == "" {
+		d, err := os.MkdirTemp("", "pi_"+name+"_review_")
+		if err != nil {
+			r.mu.Unlock()
+			return "", fmt.Errorf("create review prompt dir: %w", err)
+		}
+		dir = d
+		r.reviewPromptDir = d
 	}
+	r.mu.Unlock()
 	p := filepath.Join(dir, "round_prompt.md")
-	// O_NOFOLLOW stays: defense in depth if anything did plant a symlink
-	// INSIDE the 0700 dir (requires the daemon's own uid, i.e. a compromised
-	// process — not an external attacker).
+	// O_NOFOLLOW stays as defense in depth: planting anything inside the
+	// 0700 dir requires the daemon's own uid (a compromised process, not an
+	// external attacker), and the leaf then still refuses to follow.
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create round prompt: %w", err)
@@ -1975,7 +1988,7 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		// takes effect on the next round (the skill's stop-campaign-first
 		// rule stays: a reversal must never be picked up from a stale
 		// brief while the owner is rewriting it).
-		wrapped, err := s.writeCampaignRoundPrompt(j.Name, j.ReviewBrief)
+		wrapped, err := s.writeCampaignRoundPrompt(r, j.Name, j.ReviewBrief)
 		if err != nil {
 			s.logf(j.Name, "round %d: cannot build the campaign round prompt: %v", round, err)
 			return 1, 0, 0
