@@ -1837,13 +1837,22 @@ func (s *Supervisor) writeCampaignRoundPrompt(name, briefPath string) (string, e
 	b.WriteString(campaignReplyContract)
 	b.WriteString("\n---\n\n")
 	b.Write(body)
-	// 0600 AND O_NOFOLLOW (kody PR#9 follow-up): a pre-created symlink at
-	// this predictable path would otherwise be followed by os.WriteFile and
-	// truncate an unrelated file owned by the daemon's user on a multi-user
-	// host — the 0600 mode does not protect against that. O_NOFOLLOW makes
-	// the write fail loudly instead. The per-job file lives beside the job's
-	// other control files.
-	p := "/tmp/pi_" + name + "_review_round_prompt.md"
+	// Private per-job directory (kody PR#9 re-review): a fixed predictable
+	// path under the shared /tmp is either a symlink-truncation hazard
+	// (O_NOFOLLOW) or — once the open fails loudly — a one-time plant that
+	// denies the campaign forever. A 0700 directory with a random suffix
+	// removes both: nothing predictable can be pre-planted, and the write
+	// is owner-only. The directory persists across rounds (the prompt is
+	// regenerated into it every round, and round N+1 overwrites the same
+	// file), so no temp litter accumulates.
+	dir := "/tmp/pi_" + name + "_review"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create review prompt dir: %w", err)
+	}
+	p := filepath.Join(dir, "round_prompt.md")
+	// O_NOFOLLOW stays: defense in depth if anything did plant a symlink
+	// INSIDE the 0700 dir (requires the daemon's own uid, i.e. a compromised
+	// process — not an external attacker).
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create round prompt: %w", err)
