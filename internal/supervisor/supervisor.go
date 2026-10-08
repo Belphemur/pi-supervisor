@@ -1976,6 +1976,14 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	if err != nil {
 		return 1, 0, 0
 	}
+	// The budget's "did this round produce anything" signal must describe
+	// THIS round: lastText survives the backstop/stop return paths (which
+	// never refresh it), so a stale value from the previous round would
+	// otherwise spend budget on an empty one (kody PR#9 follow-up). Clear
+	// at round start; only a completed round's result re-fills it.
+	r.mu.Lock()
+	r.lastText = ""
+	r.mu.Unlock()
 	// The run log is a diagnostic mirror; the round's verdict comes from
 	// the client Result, so a failed close (append-only handle) is not fatal.
 	defer func() { _ = out.Close() }()
