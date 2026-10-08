@@ -19,7 +19,12 @@ type reviewCampaign struct {
 	repo     string
 	round    int
 	maxRound int
-	kind     string // acceptance|rebuttal
+	// spent counts rounds that actually DID something (runlog > 0): the
+	// budget is spent on work, not on provider flakes that returned an
+	// empty 0-token response and produced nothing (flambette#65 rounds
+	// 5-6). Exhaustion reads this, not the raw loop round.
+	kind  string // acceptance|rebuttal
+	spent int
 	// answered records, per round, which threads this job posted a reply on.
 	// The resolve guard reads it. Keyed by round so a reply from round N-1
 	// does NOT authorize a resolve in round N: the ADR requires the answer and

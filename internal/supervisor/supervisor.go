@@ -817,7 +817,29 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		default:
 		}
 		r.mu.Unlock()
-		if round > maxRounds {
+		// A campaign's budget counts ROUNDS WITH WORK, not raw loop rounds
+		// (ADR-0012 §4.2 amendment): a provider that returns an empty
+		// 0-token response — flambette#65 rounds 5-6, 3-4s each, nothing
+		// done — must not burn the operator's round budget on nothing. The
+		// loop increments c.spent below ONLY when a round produced output
+		// (runlog > 0); exhaustion is spent >= maxRound. Build jobs keep
+		// the raw round > maxRounds cap (their rounds are cheap and the
+		// marker/report gate governs them).
+		campaignExhausted := false
+		if reviewing {
+			if c := r.review; c != nil {
+				c.mu.Lock()
+				// Two exhaustion conditions: the budget is SPENT on real
+				// rounds, or the raw loop ran to 3× the budget — the
+				// backstop against a provider that returns rc=0 empty
+				// responses forever (free rounds must not mean infinite
+				// rounds).
+				campaignExhausted = c.maxRound > 0 &&
+					(c.spent >= c.maxRound || round >= c.maxRound*3)
+				c.mu.Unlock()
+			}
+		}
+		if campaignExhausted || (!reviewing && round > maxRounds) {
 			r.mu.Lock()
 			name := r.job.Name
 			r.mu.Unlock()
@@ -1033,6 +1055,17 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				r.job.SessionPath = found
 				r.mu.Unlock()
 				_ = job.Save(r.job)
+			}
+		}
+		// Budget accounting: a campaign round counts against the budget only
+		// when the agent actually produced something. An empty round (provider
+		// returned a 0-token response; runlog empty, nothing on the transcript)
+		// is free — the operator's budget is for work, not for flakes.
+		if reviewing && runlogB > 0 {
+			if c := r.review; c != nil {
+				c.mu.Lock()
+				c.spent++
+				c.mu.Unlock()
 			}
 		}
 		select {
@@ -1741,6 +1774,53 @@ func (r *runner) finish(state, diag string) {
 	r.closeSessWatch() // a job that never adopted a transcript must not leak its watcher
 }
 
+// campaignReplyContract is the MANDATORY part of every campaign round prompt
+// (owner directive 2026-10-08). The operator brief carries context and triage
+// guidance; this block carries the non-negotiable obligation: a round answers
+// its open threads with post_replies, through the shim, before it ends. The
+// flambette#65 campaign showed every way a round can end WITHOUT replying —
+// empty provider responses, build-brief drift, a mid-round kill — and a round
+// that never reached post_replies is the one outcome the budget buys nothing
+// for.
+const campaignReplyContract = "<!-- daemon-mandatory: the supervisor injected this block; do not skip -->\n" +
+	"## MANDATORY: reply to every open thread this round\n\n" +
+	"Your round is NOT complete until `_pi-supervisor-review post_replies` has\n" +
+	"answered **EVERY open thread** on the PR — exactly once each, this round:\n\n" +
+	"- **Real defect** → fix it in code (build must stay green), then reply with\n" +
+	"  the fix description and the commit.\n" +
+	"- **Non-issue** → reply with the evidence (file:line, gate/ADR reference).\n" +
+	"  Findings contradicting a recorded ADR decision are non-issues: rebut with\n" +
+	"  the ADR line, do not renegotiate.\n" +
+	"- **Out of scope** → reply stating the deferral explicitly.\n\n" +
+	"Start with `list_threads`, triage, do the work, then `post_replies` with\n" +
+	"the batch, then `resolve_thread` per answered thread (reply BEFORE resolve —\n" +
+	"the daemon refuses a resolve with no reply this round). **Ending the turn\n" +
+	"without a post_replies call is a failed round**: the supervisor counts the\n" +
+	"round against the budget and the threads stay open.\n\n" +
+	"If you are genuinely blocked (auth, missing data), say so in your final\n" +
+	"message AND reply to the threads you could answer anyway — partial beats\n" +
+	"silent.\n"
+
+// writeCampaignRoundPrompt regenerates the campaign round prompt: the
+// operator's review brief wrapped by the daemon's mandatory-reply contract.
+// Regenerated EVERY round so a brief edit mid-campaign lands on the next
+// round; the file lives at the canonical per-job path.
+func (s *Supervisor) writeCampaignRoundPrompt(name, briefPath string) (string, error) {
+	body, err := os.ReadFile(briefPath)
+	if err != nil {
+		return "", fmt.Errorf("read review brief: %w", err)
+	}
+	var b strings.Builder
+	b.WriteString(campaignReplyContract)
+	b.WriteString("\n---\n\n")
+	b.Write(body)
+	p := filepath.Join(os.TempDir(), "pi_"+name+"_review_round_prompt.md")
+	if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
+		return "", fmt.Errorf("write round prompt: %w", err)
+	}
+	return p, nil
+}
+
 // round runs one pi RPC round via the daemon-native client (internal/client);
 // hard-kills the pi process group at timeout+120s as a backstop.
 func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, dur int64, runlogB int64) {
@@ -1831,10 +1911,38 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		s.logf(j.Name, "round %d: cannot reset ack log %s: %v", round, job.Ack(j.Name), err)
 	}
 
+	promptPath := j.Brief
+	if reviewing && j.ReviewBrief != "" {
+		// ADR-0018: a campaign's rounds are seeded/RE-anchored with the
+		// review brief — BOTH the round-1 LAUNCH and every later RESUME.
+		// A resume that re-sent the BUILD continuation instead pulled the
+		// agent back into build tasks mid-campaign (flambette#65 round 8:
+		// "Now task 2 — identity store" while 12 threads sat open). The
+		// brief restates the triage contract every round, which is exactly
+		// the anchor a drifted session needs.
+		//
+		// The operator brief is WRAPPED with the daemon's mandatory-reply
+		// contract (owner directive 2026-10-08): the brief is the operator's
+		// context, but the REPLY OBLIGATION is the daemon's — it is the one
+		// thing a round exists to produce. The wrapped file is regenerated
+		// every round from the current brief, so a brief edit mid-campaign
+		// takes effect on the next round (the skill's stop-campaign-first
+		// rule stays: a reversal must never be picked up from a stale
+		// brief while the owner is rewriting it).
+		wrapped, err := s.writeCampaignRoundPrompt(j.Name, j.ReviewBrief)
+		if err != nil {
+			s.logf(j.Name, "round %d: cannot build the campaign round prompt: %v", round, err)
+			return 1, 0, 0
+		}
+		promptPath = wrapped
+	} else if resume {
+		promptPath = j.Cont
+	}
+
 	if resume {
-		s.logf(j.Name, "round %d: RESUME %s", round, j.SessionPath)
+		s.logf(j.Name, "round %d: RESUME %s (prompt %s)", round, j.SessionPath, promptPath)
 	} else {
-		s.logf(j.Name, "round %d: LAUNCH brief=%s", round, j.Brief)
+		s.logf(j.Name, "round %d: LAUNCH prompt=%s", round, promptPath)
 	}
 
 	out, err := os.OpenFile(runlog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -1845,15 +1953,6 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 	// the client Result, so a failed close (append-only handle) is not fatal.
 	defer func() { _ = out.Close() }()
 
-	promptPath := j.Brief
-	if resume {
-		promptPath = j.Cont
-	} else if reviewing && j.ReviewBrief != "" {
-		// ADR-0018: a campaign's round 1 LAUNCH is seeded with the review
-		// brief, never the build brief — the build brief asks for work the
-		// campaign's session must not redo.
-		promptPath = j.ReviewBrief
-	}
 	prompt, err := client.DefaultPromptFile(promptPath)
 	if err != nil {
 		s.logf(j.Name, "round %d: prompt unreadable: %v", round, err)

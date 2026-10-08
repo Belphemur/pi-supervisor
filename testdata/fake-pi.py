@@ -136,8 +136,24 @@ def emit(prompt):
     if "TEST_TASKWATCH" in prompt:
         emit_taskwatch(prompt)
         return
+    if "TEST_EMPTY" in prompt:
+        # Provider-flake shape (flambette#65 campaign rounds 5-6): the
+        # request succeeds, agent_end arrives, but ZERO text was streamed —
+        # content [], 0 tokens. The round ends rc=0 with an empty run log.
+        # pi STILL writes its session transcript (empty responses happen in
+        # a live session), so mirror that: create the transcript like
+        # TEST_MKSESSION does, minus any text.
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        munged = "--" + os.getcwd().lstrip("/").replace("/", "-") + "--"
+        sdir = os.path.join(home, ".pi", "agent", "sessions", munged)
+        os.makedirs(sdir, exist_ok=True)
+        sess_path = os.path.join(sdir, "sess-empty-%d.jsonl" % os.getpid())
+        with open(sess_path, "w") as fh:
+            fh.write('{"type":"session","id":"fake-empty"}\n')
+        time.sleep(0.2)
+        out({"type": "agent_end"})
+        return
     if "TEST_MKSESSION" in prompt:
-        # pi writes its session transcript asynchronously into the
         # cwd-keyed sessions dir: $HOME/.pi/agent/sessions/--<munged>--,
         # munged exactly like job.MungedSessionsDir (leading / stripped,
         # "/" -> "-"). Create it a beat AFTER the launch so the watcher

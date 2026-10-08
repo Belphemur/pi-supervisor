@@ -216,6 +216,7 @@ func Run(o Options) Result {
 		_ = reap(cmd, 5*time.Second)
 		return fail(start, res, fmt.Sprintf("send prompt: %v", err))
 	}
+	st.setBusy(true)
 	// ADR-0014: ask for session identity once per round. The reply is a
 	// `response` frame correlated by command; the reader consumes it without
 	// touching the error path (only success:false fails a round).
@@ -349,6 +350,7 @@ type stream struct {
 	holdEnd bool // an abort is in flight: the next agent_end is the aborted turn
 	drain   bool // hold further control frames until the aborted turn ends
 	turnEnd bool // reader flagged the aborted turn's agent_end
+	busy    bool // a turn is in flight: prompt forwarded, agent_end not yet seen
 	held    []any
 	out     *bufio.Writer
 	diagf   func(string, ...any)
@@ -397,6 +399,7 @@ func (s *stream) read(r io.Reader) {
 			}
 		case "agent_end":
 			s.mu.Lock()
+			s.busy = false // the turn is over; a plain prompt is deliverable again
 			if s.holdEnd {
 				// This agent_end closes the ABORTED turn, not our job.
 				s.turnEnd = true
@@ -593,6 +596,23 @@ func (s *stream) text() string {
 	return strings.TrimSpace(s.buf.String())
 }
 
+// setBusy records whether a turn is in flight (prompt forwarded, agent_end
+// not yet seen). Mid-turn prompt frames need pi's streamingBehavior field —
+// a plain prompt while processing is rejected ("Agent is already processing")
+// and that error was killing whole rounds (flambette#65 campaign, 2026-10-08).
+func (s *stream) setBusy(b bool) {
+	s.mu.Lock()
+	s.busy = b
+	s.mu.Unlock()
+}
+
+// processing reports whether a turn is in flight.
+func (s *stream) processing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.busy
+}
+
 // forwardable reports whether a control frame may be sent to pi now, and
 // releases frames held during an abort drain once the turn has ended.
 func (s *stream) forwardable(frameType string) (send bool, hold bool) {
@@ -755,6 +775,18 @@ func (c *controlReader) deliver(ln string, send func(any) error, st *stream, dia
 		c.heldAt = append(c.heldAt, time.Now())
 		c.ack.record(frameID(frame), job.AckHeld, frameType(frame), "queued behind an in-flight abort", 0)
 		return
+	}
+	// A prompt reaching pi MID-TURN must carry streamingBehavior: a plain
+	// prompt while processing is rejected outright ("Agent is already
+	// processing") and that rejection surfaced as a client error, killing
+	// the whole round (flambette#65 campaign rounds 7-8). "steer" interjects
+	// the message into the live turn without aborting it — the ADR-0019
+	// reminder's exact purpose — and an idle agent gets the frame as-is,
+	// matching the original r1 prompt shape.
+	if frameType(frame) == "prompt" && st.processing() {
+		if _, ok := frame["streamingBehavior"]; !ok {
+			frame["streamingBehavior"] = "steer"
+		}
 	}
 	if err := send(frame); err != nil {
 		fmt.Fprintf(diagOut, "[control] send failed: %v\n", err)
