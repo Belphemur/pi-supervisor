@@ -1837,13 +1837,23 @@ func (s *Supervisor) writeCampaignRoundPrompt(name, briefPath string) (string, e
 	b.WriteString(campaignReplyContract)
 	b.WriteString("\n---\n\n")
 	b.Write(body)
-	// 0600, not the world-readable default (qodo PR#9 finding 4): the prompt
-	// quotes open review findings — attacker-controllable text — and a
-	// world-readable file under /tmp invites both reads and symlink
-	// redirection on a multi-user host.
+	// 0600 AND O_NOFOLLOW (kody PR#9 follow-up): a pre-created symlink at
+	// this predictable path would otherwise be followed by os.WriteFile and
+	// truncate an unrelated file owned by the daemon's user on a multi-user
+	// host — the 0600 mode does not protect against that. O_NOFOLLOW makes
+	// the write fail loudly instead. The per-job file lives beside the job's
+	// other control files.
 	p := "/tmp/pi_" + name + "_review_round_prompt.md"
-	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("create round prompt: %w", err)
+	}
+	if _, err := f.Write([]byte(b.String())); err != nil {
+		_ = f.Close()
 		return "", fmt.Errorf("write round prompt: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("close round prompt: %w", err)
 	}
 	return p, nil
 }
