@@ -3,6 +3,10 @@
 ## Status
 
 Accepted. Implementation follows this ADR.
+Superseded IN PART by [ADR-0020](0020-report-is-the-completion-signal.md):
+the transcript text-block rule stands, but the "marker AND report" done
+conjunction is replaced — the report alone closes done, and the marker asks
+for the report (twice) instead of gatekeeping it.
 
 ## Context
 

@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.6.0
+version: 1.7.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -166,16 +166,20 @@ systemd (Type=notify, WatchdogSec=120)
   later round RESUMEs `--session <path>`. Never re-LAUNCH (forks the session).
 - **Instant-exit strikes:** rc≠0 && <60s && runlog <4KB ⇒ strike; 3 strikes ⇒
   job `fatal` (context wall / model refusal — needs operator action).
-- **Completion:** final report exists AND the marker appears in an **assistant
-  message in the session transcript** ⇒ job `done` (ADR-0011). The transcript
-  is streamed live while the round runs, so the marker is detected mid-turn,
-  and the latch is sticky for the job. It is deliberately NOT the run log:
-  `round()` truncates `/tmp/pi_<job>_run.log` at the start of every round, so a
-  marker from an earlier round is structurally invisible there — that bug made
-  `mealime-roomux` burn 14 rounds on finished work (PR #43) and end `fatal`.
-  Only assistant **text blocks** count: DCP compression summaries, the user
-  brief, and `toolCall` arguments all quote the marker without the agent
-  having finished.
+- **Completion (ADR-0020, supersedes ADR-0011's conjunction):** the fully
+  written final report closes the job `done` — exists, does not declare
+  itself incomplete, mtime not before the run's `StartedAt`. The marker
+  (assistant TEXT blocks, streamed live and sticky — never the truncated run
+  log) is the completion INTENT: seen on any surface without a report, the
+  daemon steers the agent to write the report (`report_requested` event,
+  `report_steers` in status), asks TWICE, then closes `fatal` naming the
+  missing artifact. A round-cap fatal names the marker's non-text surfaces
+  (thinking blocks, toolCall args) when they exist, so "without marker" is
+  reserved for markers that are genuinely nowhere. Only assistant **text
+  blocks** count toward done: DCP compression summaries, the user brief,
+  and `toolCall` arguments all quote the marker without the agent having
+  finished (the position-restore run, PR #203, was the live case: report
+  complete and ending in the marker, 20 transcript hits, 0 text emits).
 - **Steering:** wraps prose in a `{"type":"prompt","message":...}` frame
   (a hand-written JSON frame with a `type` field passes through unchanged);
   each frame gets an id (`steer-<ns>-<seq>`) written to the job's control
@@ -313,8 +317,8 @@ Behavior:
 
 | Symptom | Meaning / action |
 |---|---|
-| job ends `fatal` with "round cap reached without marker" but the work is visibly finished and a PR exists | the marker WAS emitted but the gate could not see it. Check `logs <job>` for `marker ... streamed from session transcript`; on a pre-ADR-0011 daemon this was the run-log truncation bug (fixed — upgrade). `status` now shows `marker_found` truthfully mid-round |
-| `status` shows `marker_found: true` but the job is not `done` | the marker was seen but `final_report` does not exist yet — the second half of the gate. Write the report at the path in the job JSON |
+| job ends `fatal` with "round cap reached without marker" but the work is visibly finished and a PR exists | **pre-ADR-0020 diagnosis.** On an ADR-0020 daemon the fatal names the marker's non-text surfaces (thinking blocks, toolCall args) when they exist, and a report-complete run closes done at the boundary — upgrade. Verify on the old daemon with the `pi-supervisor-forensics` marker-surface classifier before touching code |
+| `status` shows `marker_found: true` but the job is not `done` | the marker was seen but `final_report` does not exist yet. ADR-0020: the daemon asks twice (`report_requested` events, `report_steers` in status) and then fatals — check `report_steers`; if it is still 0 with rounds lasting seconds, the steer window is too short (known design limit for sub-second rounds; real rounds are minutes) |
 | job state `fatal`, diag "3 consecutive instant exits" | session context wall — start a fresh session (new job or clear state) or trim the session |
 | `status` says fatal but the armed watch never reported it | the watch was a one-shot (no `-t`): it exits after its FIRST event (`round_done`/`backoff`) and must be re-armed — the fatal after that had no listener. Arm `watch -t` (background+notify). If the stream was live across a daemon restart, the client now reconnects and the missed terminal arrives as the precheck (ADR-0015); only a connection that never answered fails at once. |
 | job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |

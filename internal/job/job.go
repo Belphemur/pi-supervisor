@@ -159,6 +159,11 @@ type State struct {
 	// to the gate — otherwise a finished job livelocks to MaxRounds and ends
 	// fatal (exactly what happened to mealime-roomux on PR #43).
 	MarkerSeen bool `json:"marker_seen,omitempty"`
+	// ReportSteers counts how many times the daemon has ASKED the agent to
+	// write the missing final report (ADR-0020). The marker on any surface
+	// means the agent believes the work is done; the report is the record.
+	// Two asks, then fatal — a third ask would just burn rounds.
+	ReportSteers int `json:"report_steers,omitempty"`
 	// StopSource records WHO stopped the job at its last stop: "operator"
 	// (explicit `pi-supervisor stop`) or "daemon" (the daemon's own SIGTERM
 	// shutdown, e.g. a systemd restart during install). It is the whole
@@ -247,6 +252,10 @@ type Status struct {
 	// round must survive to the gate — otherwise a finished job livelocks to
 	// MaxRounds and ends fatal.
 	MarkerSeen bool `json:"marker_seen,omitempty"`
+	// ReportSteers mirrors State.ReportSteers (ADR-0020): how many times the
+	// daemon asked the agent to write the missing final report. 2 with no
+	// report is the fatal condition.
+	ReportSteers int `json:"report_steers,omitempty"`
 	// PRURL is the pull-request URL found in the last round's transcript
 	// (ADR-0006); "" when none was linked.
 	PRURL string `json:"pr_url,omitempty"`
