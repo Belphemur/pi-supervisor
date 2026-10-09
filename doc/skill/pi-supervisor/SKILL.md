@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.7.0
+version: 1.8.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -252,6 +252,14 @@ Behavior:
   `pull request: <url>`. It is a best-effort scrape, so `pr_url` is absent
   when the agent opened a PR without linking it — "" means "not linked", not
   "no PR".
+- **The model usage is in the payload too (ADR-0021).** `status` carries
+  `current_model` (what is answering right now) and `models_used` (every
+  distinct model this run, first-seen order), scraped from assistant
+  records' `provider`/`model` pair in the transcript. The job def's
+  `provider`/`model` is a REQUEST; these fields are EVIDENCE — on routed
+  providers they diverge routinely. Quoted "model" text in briefs, steers,
+  or toolResults never counts. Model swaps mid-run (provider failover,
+  operator swap) show up the moment the next assistant record lands.
 - **Finished run ⇒ immediate return.** If the job is already done/fatal/stopped
   when you arm, the watch does NOT block — it prints
   `THE RUN IS OVER — <job> <event>`, points at `status`, and says not to re-arm.
@@ -323,7 +331,9 @@ Behavior:
 | `status` says fatal but the armed watch never reported it | the watch was a one-shot (no `-t`): it exits after its FIRST event (`round_done`/`backoff`) and must be re-armed — the fatal after that had no listener. Arm `watch -t` (background+notify). If the stream was live across a daemon restart, the client now reconnects and the missed terminal arrives as the precheck (ADR-0015); only a connection that never answered fails at once. |
 | job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |
 || job ends `fatal` with "round cap reached without marker" but the code is committed + pushed and a PR exists | **The marker WAS emitted but the gate could not latch it.** Verify before concluding anything is wrong: `grep -c '<MARKER>' <session_path>` and, decisively, `grep '<MARKER>' <session_path> | grep -c '"role":"assistant"'` — a non-zero count in an ASSISTANT message proves the agent finished (per ADR-0011 only assistant text counts). Then check whether the FINAL REPORT exists; pi often finishes the work, emits the marker, and dies before writing the report. In that case the supervisor cannot be trusted to have recorded the outcome — re-derive it yourself from the commits (`git log <base>..HEAD`, `git diff --stat`) and RE-RUN the gates rather than trusting the run log, then write the missing report. Re-running the gates is not optional: a run log claiming "CI 8/8 green, all shipped" is a self-report. |
+| `start` says `unknown job` right after you wrote `jobs/<name>.json` | the daemon loads job DEFINITIONS from disk only on `pi-supervisor reload` — writing the JSON does not register it. Reload, then start. |
 | `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
+| rounds die in seconds: round 1 `exit=0` with an EMPTY assistant message, resume round `exit=1` with `prompt unreadable: empty prompt` | the configured model is returning empty completions (or its fallback rotation landed on one that does) — a provider/model fault, not a context wall. Check the session JSONL for `model_change` entries naming the failing model, pin a known-good model as `defaultModel` in `~/.pi/agent/settings.json`, then `restart <job> --fresh`. Do not retry the same model: the empty-reply shape repeats every time. |
 || `start` after a stopped run silently resumes the OLD session (fresh-LAUNCH intent defeated) | **RESOLVED — use `pi-supervisor restart <job> --fresh`** (ADR-0010). It quarantines the transcript to `<dir>/_archived-stale/<stem>_<ts>.jsonl`, clears `session_path`, resets the round counter, and relaunches with brief+cont re-read from disk. (Pre-ADR-0010 you had to `mv` the JSONL out of the munged dir and clear the state file by hand; don't do that anymore — the daemon sequence has no re-adoption window.) |
 || `steer` reports `forwarded` but pi never acted on it | ack `outcome: forwarded` is written when the control frame lands on disk, NOT when pi reads it; the control file is truncated at each round start, so a steer delivered while pi is parked in a CI/review poll (`gh pr checks --watch`) is wiped unread and the `forwarded` ack becomes a false positive. Wait until `status` shows a live round NOT polling CI, then re-send; if the round is in its polling window, use `steer --interrupt` so the current turn is dropped and pi reads the frame on the next prompt. |
 || round is alive but `tool_use` stays 0 and `session_bytes` is frozen (pi pid alive, `Sl`, empty assistant turns) | empty-turn stall. **Now detected automatically** (ADR-0010): the first window emits an `empty_turn` event in `watch`; a second consecutive window escalates on the same abort+re-prompt path as `ci_stall`. Tune the window with `empty_turn_idle_s` in the job JSON (default 60s). |

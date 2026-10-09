@@ -301,6 +301,163 @@ func (s *PRURLScanner) PRURL() string {
 // offset. Bounding a read is not the same as bounding what gets scanned.
 const prURLChunkBytes = 256 << 10
 
+// modelChunkBytes bounds ONE read of the model scanner. Same rationale as
+// prURLChunkBytes: bounding a read is not the same as bounding what gets
+// scanned — the offset bounds the total.
+const modelChunkBytes = 256 << 10
+
+// modelOverlapBytes is how far back each incremental read reaches. It must
+// cover the longest possible `"provider":"…","model":"…"` pair straddling a
+// boundary. Provider and model strings are bounded in practice, but the
+// overlap is cheap: re-scanning 8KiB costs nothing next to a missed model.
+const modelOverlapBytes = 8 << 10
+
+// modelRe extracts the provider+model pair from an assistant record. The
+// pair — not the bare `"model":"…"` — is matched on purpose: the pair only
+// occurs in the assistant record's header (where pi records who answered),
+// while a bare `"model":"…"` also appears in operator briefs, steers, and
+// toolResult quotes, where it names a REQUEST, not an answer. Escaped-quote
+// handling is unnecessary for the common case: provider/model slugs do not
+// contain quotes, and the field set is bounded by pi's RPC docs.
+var modelRe = regexp.MustCompile(
+	`"provider":"([^"\\]+)","model":"([^"\\]+)"`)
+
+// ModelUse is one model identity scraped from an assistant record.
+type ModelUse struct {
+	Provider string
+	Model    string
+}
+
+// String renders "provider/model" — the canonical surface form.
+func (m ModelUse) String() string {
+	if m.Provider == "" {
+		return m.Model
+	}
+	return m.Provider + "/" + m.Model
+}
+
+// ModelScanner is the incremental model-identity scanner for one transcript
+// (ADR-0021). Same discipline as PRURLScanner: offset + inode rotation check
+// + overlap, append-only, never re-reads the whole file. It is the ONE
+// component that parses transcript records for model identity; nothing else
+// re-derives it.
+type ModelScanner struct {
+	mu       sync.Mutex
+	path     string
+	offset   int64
+	lastSize int64
+	lastIno  uint64
+	// last is the most recent model seen (current_model); order remembers
+	// every distinct model in first-seen order (models_used).
+	last    string
+	seen    []string
+	seenSet map[string]bool
+}
+
+// NewModelScanner starts a scanner for one transcript path.
+func NewModelScanner(path string) *ModelScanner {
+	return &ModelScanner{path: path, seenSet: map[string]bool{}}
+}
+
+// Path is the transcript this scanner reads, so a caller holding one per job
+// can tell whether it still matches the job's current session.
+func (s *ModelScanner) Path() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path
+}
+
+// Current is the most recent model seen ("provider/model"), "" before the
+// first assistant record lands.
+func (s *ModelScanner) Current() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
+}
+
+// Used is every distinct model in first-seen order. The slice is copied so
+// the caller cannot mutate the scanner's view.
+func (s *ModelScanner) Used() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.seen))
+	copy(out, s.seen)
+	return out
+}
+
+// Scan reads bytes appended since the previous call and updates the current
+// model and the used list. "" returns are normal: no assistant record has
+// landed yet, or nothing new was appended.
+func (s *ModelScanner) Scan() (current string, used []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	fi, err := os.Stat(s.path)
+	if err != nil {
+		return s.last, s.copySeen()
+	}
+	size := fi.Size()
+	ino, inoOK := inodeOf(fi)
+	// Truncated/rotated/replaced — same discipline as PRURLScanner: the
+	// offset is meaningless, start over; the used list SURVIVES a truncate
+	// only if the same file comes back (a restart --fresh changes the path,
+	// which recreates the scanner anyway).
+	if size < s.offset {
+		s.offset, s.lastSize = 0, 0
+		s.last = ""
+	}
+	if inoOK && s.lastIno != 0 && ino != s.lastIno {
+		// A replacement file is NEW content at the same path: the used list
+		// resets with everything else. (A restart --fresh changes the path
+		// and recreates the scanner wholesale; this path covers in-place
+		// rewrites.) The inconsistency of clearing `last` but keeping `seen`
+		// would surface as a current model missing from the used list.
+		s.offset, s.last, s.lastSize = 0, "", 0
+		s.seen, s.seenSet = nil, map[string]bool{}
+	}
+	if inoOK {
+		s.lastIno = ino
+	}
+	if size == s.lastSize && s.offset >= size {
+		return s.last, s.copySeen()
+	}
+
+	readTo := min(s.offset+modelChunkBytes, size)
+	from := s.offset
+	if from > modelOverlapBytes {
+		from -= modelOverlapBytes
+	}
+
+	buf := make([]byte, readTo-from)
+	n, _ := readFileAt(s.path, buf, from)
+	if n > 0 {
+		s.offset = from + int64(n)
+	}
+	if s.offset >= size {
+		s.lastSize = size
+	} else {
+		s.lastSize = -1
+	}
+	if n <= 0 {
+		return s.last, s.copySeen()
+	}
+	for _, m := range modelRe.FindAllSubmatch(buf[:n], -1) {
+		use := ModelUse{Provider: string(m[1]), Model: string(m[2])}
+		s.last = use.String()
+		if !s.seenSet[s.last] {
+			s.seenSet[s.last] = true
+			s.seen = append(s.seen, s.last)
+		}
+	}
+	return s.last, s.copySeen()
+}
+
+func (s *ModelScanner) copySeen() []string {
+	out := make([]string, len(s.seen))
+	copy(out, s.seen)
+	return out
+}
+
 // readFileAt reads into buf at off, tolerating a short read: a PR link near the
 // tail is exactly what we came for, so partial data is better than none.
 func readFileAt(path string, buf []byte, off int64) (int, error) {

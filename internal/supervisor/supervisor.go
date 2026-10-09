@@ -151,6 +151,10 @@ type runner struct {
 	// only ever reads bytes appended since the last call instead of re-reading a
 	// growing file every round. Reset when the session path changes.
 	prScanner *stall.PRURLScanner
+	// modelScanner is the incremental model-identity scanner (ADR-0021) —
+	// same lifecycle as prScanner: held per runner, incremental, reset when
+	// the session path changes.
+	modelScanner *stall.ModelScanner
 	// launchedAt is when the current round spawned pi. It is the floor for
 	// session discovery: a transcript that predates the spawn cannot be this
 	// round's session, so FindSession must not adopt it. Zero on a RESUME
@@ -259,6 +263,7 @@ func (r *runner) snapshot() job.Status {
 		LastRunlogB: r.runlogB, InstantExits: r.state.InstantExits,
 		CIStalls: r.state.CIStalls, ReportSteers: r.state.ReportSteers,
 		LastDiag: r.state.LastDiag, PRURL: r.state.PRURL,
+		ModelsUsed: r.state.ModelsUsed, CurrentModel: r.state.CurrentModel,
 		LastUpdate: time.Now().Format(time.RFC3339),
 	}
 	if r.job.FinalReport != "" {
@@ -515,6 +520,10 @@ func (s *Supervisor) Restart(name string) error {
 	r.state.MarkerSeen = false
 	r.state.ReportSteers = 0
 	r.state.StartedAt = ""
+	// Model usage is run-scoped evidence (ADR-0021): a fresh run's models
+	// must not be mixed with the previous run's list.
+	r.state.ModelsUsed = nil
+	r.state.CurrentModel = ""
 	// Run-scoped in-memory report-request state: a fresh run must not
 	// inherit an armed ask or spent grace budget (kody, PR#7).
 	r.pendingReportSteer = false
@@ -1293,6 +1302,34 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			r.mu.Unlock()
 			if u := sc.PRURL(); u != "" {
 				s.recordPR(r, u)
+			}
+		}
+
+		// Model identity (ADR-0021): scanned whenever a session exists,
+		// unlike the PR scrape which stops at the first link — the model can
+		// change mid-run (provider failover, operator swap) and the used
+		// list must follow. Same incremental discipline, same runner-held
+		// scanner, same reset-on-session-change.
+		if sess != "" {
+			r.mu.Lock()
+			if r.modelScanner == nil || r.modelScanner.Path() != sess {
+				r.modelScanner = stall.NewModelScanner(sess)
+			}
+			ms := r.modelScanner
+			r.mu.Unlock()
+			if cur, used := ms.Scan(); len(used) > 0 {
+				r.mu.Lock()
+				changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
+				if changed {
+					r.state.ModelsUsed = used
+					r.state.CurrentModel = cur
+				}
+				name := r.job.Name
+				r.mu.Unlock()
+				if changed {
+					r.persistState()
+					s.logf(name, "model: %s (used this run: %s)", cur, strings.Join(used, ", "))
+				}
 			}
 		}
 
@@ -2646,6 +2683,20 @@ func (s *Supervisor) watchEmptyTurn(r *runner, sess string, round int, watchStop
 			return
 		}
 	}
+}
+
+// equalStrings is a nil-safe slice equality for the model list's
+// changed-detection; slices cannot be compared with ==.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // recordPR stores the first pull-request URL seen in the round's transcript
