@@ -353,6 +353,12 @@ type ModelScanner struct {
 	offset   int64
 	lastSize int64
 	lastIno  uint64
+	// lastMod guards the nothing-new short-circuit: an in-place rewrite can
+	// reuse the SAME inode AND the SAME size (remove+recreate does exactly
+	// that on ext4/overlayfs — caught by CI, never locally), so neither
+	// check alone proves the content unchanged. A bumped ModTime always
+	// means bytes worth (re)scanning.
+	lastMod time.Time
 	// partial carries the incomplete trailing line between reads: the offset
 	// commits to the raw end of what was read, so a record straddling a
 	// chunk boundary is only parsed once its newline has landed.
@@ -422,9 +428,21 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 	if inoOK {
 		s.lastIno = ino
 	}
-	if size == s.lastSize && s.offset >= size {
+	// ModTime is the rewrite detector: a remove+recreate can reuse the same
+	// inode AND the same size (caught by CI on overlayfs), so neither proves
+	// the content unchanged. A bumped mtime with a caught-up offset and no
+	// size growth means an IN-PLACE REWRITE — the offset points past the new
+	// content, so it must reset to 0 (and the model state with it) or the
+	// scanner reads an empty window forever and reports the stale model.
+	rewritten := fi.ModTime().After(s.lastMod) && s.offset >= size && size == s.lastSize
+	if rewritten {
+		s.reset()
+	}
+	// Nothing-new short-circuit: size, offset, and mtime all agree.
+	if size == s.lastSize && s.offset >= size && !fi.ModTime().After(s.lastMod) {
 		return s.last, s.copySeen()
 	}
+	s.lastMod = fi.ModTime()
 
 	readTo := min(s.offset+modelChunkBytes, size)
 	buf := make([]byte, readTo-s.offset)
@@ -494,6 +512,7 @@ func (s *ModelScanner) reset() {
 	s.offset, s.lastSize, s.partial = 0, 0, ""
 	s.last = ""
 	s.seen, s.seenSet = nil, map[string]bool{}
+	s.lastMod = time.Time{}
 }
 
 func (s *ModelScanner) copySeen() []string {
