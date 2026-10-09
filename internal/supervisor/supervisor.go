@@ -1899,15 +1899,10 @@ func (s *Supervisor) writeCampaignRoundPrompt(r *runner, name, briefPath string)
 	return p, nil
 }
 
-// reviewSkillDir resolves the pi_supervisor_review skill directory — the
-// shim's usage contract — so every campaign round can be seeded with it
-// explicitly (owner directive 2026-10-08). The shim is installed as a
-// symlink to the canonical copy's dir, so resolving it yields the skill dir
-// itself; the pi discovery symlink (~/.pi/agent/skills/pi_supervisor_review,
-// created by install.sh) is the fallback. "" when neither resolves: the
-// caller logs a warning and the round runs without the skill (the wrapped
-// prompt's mandatory-reply contract still carries the obligation).
-func reviewSkillDir() string {
+// reviewSkillDirImpl is the production resolver; reviewSkillDir is the seam
+// the tests stub (same pattern as listOpenThreads) so CI can exercise the
+// injection without an installed shim.
+var reviewSkillDirImpl = func() string {
 	if p, err := exec.LookPath("_pi-supervisor-review"); err == nil {
 		if resolved, err := filepath.EvalSymlinks(p); err == nil {
 			dir := filepath.Dir(resolved)
@@ -1927,28 +1922,57 @@ func reviewSkillDir() string {
 	return ""
 }
 
+// reviewSkillDir resolves the pi_supervisor_review skill directory — the
+// shim's usage contract — so every campaign round can be seeded with it
+// explicitly (owner directive 2026-10-08). The shim is installed as a
+// symlink to the canonical copy's dir, so resolving it yields the skill dir
+// itself; the pi discovery symlink (~/.pi/agent/skills/pi_supervisor_review,
+// created by install.sh) is the fallback. "" when neither resolves: the
+// caller logs a warning and the round runs without the skill (the wrapped
+// prompt's mandatory-reply contract still carries the obligation).
+func reviewSkillDir() string {
+	return reviewSkillDirImpl()
+}
+
 // campaignSkills is the skill list ONE campaign round is spawned with: the
-// job's list, plus the review contract skill when it is not already there
-// (dedup on the resolved path AND on any entry whose basename matches, so an
-// operator listing it by another equally-valid path does not double it).
-// Deterministic injection, not discovery: the wrapper prompt carries the
-// obligation, this skill carries the mechanics (verbs, PRRT_ ids,
-// reply-before-resolve) — a round that has to discover the contract is a
-// round that can drift past it.
-func campaignSkills(jobSkills []string) []string {
+// job's list, plus the review contract skill when it is not already there.
+// The second return value reports the injected dir ("" when not injected —
+// either already present or unresolvable), and the third whether resolution
+// FAILED outright, so the caller can warn instead of degrading silently
+// (qodo PR#10 finding 2 / kody).
+//
+// Dedup compares RESOLVED locations (qodo PR#10 finding 1): an operator
+// entry named pi_supervisor_review that resolves elsewhere — a stale or
+// hand-made copy — is NOT the installed contract, so the canonical dir is
+// still appended (pi loads both, the daemon's copy is authoritative).
+// Basename matching is only trusted after EvalSymlinks agrees the two
+// paths land in the same directory.
+func campaignSkills(jobSkills []string) (skills []string, injected string, resolveFailed bool) {
 	dir := reviewSkillDir()
 	if dir == "" {
-		return jobSkills
+		return jobSkills, "", true
 	}
-	base := filepath.Base(dir)
 	for _, s := range jobSkills {
-		if s == dir || filepath.Base(s) == base {
-			return jobSkills
+		if s == dir {
+			return jobSkills, "", false
+		}
+		// Resolve the entry: a symlink may point AT the dir (the pi
+		// discovery link) or INTO it (a shim-style symlink — EvalSymlinks
+		// lands on the SKILL.md's sibling). Either shape IS the contract;
+		// a same-name copy resolving elsewhere is not (qodo PR#10 finding
+		// 1) and falls through to the canonical append.
+		resolved, err := filepath.EvalSymlinks(s)
+		if err != nil {
+			continue
+		}
+		if resolved == dir || filepath.Dir(resolved) == dir {
+			return jobSkills, "", false
 		}
 	}
 	out := make([]string, 0, len(jobSkills)+1)
 	out = append(out, jobSkills...)
-	return append(out, dir)
+	out = append(out, dir)
+	return out, dir, false
 }
 
 // round runs one pi RPC round via the daemon-native client (internal/client);
@@ -2099,11 +2123,19 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 
 	skills := j.Skills
 	if reviewing {
-		seeded := campaignSkills(j.Skills)
-		if len(seeded) != len(j.Skills) {
-			if dir := reviewSkillDir(); dir != "" {
-				s.logf(j.Name, "round %d: review skill injected into the round (%s)", round, dir)
-			}
+		seeded, injected, resolveFailed := campaignSkills(j.Skills)
+		switch {
+		case resolveFailed && len(seeded) == len(j.Skills):
+			// The contract could not be resolved AND the job did not list
+			// it: the round runs on the wrapped prompt alone. Say so — a
+			// silent degradation here is exactly the drift that left the
+			// mealime-presence campaign with zero shim calls (qodo PR#10
+			// finding 2 / kody).
+			journal.Subsys("job").Warn(
+				"review skill pi_supervisor_review could NOT be resolved (no shim on PATH, no ~/.pi/agent/skills link) — campaign round runs without the shim contract; install pi-supervisor to fix",
+				"job", j.Name, "round", round)
+		case injected != "":
+			s.logf(j.Name, "round %d: review skill injected into the round (%s)", round, injected)
 		}
 		skills = seeded
 	}
