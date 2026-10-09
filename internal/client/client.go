@@ -431,22 +431,22 @@ func (s *stream) read(r io.Reader) {
 					msg = "command failed"
 				}
 				s.mu.Lock()
-				// A STEER whose delivery pi refused ("Agent is already
-				// processing", a stale id, a transient provider hiccup) is
-				// not the round's verdict: the round's own prompt (r1) ran
-				// and the turn may be perfectly healthy. Failing the round
-				// on it is what let one bad reminder kill a whole campaign
-				// round (flambette#65 rounds 7-8). The discriminator is the
-				// turn-state flag: busy=true means r1 was accepted and a
-				// turn is live, so the refusal must be about a STEER —
-				// record and continue (kody PR#9 round 5: when r1 ITSELF is
-				// refused, busy is still false from the last turn end, and
-				// swallowing that error stalled the round to a generic
-				// TIMEOUT instead of reporting the real failure).
-				if s.busy && s.steerErr == "" && strings.Contains(msg, "already processing") {
+				// Correlate the refusal to the frame that caused it (kody
+				// PR#9 round 6): the round's own prompt is id "r1"; every
+				// control-file steer carries its own id. A refusal of a
+				// steer — "Agent is already processing", a stale id, a
+				// transient provider hiccup — is not the round's verdict:
+				// the round's prompt ran and the turn may be healthy.
+				// Failing the round on a steer refusal is what let one bad
+				// reminder kill a whole campaign round (flambette#65
+				// rounds 7-8). The id — not a turn-state flag — is the
+				// discriminator, because busy is momentarily false in the
+				// abort-drain window between the aborted turn's agent_end
+				// and the held prompt's re-send.
+				if tf.ID != "" && tf.ID != "r1" && s.steerErr == "" && strings.Contains(msg, "already processing") {
 					s.steerErr = msg
 					s.mu.Unlock()
-					s.diagf("[control] steer refused by pi (%s); the steer is dropped, the round continues", msg)
+					s.diagf("[control] steer %s refused by pi (%s); the steer is dropped, the round continues", tf.ID, msg)
 					continue
 				}
 				if s.errMsg == "" {
@@ -471,12 +471,17 @@ type toolExecFrame struct {
 	Command string
 	Success bool
 	Data    json.RawMessage
+	// response correlation: the RPC frame's id, so a refusal can be tied
+	// to the frame that caused it (r1 = the round's own prompt; steer ids
+	// carry the steer- prefix from the supervisor).
+	ID string
 }
 
 // decodeToolExec parses one raw tool-execution (or response) frame.
 func decodeToolExec(line []byte) (toolExecFrame, bool) {
 	var raw struct {
 		Type       string          `json:"type"`
+		ID         string          `json:"id"`
 		ToolCallID string          `json:"toolCallId"`
 		ToolName   string          `json:"toolName"`
 		Args       json.RawMessage `json:"args"`
@@ -490,6 +495,7 @@ func decodeToolExec(line []byte) (toolExecFrame, bool) {
 	}
 	f := toolExecFrame{
 		Type:       raw.Type,
+		ID:         raw.ID,
 		ToolCallID: raw.ToolCallID,
 		ToolName:   raw.ToolName,
 		Args:       raw.Args,
