@@ -89,10 +89,20 @@ type Supervisor struct {
 	reviewRounds int
 	// reviewAckTimeoutDur bounds a pending bulk_resolve; 0 = 30m.
 	reviewAckTimeoutDur time.Duration
+	// steerGapWait bounds how long Steer waits inside a between-rounds gap
+	// (the loop's inter-round backoff) for the next round's pi to publish
+	// its pid; 0 = steerGapWaitDefault.
+	steerGapWait time.Duration
 	// reviewWarmupDur is how long the auto-trigger waits for CodeRabbit to
 	// produce threads before counting; 0 = 5m.
 	reviewWarmupDur time.Duration
 }
+
+// steerGapWaitDefault bounds the between-rounds steer wait. The loop's
+// inter-round backoffs are 15-90s × scale, so 95s covers the largest standard
+// one at scale 1; a longer custom backoff still times out with the honest
+// "still between rounds" report instead of blocking the CLI forever.
+const steerGapWaitDefault = 95 * time.Second
 
 type runner struct {
 	mu       sync.Mutex
@@ -576,7 +586,9 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 	// Snapshot under r.mu, then let go: nothing below may hold s.mu or r.mu
 	// across a wait (lock order is s.mu -> r.mu, and the round loop needs
 	// r.mu to publish its own end).
+	var between bool
 	r.mu.Lock()
+	between = r.active && r.pid == 0
 	rep := job.SteerReport{
 		Job:         name,
 		FrameID:     id,
@@ -590,12 +602,47 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 	}
 	r.mu.Unlock()
 
+	if between {
+		// The loop is BETWEEN ROUNDS (its inter-round backoff): no pi is
+		// reading the ctrl file yet, but one will. round() truncates the
+		// ctrl file BEFORE the spawn and the client publishes its pid right
+		// after it, so waiting for pid > 0 is the exact point where a frame
+		// is safe from the truncate and will be read on the first poll
+		// (mealime-redesign-slice811, 2026-10-09: a steer sent 47s into a
+		// 90s instant-exit backoff bounced with "no live round" on a job
+		// that reported itself running). Waiting keys on the pid, never on
+		// the round counter: the counter increments before round() runs,
+		// ahead of the truncate — delivering on it could lose the frame.
+		s.waitForLiveRound(&rep, r)
+	}
+
 	if !rep.LiveRound {
 		// Do not queue it: round() truncates the ctrl file at the start of
 		// every round, so a frame written now would be wiped unread.
 		rep.Outcome = job.AckNoRound
-		rep.Detail = fmt.Sprintf("job state %q, round %d: no round is reading %s, so nothing was written",
-			rep.JobState, rep.Round, rep.CtrlPath)
+		var active bool
+		r.mu.Lock()
+		active = r.active
+		r.mu.Unlock()
+		switch {
+		case between && active:
+			// The gap wait ran out while the loop is still sleeping out its
+			// backoff. Say exactly that instead of the generic refusal, so
+			// the operator re-sends after the round starts instead of
+			// debugging a "running" job that refuses steers.
+			rep.Detail = fmt.Sprintf(
+				"job state %q, round %d: still between rounds after %s — round %d ended and the next one is behind a backoff that re-truncates %s when it starts; nothing was written, re-send once the round is live",
+				rep.JobState, rep.Round, s.gapBudget().Round(time.Second), rep.Round, rep.CtrlPath)
+		case between:
+			// The run ended while we waited for the next round: nothing is
+			// coming to read the file.
+			rep.Detail = fmt.Sprintf(
+				"job state %q, round %d: the run ended while waiting for the next round — no round is reading %s, so nothing was written",
+				rep.JobState, rep.Round, rep.CtrlPath)
+		default:
+			rep.Detail = fmt.Sprintf("job state %q, round %d: no round is reading %s, so nothing was written",
+				rep.JobState, rep.Round, rep.CtrlPath)
+		}
 		return rep, fault.New(fault.KindNoLiveRound, fmt.Errorf("%s", rep.Detail))
 	}
 
@@ -646,6 +693,47 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 		return rep, fmt.Errorf("frame %s not confirmed: %s", rep.FrameID, rep.Outcome)
 	}
 	return rep, nil
+}
+
+// gapBudget is the between-rounds wait budget (0 on the struct = default).
+func (s *Supervisor) gapBudget() time.Duration {
+	if s.steerGapWait > 0 {
+		return s.steerGapWait
+	}
+	return steerGapWaitDefault
+}
+
+// waitForLiveRound waits out a BETWEEN-ROUNDS gap: the round loop is active
+// (r.active) but no pi process exists (r.pid == 0) because the loop is in its
+// inter-round backoff. It never holds a supervisor lock across the wait.
+//
+// Returns true when a live round appeared — rep is refreshed in place (pid,
+// round, state) so the caller delivers into the round that actually started.
+// Returns false when the loop exited while waiting (operator/daemon stop or a
+// terminal classification) or the budget ran out; rep still carries the
+// freshest snapshot, so the caller's refusal tells the truth about the state
+// it saw. Bounded by steerGapWaitDefault (or the test-shrunk override): a job
+// whose backoff outlasts the budget is refused honestly rather than parked.
+func (s *Supervisor) waitForLiveRound(rep *job.SteerReport, r *runner) bool {
+	deadline := time.Now().Add(s.gapBudget())
+	for {
+		var active, live bool
+		r.mu.Lock()
+		rep.Round = r.state.Round
+		rep.JobState = r.state.State
+		rep.ClientPID = r.pid
+		active = r.active
+		live = active && r.pid > 0
+		r.mu.Unlock()
+		if live {
+			rep.LiveRound = true
+			return true
+		}
+		if !active || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // waitAck polls the ack log for this frame's terminal record. It never holds

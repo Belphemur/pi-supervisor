@@ -402,3 +402,133 @@ func TestSteerRejectsEmptyText(t *testing.T) {
 		t.Fatal("empty steer wrote to the ctrl file")
 	}
 }
+
+// A steer landing inside the BETWEEN-ROUNDS backoff must wait for the next
+// round instead of bouncing (mealime-redesign-slice811, 2026-10-09: round 3
+// died on an empty cont file, the steer landed 47s into the 90s instant-exit
+// backoff, and the operator was told "no live round" on a job that reported
+// itself running). The wait keys on pid > 0 — the exact point past the
+// ctrl-file truncate — and the report must name the round it actually
+// landed in, not the one that died.
+func TestSteerWaitsOutBetweenRoundsGap(t *testing.T) {
+	testEnv(t)
+	// Unique name per run: job.Ack/Ctrl are fixed /tmp paths that collide
+	// across -count iterations (see TestSteerReportsHeldThenDelivered).
+	name := fmt.Sprintf("gapw-%s-%d", t.Name(), time.Now().UnixNano())
+	writeJob(t, job.Job{
+		Name: name, Brief: "/tmp/x.md", Worktree: t.TempDir(),
+		SessionName: name, MaxRounds: 1, TimeoutS: 20, PiBin: "true",
+	})
+	s := newTestSupervisor(t)
+	s.steerWait = 10 * time.Second
+	s.steerGapWait = 5 * time.Second
+	// Between rounds: the loop is alive but round 1's pi is gone and the
+	// next one has not spawned yet.
+	armFakeRound(t, s, name, 0)
+
+	go func() {
+		// Play the loop: 300ms into the backoff, the next round truncates
+		// (nothing to truncate here) and OnPID publishes the pid.
+		time.Sleep(300 * time.Millisecond)
+		s.mu.Lock()
+		r := s.jobs[name]
+		s.mu.Unlock()
+		r.mu.Lock()
+		r.state.Round = 2
+		r.pid = 5678
+		r.mu.Unlock()
+		// Play the client: ack whatever frame the steer appended.
+		deadline := time.After(10 * time.Second)
+		for {
+			select {
+			case <-deadline:
+				return
+			default:
+			}
+			if id, ok := lastFrameID(t, job.Ctrl(name)); ok {
+				appendAck(t, job.Ack(name), job.AckRecord{
+					ID: id, Outcome: job.AckForwarded, Type: "prompt",
+				})
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	rep, err := s.Steer(name, "POLICY CHANGE", false, false)
+	if err != nil {
+		t.Fatalf("Steer: %v (%+v)", err, rep)
+	}
+	if rep.Outcome != job.AckForwarded || !rep.Confirmed {
+		t.Fatalf("outcome = %q confirmed=%v, want forwarded", rep.Outcome, rep.Confirmed)
+	}
+	if rep.ClientPID != 5678 || rep.Round != 2 {
+		t.Fatalf("report does not name the round it landed in: pid=%d round=%d (%+v)",
+			rep.ClientPID, rep.Round, rep)
+	}
+	if !rep.LiveRound {
+		t.Fatalf("report = %+v, want live_round=true after the gap wait", rep)
+	}
+}
+
+// The gap wait is bounded: a backoff that outlasts the budget is refused with
+// a detail that says the job is BETWEEN ROUNDS, not the generic "no round is
+// reading", so the operator re-sends instead of debugging a running job that
+// refuses steers.
+func TestSteerBetweenRoundsGapTimeoutIsHonest(t *testing.T) {
+	testEnv(t)
+	name := fmt.Sprintf("gapt-%s-%d", t.Name(), time.Now().UnixNano())
+	writeJob(t, job.Job{
+		Name: name, Brief: "/tmp/x.md", Worktree: t.TempDir(),
+		SessionName: name, MaxRounds: 1, TimeoutS: 20, PiBin: "true",
+	})
+	s := newTestSupervisor(t)
+	s.steerGapWait = 500 * time.Millisecond
+	armFakeRound(t, s, name, 0) // between rounds, and nothing ever spawns
+
+	rep, err := s.Steer(name, "POLICY CHANGE", false, false)
+	if err == nil {
+		t.Fatalf("the timed-out gap must be an error, got %+v", rep)
+	}
+	if rep.Outcome != job.AckNoRound || rep.Confirmed {
+		t.Fatalf("outcome = %q confirmed=%v, want no live round", rep.Outcome, rep.Confirmed)
+	}
+	if !strings.Contains(rep.Detail, "still between rounds") {
+		t.Fatalf("detail = %q, want the between-rounds explanation", rep.Detail)
+	}
+	if job.Size(rep.CtrlPath) != 0 {
+		t.Fatalf("ctrl file grew to %d bytes; the frame would only be wiped", job.Size(rep.CtrlPath))
+	}
+}
+
+// If the run ENDS while the steer is waiting out the gap, the refusal says
+// that — the next round is never coming to read the file.
+func TestSteerBetweenRoundsGapRunEndedIsHonest(t *testing.T) {
+	testEnv(t)
+	name := fmt.Sprintf("gape-%s-%d", t.Name(), time.Now().UnixNano())
+	writeJob(t, job.Job{
+		Name: name, Brief: "/tmp/x.md", Worktree: t.TempDir(),
+		SessionName: name, MaxRounds: 1, TimeoutS: 20, PiBin: "true",
+	})
+	s := newTestSupervisor(t)
+	s.steerGapWait = 5 * time.Second
+	armFakeRound(t, s, name, 0)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		disarmRound(s, name)
+	}()
+
+	rep, err := s.Steer(name, "POLICY CHANGE", false, false)
+	if err == nil {
+		t.Fatalf("a run that ended mid-wait must be an error, got %+v", rep)
+	}
+	if rep.Outcome != job.AckNoRound {
+		t.Fatalf("outcome = %q, want no live round", rep.Outcome)
+	}
+	if !strings.Contains(rep.Detail, "run ended while waiting") {
+		t.Fatalf("detail = %q, want the run-ended explanation", rep.Detail)
+	}
+	if job.Size(rep.CtrlPath) != 0 {
+		t.Fatalf("ctrl file grew to %d bytes; the frame would only be wiped", job.Size(rep.CtrlPath))
+	}
+}

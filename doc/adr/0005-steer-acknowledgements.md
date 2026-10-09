@@ -91,3 +91,35 @@ the CLI prints the ack.**
 - **Keep writing to an idle job's ctrl file** so the next round picks it up.
   Rejected: round() truncates at start, and a steer meant for *this* round
   landing in *the next* one is worse than an explicit error.
+
+## Amendment (2026-10-09): steering inside the between-rounds backoff
+
+A steer to a job mid-backoff bounced with `no live round` even though the job
+reported itself running: the round loop was alive (`r.active`) but no pi
+process existed because the loop was sleeping out its inter-round backoff
+(15–90s), and `Steer` checked only `active && pid > 0`. The operator re-sent
+blind, and any steer landing in that window was lost work.
+
+The refusal was still *technically* right — `round()` truncates the ctrl file
+before the spawn, so a frame written mid-backoff would be wiped unread — but
+"no round" is a lie about a loop that is about to open one.
+
+**`Steer` now waits out the gap instead of bouncing.** When the loop is active
+but `pid == 0`, it polls for the next round's pi to publish its pid, bounded
+by 95s (the largest standard backoff plus margin; a longer custom backoff
+still times out rather than parking the CLI). The pid is the safe delivery
+signal by construction: `round()` truncates the ctrl file *before* the spawn
+and `OnPID` publishes the pid right after it, so a frame written once
+`pid > 0` is past the truncate and is read on the client's first poll. The
+wait deliberately does NOT key on the round counter — the counter increments
+before `round()` runs, ahead of the truncate, so delivering on it could lose
+the frame.
+
+- **The report names the round it landed in.** After a successful gap wait the
+  report is refreshed (pid, round, state), so it never claims to have steered
+  the round that died.
+- **Timeout and mid-wait stop are honest.** A budget exhausted while the loop
+  still sleeps reports "still between rounds after 95s — re-send once the
+  round is live"; a run that ended while waiting says so. All three no-round
+  cases (`idle job`, `still between rounds`, `run ended while waiting`) remain
+  failures with a non-zero exit and nothing written.
