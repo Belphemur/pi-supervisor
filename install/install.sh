@@ -77,6 +77,29 @@ if [ ! -r "${BIN_DIR}/_pi-supervisor-review" ]; then
   echo "    ERROR: ${BIN_DIR}/_pi-supervisor-review does not resolve to the shim"
   exit 1
 fi
+
+# The review skill (the shim's usage contract) is symlinked into pi's OWN
+# skill discovery dir too, so a campaign agent finds it even when the job's
+# skills list forgot it — the daemon also injects it explicitly on every
+# campaign round (reviewSkillDir), but discovery is the fallback that keeps
+# working when the daemon cannot resolve the canonical dir. Guarded like the
+# Hermes link above: never clobber a real file, never leave a dangling link.
+PI_SKILL_DIR="${HOME}/.pi/agent/skills"
+if [ ! -f "${SKILL_SRC}/pi_supervisor_review/SKILL.md" ]; then
+  echo "    ERROR: ${SKILL_SRC}/pi_supervisor_review/SKILL.md not found"
+  exit 1
+fi
+install -d "$PI_SKILL_DIR"
+if [ -e "${PI_SKILL_DIR}/pi_supervisor_review" ] && [ ! -L "${PI_SKILL_DIR}/pi_supervisor_review" ]; then
+  echo "    ERROR: ${PI_SKILL_DIR}/pi_supervisor_review exists and is not a symlink — refusing to clobber"
+  exit 1
+fi
+ln -sfn "${SKILL_SRC}/pi_supervisor_review" "${PI_SKILL_DIR}/pi_supervisor_review"
+if [ ! -r "${PI_SKILL_DIR}/pi_supervisor_review/SKILL.md" ]; then
+  echo "    ERROR: ${PI_SKILL_DIR}/pi_supervisor_review does not resolve to the review skill"
+  exit 1
+fi
+echo "    installed: ${PI_SKILL_DIR}/pi_supervisor_review -> $(readlink -f "${PI_SKILL_DIR}/pi_supervisor_review")"
 # The shim resolves pi-supervisor from PATH; if the user's PATH misses BIN_DIR
 # the shim would fail at exec time rather than at install time, so check here.
 if ! command -v pi-supervisor >/dev/null 2>&1; then
