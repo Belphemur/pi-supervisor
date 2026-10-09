@@ -19,7 +19,22 @@ type reviewCampaign struct {
 	repo     string
 	round    int
 	maxRound int
-	kind     string // acceptance|rebuttal
+	// spent counts rounds that actually DID something (assistant text on
+	// the transcript): the budget is spent on work, not on provider flakes
+	// that returned an empty 0-token response and produced nothing
+	// (flambette#65 rounds 5-6). Exhaustion reads this, not the raw loop
+	// round. Counted from the RESULT text, not the runlog — the runlog
+	// also mirrors client diagnostics, so a forwarded steer's diag line
+	// would count an empty turn as work (qodo PR#9 finding 3).
+	kind  string // acceptance|rebuttal
+	spent int
+	// rawRound counts review rounds SINCE THE CAMPAIGN BEGAN — the
+	// backstop's denominator. r.state.Round is the job's LIFETIME counter
+	// (build rounds included) and is never reset on the build→reviewing
+	// transition, so comparing it against maxRound*3 exhausted campaigns
+	// whose build ran long before the first review round (qodo PR#9
+	// finding 2 / kody). Bumped alongside spent, under the same lock.
+	rawRound int
 	// answered records, per round, which threads this job posted a reply on.
 	// The resolve guard reads it. Keyed by round so a reply from round N-1
 	// does NOT authorize a resolve in round N: the ADR requires the answer and
