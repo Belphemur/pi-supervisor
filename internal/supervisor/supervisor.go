@@ -1952,6 +1952,14 @@ func campaignSkills(jobSkills []string) (skills []string, injected string, resol
 	if dir == "" {
 		return jobSkills, "", true
 	}
+	// Normalize (kody PR#10 round 2): the discovery fallback returns the
+	// raw SYMLINK (~/.pi/agent/skills/pi_supervisor_review), which would
+	// never string-match a resolved canonical path or a job entry and so
+	// double-inject. Resolve once so every comparison below happens in
+	// resolved-land.
+	if rd, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = rd
+	}
 	for _, s := range jobSkills {
 		if s == dir {
 			return jobSkills, "", false

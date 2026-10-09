@@ -84,6 +84,22 @@ func TestCampaignSkillsInjectsReviewSkill(t *testing.T) {
 		t.Errorf("symlink dedup failed: %v (injected %q)", viaLink, injected3)
 	}
 
+	// kody PR#10 round 2: reviewSkillDir's fallback returns the RAW symlink
+	// (~/.pi/.../pi_supervisor_review). Simulate it by stubbing the resolver
+	// to return the symlink path, with the canonical dir already listed: the
+	// injected dir must be normalized before comparison — no duplicate.
+	raw := filepath.Join(t.TempDir(), "skills", "pi_supervisor_review")
+	if err := os.Symlink(canonical, raw); err != nil {
+		t.Fatal(err)
+	}
+	prev := reviewSkillDirImpl
+	reviewSkillDirImpl = func() string { return raw }
+	t.Cleanup(func() { reviewSkillDirImpl = prev })
+	viaRaw, injectedRaw, failedRaw := campaignSkills(append(append([]string{}, jobSkills...), canonical))
+	if failedRaw || injectedRaw != "" {
+		t.Errorf("raw-symlink resolver double-injected: %v (injected %q, failed %t)", viaRaw, injectedRaw, failedRaw)
+	}
+
 	// A STALE copy with the same basename that resolves ELSEWHERE is NOT the
 	// contract: the canonical dir is still appended (qodo PR#10 finding 1).
 	stale := filepath.Join(t.TempDir(), "pi_supervisor_review")
