@@ -436,11 +436,14 @@ func (s *stream) read(r io.Reader) {
 				// not the round's verdict: the round's own prompt (r1) ran
 				// and the turn may be perfectly healthy. Failing the round
 				// on it is what let one bad reminder kill a whole campaign
-				// round (flambette#65 rounds 7-8). Record it for the diag
-				// only — unless the round's OWN prompt was never accepted
-				// (no successful turn yet), in which case this IS the
-				// round's failure.
-				if s.steerErr == "" && strings.Contains(msg, "already processing") {
+				// round (flambette#65 rounds 7-8). The discriminator is the
+				// turn-state flag: busy=true means r1 was accepted and a
+				// turn is live, so the refusal must be about a STEER —
+				// record and continue (kody PR#9 round 5: when r1 ITSELF is
+				// refused, busy is still false from the last turn end, and
+				// swallowing that error stalled the round to a generic
+				// TIMEOUT instead of reporting the real failure).
+				if s.busy && s.steerErr == "" && strings.Contains(msg, "already processing") {
 					s.steerErr = msg
 					s.mu.Unlock()
 					s.diagf("[control] steer refused by pi (%s); the steer is dropped, the round continues", msg)
