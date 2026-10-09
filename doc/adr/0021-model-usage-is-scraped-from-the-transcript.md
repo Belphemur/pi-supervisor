@@ -31,12 +31,18 @@ Every assistant record in the session JSONL already carries the truth:
    assistant records of the session JSONL — the same surface the marker gate
    (ADR-0011) and the PR scrape (ADR-0006) already read. A job-definition
    request is intent, never evidence.
-2. **Incremental, append-only scanning.** Like the PR scrape, a per-runner
-   scanner reads only bytes appended since its last call, with an offset,
-   an inode-rotation check, and an overlap window large enough that a
-   `"model":"…"` field straddling a read boundary is never split. The
-   scanner is the ONE component that parses transcript records for model
-   identity; nothing else re-derives it (the marker funnel rule).
+2. **Incremental JSONL parsing, not regex.** Like the PR scrape, a per-runner
+   scanner reads only bytes appended since its last call (offset, inode
+   rotation check). Unlike the byte-regex scrape, it parses every COMPLETE
+   line with `encoding/json` — an incomplete trailing line is carried to the
+   next read (capped, same discipline as the client's control reader) — and
+   DISCARDS anything it does not recognize: non-JSON noise, non-assistant
+   roles, records without a model. Only an assistant record's
+   `message.role == "assistant"` with a non-empty `message.model` counts,
+   so field reordering, unknown fields, and quoted model text in briefs,
+   steers, and toolResults can never produce a false identity. The scanner
+   is the ONE component that derives model identity; nothing else
+   re-derives it (the marker funnel rule).
 3. **Two fields, one list.** State and status carry:
    - `models_used` — the ordered, deduplicated list of every model that has
      answered at least one assistant record this run (first-seen order).

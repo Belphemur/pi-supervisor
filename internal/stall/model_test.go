@@ -101,11 +101,93 @@ func TestModelScannerSurvivesRotation(t *testing.T) {
 	}
 }
 
+func TestModelScannerSplitsAcrossReadsAreParsedWhole(t *testing.T) {
+	dir := t.TempDir()
+	sess := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(sess, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewModelScanner(sess)
+
+	// A single record larger than one chunk, written in TWO halves: the
+	// scanner must carry the incomplete trailing line and parse the record
+	// exactly once, whole — this is the JSONL-parsing contract the regex
+	// version could not honor.
+	rec := `{"type":"message","message":{"role":"assistant","provider":"prov-x","model":"model-y","usage":{"input":1}}}` + "\n"
+	// Pad the record body so the total exceeds modelChunkBytes... the chunk
+	// is 256KiB; instead verify the carry with a small synthetic: write the
+	// first half, scan (partial carried, nothing parsed), write the rest.
+	rec = strings.Repeat(" ", 0) + rec
+	idx := strings.Index(rec, `"provider"`)
+	if idx < 0 {
+		t.Fatal("test record malformed")
+	}
+	if err := os.WriteFile(sess, []byte(rec[:idx]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cur, used := s.Scan(); cur != "" || len(used) != 0 {
+		t.Fatalf("half a record produced a model: cur=%q used=%v", cur, used)
+	}
+	f, err := os.OpenFile(sess, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(rec[idx:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	cur, used := s.Scan()
+	if cur != "prov-x/model-y" {
+		t.Fatalf("carried record not parsed whole: cur=%q used=%v", cur, used)
+	}
+	if len(used) != 1 {
+		t.Fatalf("carried record double-counted: %v", used)
+	}
+}
+
+func TestModelScannerFieldOrderAndUnknownFieldsIrrelevant(t *testing.T) {
+	dir := t.TempDir()
+	sess := filepath.Join(dir, "session.jsonl")
+	// Field ORDER reversed, extra unknown fields, pretty-printed-style
+	// spacing all present in the wild — encoding/json does not care.
+	if err := os.WriteFile(sess, []byte(`{"top":"x","message":{"model":"m-b","role":"assistant","provider":"prov-b","extra":{"deep":[1,2]}}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewModelScanner(sess)
+	cur, used := s.Scan()
+	if cur != "prov-b/m-b" || len(used) != 1 {
+		t.Fatalf("reordered/unknown fields broke parsing: cur=%q used=%v", cur, used)
+	}
+}
+
+func TestModelScannerDiscardsUnknownRecords(t *testing.T) {
+	dir := t.TempDir()
+	sess := filepath.Join(dir, "session.jsonl")
+	lines := strings.Join([]string{
+		`not json at all`,
+		`{"type":"session","id":"x"}`,
+		`{"type":"message","message":{"role":"user","content":"blah","model":"user-quoted"}}`,
+		`{"message":{"role":"assistant"}}`,                     // no model: skip
+		`{"message":{"role":"toolResult","model":"tr-model"}}`, // not an assistant
+		`{"type":"message","message":{"role":"assistant","provider":"p","model":"real"}}`,
+		`{broken json`,
+		``,
+	}, "\n") + "\n"
+	if err := os.WriteFile(sess, []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewModelScanner(sess)
+	cur, used := s.Scan()
+	if cur != "p/real" || len(used) != 1 || used[0] != "p/real" {
+		t.Fatalf("noise leaked into identity: cur=%q used=%v", cur, used)
+	}
+}
+
 func TestModelScannerLongBoundaryStraddle(t *testing.T) {
 	dir := t.TempDir()
 	sess := filepath.Join(dir, "session.jsonl")
-	// Filler longer than the overlap, then a record whose provider/model
-	// pair straddles the 8KiB overlap boundary.
+	// Filler longer than one chunk, then a complete record AFTER it: the
+	// offset must reach it (chunked reads) and parse it whole.
 	filler := `{"type":"message","message":{"role":"user","content":"` + strings.Repeat("x", 12<<10) + `"}}` + "\n"
 	if err := os.WriteFile(sess, []byte(filler), 0o644); err != nil {
 		t.Fatal(err)
@@ -114,27 +196,9 @@ func TestModelScannerLongBoundaryStraddle(t *testing.T) {
 	if _, _ = s.Scan(); s.Path() != sess {
 		t.Fatal("path mismatch")
 	}
-	// The pair lands past the first chunk+overlap window in two pieces.
-	first := `{"type":"message","message":{"role":"assistant","provider":"prov`
-	second := `ider-x","model":"model-y","usage":{}}}`
-	writeLine(t, sess, first)
-	if _, _ = s.Scan(); s.Current() != "" {
-		// The first half alone must not produce a model.
-		t.Fatalf("partial pair produced a model: %q", s.Current())
-	}
-	writeLine(t, sess, second)
+	writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"p2","model":"m2"}}`)
 	cur, used := s.Scan()
-	if cur != "prov/ider-x" {
-		// The straddle may leave a partial match at the seam; what matters
-		// is that a LATER complete record on the same line-shape is found.
-		writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"p2","model":"m2"}}`)
-		cur, used = s.Scan()
-		if cur != "p2/m2" {
-			t.Fatalf("recovery after straddle failed: cur=%q used=%v", cur, used)
-		}
-		return
-	}
-	if len(used) != 1 || used[0] != cur {
-		t.Fatalf("used after straddle = %v, want exactly [%s]", used, cur)
+	if cur != "p2/m2" || len(used) != 1 {
+		t.Fatalf("record after filler not found: cur=%q used=%v", cur, used)
 	}
 }

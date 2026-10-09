@@ -190,8 +190,9 @@ systemd (Type=notify, WatchdogSec=120)
   client pid, and the outcome (`forwarded` / `held` then delivered /
   `send failed` / `bad frame` / `no live round`). It blocks until that ack
   (bounded by the job's `timeout_s`, default ~20s) and exits non-zero unless
-  pi took the frame. `-n` skips the wait and reports only `written`. See
-  ADR-0005.
+  pi took the frame. `-n` skips the wait and reports only `written`. A steer
+  sent while the loop sleeps between rounds (backoff) WAITS up to ~95s for
+  the next round's pi instead of failing; see ADR-0005.
 - **Interrupting a steer:** `-i`/`--interrupt` first SIGINTs pi's process
   group (`-pid`), so the turn already in flight is asked to stop and this steer
   is what pi picks up next; the report then carries an extra `interrupt` line
@@ -254,12 +255,15 @@ Behavior:
   "no PR".
 - **The model usage is in the payload too (ADR-0021).** `status` carries
   `current_model` (what is answering right now) and `models_used` (every
-  distinct model this run, first-seen order), scraped from assistant
-  records' `provider`/`model` pair in the transcript. The job def's
-  `provider`/`model` is a REQUEST; these fields are EVIDENCE — on routed
-  providers they diverge routinely. Quoted "model" text in briefs, steers,
-  or toolResults never counts. Model swaps mid-run (provider failover,
-  operator swap) show up the moment the next assistant record lands.
+  distinct model this run, first-seen order), parsed from assistant records'
+  `message.provider`/`message.model` fields with real JSON decoding — never
+  regex — so field reordering and formatting changes in pi's writer cannot
+  break it. The job def's `provider`/`model` is a REQUEST; these fields are
+  EVIDENCE — on routed providers they diverge routinely. Only assistant
+  records count: quoted "model" text in briefs, steers, or toolResults, and
+  user/toolResult roles, never produce an identity. Model swaps mid-run
+  (provider failover, operator swap) show up the moment the next assistant
+  record lands.
 - **Finished run ⇒ immediate return.** If the job is already done/fatal/stopped
   when you arm, the watch does NOT block — it prints
   `THE RUN IS OVER — <job> <event>`, points at `status`, and says not to re-arm.
@@ -340,7 +344,7 @@ Behavior:
 | ctl: "daemon not reachable" | `systemctl --user status pi-supervisor`; journal for socket errors |
 | `systemctl status` count is stale | the beat only rewrites STATUS when the count changes; a count that never moves means no round is ending |
 | `steer -i` says `interrupt requested but cannot SIGINT` | the pi group was already gone (round ended between your `status` and the steer). Nothing was written — check `status`, then re-send; if the round is genuinely running this is a real failure, not a silent no-op |
-| `steer` says `no live round` / `not confirmed` | no round was polling the ctrl file, or pi never acked within the bounded wait (~20s) — the frame was NOT delivered; check `status` and the run log, then re-send |
+| `steer` says `no live round` / `not confirmed` | idle job (loop not active): nothing was written; check `status`, then re-send once a round is live. Mid-backoff ("still between rounds after ~95s"): the loop is sleeping out its inter-round backoff — wait for the next round and re-send. Otherwise pi never acked within the bounded wait (~20s) — the frame was NOT delivered; check `status` and the run log, then re-send |
 | rc=2 in the log | pi's stdout closed with no agent_end (crash mid-turn) — treated as a failure, not a clean cap |
 | `status` shows an empty `pr_url` but a PR is open on GitHub | the daemon scrapes the PR URL from the round's transcript as it tails it (ADR-0006); it only sees URLs the agent *linked* in its messages. A PR opened without the agent writing the `pull/<number>` link — e.g. a toolResult that truncated the URL, or a PR filed by CI/a hook — is not surfaced. An empty field means "not linked in the transcript", not "no PR exists"; link the PR in your next round to have it appear. |
 | `pr_url` empty although `pull/N` IS in the transcript, and auto-review skipped with "no GitHub PR was linked" | the scrape rides on the CI/empty-turn STALL watchers, which are only armed once a transcript path exists (`sess != ""`). On a fresh LAUNCH round the watcher has no path yet, so a URL written during THAT round is missed. Link the PR in a LATER round, or pass `--pr <N>` explicitly rather than relying on `--auto`. |
@@ -391,8 +395,10 @@ actually emits, not what the fixtures assume it emits):
   (bounded by the job's `timeout_s`, default ~20s) and exits non-zero unless
   pi took the frame; `-n` skips the wait and reports only `written`. A steer
   with no live round reports `no live round` — the ctrl file is truncated at
-  every round start, so a queued frame would be wiped unread. Wait for
-  `status` to show a round, then re-send.
+  every round start, so a queued frame would be wiped unread. A steer sent
+  while the loop sleeps between rounds (backoff) waits up to ~95s for the
+  next round's pi and delivers into it; if the budget runs out the detail
+  says "still between rounds" — wait for the next round, then re-send.
 - **`-i` interrupts; a plain steer queues.** `steer -i` SIGINTs pi's process
   group first (ADR-0007) so the current turn is dropped and the steer is what
   pi does next; the report line `interrupted` means the signal was *sent*, not

@@ -6,9 +6,11 @@ package stall
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -303,50 +305,58 @@ const prURLChunkBytes = 256 << 10
 
 // modelChunkBytes bounds ONE read of the model scanner. Same rationale as
 // prURLChunkBytes: bounding a read is not the same as bounding what gets
-// scanned — the offset bounds the total.
+// scanned — the offset bounds the total, and the partial-line carry makes
+// sure a record split across reads is parsed whole.
 const modelChunkBytes = 256 << 10
 
-// modelOverlapBytes is how far back each incremental read reaches. It must
-// cover the longest possible `"provider":"…","model":"…"` pair straddling a
-// boundary. Provider and model strings are bounded in practice, but the
-// overlap is cheap: re-scanning 8KiB costs nothing next to a missed model.
-const modelOverlapBytes = 8 << 10
+// modelMaxPartial caps the carried incomplete trailing line. An assistant
+// record is a few KB; compaction records can reach megabytes. A line longer
+// than the cap has its model missed for THIS record (the offset has already
+// committed past it) — the honest tradeoff vs unbounded memory, and the
+// same cap discipline the client's control reader uses.
+const modelMaxPartial = 8 << 20
 
-// modelRe extracts the provider+model pair from an assistant record. The
-// pair — not the bare `"model":"…"` — is matched on purpose: the pair only
-// occurs in the assistant record's header (where pi records who answered),
-// while a bare `"model":"…"` also appears in operator briefs, steers, and
-// toolResult quotes, where it names a REQUEST, not an answer. Escaped-quote
-// handling is unnecessary for the common case: provider/model slugs do not
-// contain quotes, and the field set is bounded by pi's RPC docs.
-var modelRe = regexp.MustCompile(
-	`"provider":"([^"\\]+)","model":"([^"\\]+)"`)
-
-// ModelUse is one model identity scraped from an assistant record.
-type ModelUse struct {
-	Provider string
-	Model    string
+// transcriptModelRecord is the slice of a session JSONL line the model
+// scanner needs. Parsed with encoding/json — never regex — so field
+// reordering, escaping, and formatting changes in pi's writer cannot break
+// the scrape (owner directive 2026-10-09). Only assistant records carry a
+// model: `message.role == "assistant"` plus a non-empty `message.model`.
+// A bare `"model"` string quoted in CONTENT (briefs, steers, toolResults)
+// names a request, not an answer, and is never inspected here.
+type transcriptModelRecord struct {
+	Message *struct {
+		Role     string `json:"role"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+	} `json:"message"`
 }
 
-// String renders "provider/model" — the canonical surface form.
-func (m ModelUse) String() string {
-	if m.Provider == "" {
-		return m.Model
+// modelIdentity renders "provider/model" — the canonical surface form.
+func modelIdentity(provider, model string) string {
+	if provider == "" {
+		return model
 	}
-	return m.Provider + "/" + m.Model
+	return provider + "/" + model
 }
 
 // ModelScanner is the incremental model-identity scanner for one transcript
-// (ADR-0021). Same discipline as PRURLScanner: offset + inode rotation check
-// + overlap, append-only, never re-reads the whole file. It is the ONE
-// component that parses transcript records for model identity; nothing else
-// re-derives it.
+// (ADR-0021). Same discipline as PRURLScanner: offset + inode rotation check,
+// append-only, never re-reads the whole file — but it parses complete JSONL
+// records (json.Unmarshal per line, with an incomplete trailing line carried
+// to the next read) instead of regexing raw bytes, so pi's writer can
+// reorder or reformat fields without breaking identity extraction. It is
+// the ONE component that derives model identity from the transcript;
+// nothing else re-derives it.
 type ModelScanner struct {
 	mu       sync.Mutex
 	path     string
 	offset   int64
 	lastSize int64
 	lastIno  uint64
+	// partial carries the incomplete trailing line between reads: the offset
+	// commits to the raw end of what was read, so a record straddling a
+	// chunk boundary is only parsed once its newline has landed.
+	partial string
 	// last is the most recent model seen (current_model); order remembers
 	// every distinct model in first-seen order (models_used).
 	last    string
@@ -380,14 +390,13 @@ func (s *ModelScanner) Current() string {
 func (s *ModelScanner) Used() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]string, len(s.seen))
-	copy(out, s.seen)
-	return out
+	return s.copySeen()
 }
 
-// Scan reads bytes appended since the previous call and updates the current
-// model and the used list. "" returns are normal: no assistant record has
-// landed yet, or nothing new was appended.
+// Scan reads bytes appended since the previous call, parses every COMPLETE
+// line as JSON, and updates the current model and the used list. "" returns
+// are normal: no assistant record has landed yet, or nothing new was
+// appended.
 func (s *ModelScanner) Scan() (current string, used []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -399,21 +408,16 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 	size := fi.Size()
 	ino, inoOK := inodeOf(fi)
 	// Truncated/rotated/replaced — same discipline as PRURLScanner: the
-	// offset is meaningless, start over; the used list SURVIVES a truncate
-	// only if the same file comes back (a restart --fresh changes the path,
-	// which recreates the scanner anyway).
+	// offset is meaningless, start over. A replacement file is NEW content:
+	// the used list resets with everything else, because keeping `seen`
+	// while clearing `last` would surface a current model missing from the
+	// used list. (A restart --fresh changes the path and recreates the
+	// scanner wholesale; this path covers in-place rewrites.)
 	if size < s.offset {
-		s.offset, s.lastSize = 0, 0
-		s.last = ""
+		s.reset()
 	}
 	if inoOK && s.lastIno != 0 && ino != s.lastIno {
-		// A replacement file is NEW content at the same path: the used list
-		// resets with everything else. (A restart --fresh changes the path
-		// and recreates the scanner wholesale; this path covers in-place
-		// rewrites.) The inconsistency of clearing `last` but keeping `seen`
-		// would surface as a current model missing from the used list.
-		s.offset, s.last, s.lastSize = 0, "", 0
-		s.seen, s.seenSet = nil, map[string]bool{}
+		s.reset()
 	}
 	if inoOK {
 		s.lastIno = ino
@@ -423,33 +427,73 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 	}
 
 	readTo := min(s.offset+modelChunkBytes, size)
-	from := s.offset
-	if from > modelOverlapBytes {
-		from -= modelOverlapBytes
-	}
-
-	buf := make([]byte, readTo-from)
-	n, _ := readFileAt(s.path, buf, from)
+	buf := make([]byte, readTo-s.offset)
+	n, _ := readFileAt(s.path, buf, s.offset)
 	if n > 0 {
-		s.offset = from + int64(n)
+		s.offset += int64(n)
 	}
 	if s.offset >= size {
 		s.lastSize = size
 	} else {
-		s.lastSize = -1
+		s.lastSize = -1 // force the next call to keep reading
 	}
 	if n <= 0 {
 		return s.last, s.copySeen()
 	}
-	for _, m := range modelRe.FindAllSubmatch(buf[:n], -1) {
-		use := ModelUse{Provider: string(m[1]), Model: string(m[2])}
-		s.last = use.String()
+
+	// Split at the LAST newline: everything before it is whole records; the
+	// remainder is carried to the next read (a record split across chunk
+	// boundaries is parsed exactly once, whole).
+	data := s.partial + string(buf[:n])
+	if i := strings.LastIndexByte(data, '\n'); i >= 0 {
+		s.partial = data[i+1:]
+		data = data[:i+1]
+	} else {
+		// No newline in this read: the whole chunk is one growing line.
+		if len(data) > modelMaxPartial {
+			// Runaway line (a multi-MB record): drop it rather than grow
+			// without bound. Its model is missed; the offset has already
+			// committed past it, so later records are unaffected.
+			s.partial = ""
+			return s.last, s.copySeen()
+		}
+		s.partial = data
+		return s.last, s.copySeen()
+	}
+	if len(s.partial) > modelMaxPartial {
+		s.partial = ""
+	}
+	s.scanLines(data)
+	return s.last, s.copySeen()
+}
+
+// scanLines parses whole LF-terminated lines and folds assistant records'
+// model identities into last/seen.
+func (s *ModelScanner) scanLines(data string) {
+	for line := range strings.SplitSeq(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec transcriptModelRecord
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue // non-JSON noise: ignore, matching the client reader
+		}
+		if rec.Message == nil || rec.Message.Role != "assistant" || rec.Message.Model == "" {
+			continue
+		}
+		s.last = modelIdentity(rec.Message.Provider, rec.Message.Model)
 		if !s.seenSet[s.last] {
 			s.seenSet[s.last] = true
 			s.seen = append(s.seen, s.last)
 		}
 	}
-	return s.last, s.copySeen()
+}
+
+func (s *ModelScanner) reset() {
+	s.offset, s.lastSize, s.partial = 0, 0, ""
+	s.last = ""
+	s.seen, s.seenSet = nil, map[string]bool{}
 }
 
 func (s *ModelScanner) copySeen() []string {
