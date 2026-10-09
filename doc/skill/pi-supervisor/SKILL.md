@@ -431,6 +431,15 @@ plus a machine-readable `reason` from a closed enum.
    campaign; the job leaves `reviewing` for good and the baseline is written.
 
 - **Surface.** `pi-supervisor review <job> --pr <N> [--rounds N=5] [--type acceptance|rebuttal] [--json]` / `review <job> --auto` / `ack --event <ack_id>`. `--pr` and `--auto` are mutually exclusive. `--rounds` is the campaign's `MaxRounds` — **default 5** (a review round is hours-long; an operator count beats a heuristic); `--rounds 0` auto-derives `ceil(open / review.per_round)` (`per_round` 12) capped by `review.max_rounds` (12). `--type` is the campaign's round character, uniform across its rounds and recorded per round so `watch`/`status` surface `#acceptance` vs `#rebuttal`; mixed campaigns are two campaigns.
+- **The review skill is daemon-injected, deterministically.** Every campaign
+  round is spawned with `pi_supervisor_review` appended to the job's skill
+  list (resolved from the installed shim's canonical dir; deduped against an
+  operator-listed copy), and install.sh also links it into pi's own discovery
+  dir as the fallback. Never rely on the job's `skills` list to carry it —
+  the mealime-presence campaign ran 4 rounds with zero shim calls because it
+  didn't. The wrapped round prompt carries the OBLIGATION (post_replies for
+  every open thread); the skill carries the MECHANICS (verbs, `PRRT_` ids,
+  reply-before-resolve, pagination exhaustion).
 - **One instruction source, not two.** `--skill` defaults to
   **`pi_supervisor_review`**, which carries the triage vocabulary (fix /
   explain-non-issue / defer-out-of-scope) *and* the shim contract. It is NOT

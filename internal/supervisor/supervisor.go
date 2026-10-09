@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1898,6 +1899,58 @@ func (s *Supervisor) writeCampaignRoundPrompt(r *runner, name, briefPath string)
 	return p, nil
 }
 
+// reviewSkillDir resolves the pi_supervisor_review skill directory — the
+// shim's usage contract — so every campaign round can be seeded with it
+// explicitly (owner directive 2026-10-08). The shim is installed as a
+// symlink to the canonical copy's dir, so resolving it yields the skill dir
+// itself; the pi discovery symlink (~/.pi/agent/skills/pi_supervisor_review,
+// created by install.sh) is the fallback. "" when neither resolves: the
+// caller logs a warning and the round runs without the skill (the wrapped
+// prompt's mandatory-reply contract still carries the obligation).
+func reviewSkillDir() string {
+	if p, err := exec.LookPath("_pi-supervisor-review"); err == nil {
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			dir := filepath.Dir(resolved)
+			if fi, err := os.Stat(filepath.Join(dir, "SKILL.md")); err == nil && !fi.IsDir() {
+				return dir
+			}
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	cand := filepath.Join(home, ".pi", "agent", "skills", "pi_supervisor_review")
+	if fi, err := os.Stat(filepath.Join(cand, "SKILL.md")); err == nil && !fi.IsDir() {
+		return cand
+	}
+	return ""
+}
+
+// campaignSkills is the skill list ONE campaign round is spawned with: the
+// job's list, plus the review contract skill when it is not already there
+// (dedup on the resolved path AND on any entry whose basename matches, so an
+// operator listing it by another equally-valid path does not double it).
+// Deterministic injection, not discovery: the wrapper prompt carries the
+// obligation, this skill carries the mechanics (verbs, PRRT_ ids,
+// reply-before-resolve) — a round that has to discover the contract is a
+// round that can drift past it.
+func campaignSkills(jobSkills []string) []string {
+	dir := reviewSkillDir()
+	if dir == "" {
+		return jobSkills
+	}
+	base := filepath.Base(dir)
+	for _, s := range jobSkills {
+		if s == dir || filepath.Base(s) == base {
+			return jobSkills
+		}
+	}
+	out := make([]string, 0, len(jobSkills)+1)
+	out = append(out, jobSkills...)
+	return append(out, dir)
+}
+
 // round runs one pi RPC round via the daemon-native client (internal/client);
 // hard-kills the pi process group at timeout+120s as a backstop.
 func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, dur int64, runlogB int64) {
@@ -2044,6 +2097,17 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		return 1, 0, 0
 	}
 
+	skills := j.Skills
+	if reviewing {
+		seeded := campaignSkills(j.Skills)
+		if len(seeded) != len(j.Skills) {
+			if dir := reviewSkillDir(); dir != "" {
+				s.logf(j.Name, "round %d: review skill injected into the round (%s)", round, dir)
+			}
+		}
+		skills = seeded
+	}
+
 	// ADR-0014: wire the TaskUpdate completion watch into THIS round. The
 	// watcher is round-scoped: one worker goroutine, buffered channels, and
 	// a bounded flush before the round is classified, so the terminal close
@@ -2056,7 +2120,7 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 		Session:      j.SessionPath,
 		Name:         j.SessionName,
 		Worktree:     j.Worktree,
-		Skills:       j.Skills,
+		Skills:       skills,
 		Provider:     j.Provider,
 		Model:        j.Model,
 		Prompt:       prompt,
