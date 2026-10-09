@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1866,7 +1867,24 @@ func (s *Supervisor) writeCampaignRoundPrompt(r *runner, name, briefPath string)
 	// O_NOFOLLOW stays as defense in depth: planting anything inside the
 	// 0700 dir requires the daemon's own uid (a compromised process, not an
 	// external attacker), and the leaf then still refuses to follow.
+	//
+	// Self-healing (kody PR#9 re-review round 3): a tmp reaper or a cleared
+	// tmpfs can delete the cached dir while the daemon runs, and without
+	// recovery every later round fails at OpenFile (ENOENT) — a permanent
+	// campaign denial until restart. On fs.ErrNotExist the cached path is
+	// stale: drop it, create a fresh MkdirTemp dir, and retry the open ONCE.
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if errors.Is(err, fs.ErrNotExist) {
+		d, derr := os.MkdirTemp("", "pi_"+name+"_review_")
+		if derr != nil {
+			return "", fmt.Errorf("recreate review prompt dir: %w", derr)
+		}
+		r.mu.Lock()
+		r.reviewPromptDir = d
+		r.mu.Unlock()
+		p = filepath.Join(d, "round_prompt.md")
+		f, err = os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	}
 	if err != nil {
 		return "", fmt.Errorf("create round prompt: %w", err)
 	}
