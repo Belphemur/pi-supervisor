@@ -89,6 +89,9 @@ func TestCampaignSkillsInjectsReviewSkill(t *testing.T) {
 	// to return the symlink path, with the canonical dir already listed: the
 	// injected dir must be normalized before comparison — no duplicate.
 	raw := filepath.Join(t.TempDir(), "skills", "pi_supervisor_review")
+	if err := os.MkdirAll(filepath.Dir(raw), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Symlink(canonical, raw); err != nil {
 		t.Fatal(err)
 	}
