@@ -2,7 +2,10 @@ package supervisor
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,6 +107,32 @@ func (s *Supervisor) freshCampaignSession(r *runner, name string) {
 	r.mu.Lock()
 	brief := r.job.ReviewBrief
 	pinned := r.job.SessionPath
+	if brief == "" {
+		// Owner directive 2026-10-10: triggering a review must NEVER fall
+		// back to the build continuation. A job without review_brief used
+		// to keep the build pin and resume with j.Cont — the agent's own
+		// context says the work is complete, so it re-verified and exited
+		// without addressing threads: the campaign burned rounds and no
+		// review ever started (mealime-redesign). Generate a default brief
+		// instead; the daemon's mandatory-reply contract is wrapped around
+		// it every round regardless.
+		generated, err := s.writeDefaultReviewBrief(r, name)
+		if err != nil {
+			r.mu.Unlock()
+			journal.Subsys("job").Error(
+				"campaign armed WITHOUT review_brief and the default brief could not be written — campaign NOT started; write review_brief into the job def and re-arm",
+				"job", name, "err", err.Error())
+			s.logf(name, "campaign aborted: no review_brief and default brief generation failed: %v", err)
+			return
+		}
+		brief = generated
+		r.job.ReviewBrief = generated
+		updated := r.job
+		r.mu.Unlock()
+		_ = job.Save(updated)
+		s.logf(name, "no review_brief in the job def: generated a default review brief at %s (review rounds will LAUNCH it, never the build continuation)", generated)
+		r.mu.Lock()
+	}
 	if brief != "" {
 		r.job.SessionPath = ""
 		updated := r.job
@@ -231,4 +260,43 @@ func (s *Supervisor) ExpireAcks(stop chan struct{}) {
 			s.ExpireReviewAcks()
 		}
 	}
+}
+
+// writeDefaultReviewBrief generates the review brief for a job whose def
+// carries none (owner directive 2026-10-10: a review trigger must never fall
+// back to the build continuation). The brief is deterministic and generic —
+// the PR-specific state (open threads) is read LIVE by every round through
+// the shim's list_threads, so embedding a thread snapshot here would rot.
+// The daemon's mandatory-reply contract is wrapped around this file by
+// writeCampaignRoundPrompt on every round.
+// Caller must hold r.mu — it reads state.PRURL under it.
+func (s *Supervisor) writeDefaultReviewBrief(r *runner, name string) (string, error) {
+	dir := filepath.Join(job.Home(), ".pi", "supervisor", "briefs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create briefs dir: %w", err)
+	}
+	pr := r.state.PRURL
+	var b strings.Builder
+	b.WriteString("# Review campaign (auto-generated brief)\n\n")
+	b.WriteString("The build phase of this job is COMPLETE: its final report closed the job. ")
+	b.WriteString("Do NOT re-do, re-verify, or extend the build work unless a review thread demands a code fix.\n\n")
+	if pr != "" {
+		fmt.Fprintf(&b, "The work under review is %s.\n\n", pr)
+	}
+	b.WriteString("Your job each round:\n\n")
+	b.WriteString("1. `list_threads` — read EVERY open review thread on the PR.\n")
+	b.WriteString("2. Triage each thread: real defect / non-issue / out of scope.\n")
+	b.WriteString("3. Do the work the triage demands (code fixes keep the build green).\n")
+	b.WriteString("4. `post_replies` with the batch, then `resolve_thread` per answered thread.\n\n")
+	b.WriteString("Rules:\n\n")
+	b.WriteString("- The mandatory block above this brief is binding: a round without a\n")
+	b.WriteString("  `post_replies` call is a failed round, whatever else it produced.\n")
+	b.WriteString("- Never open a new PR; never merge; never push unrelated changes.\n")
+	b.WriteString("- A finding contradicting a recorded ADR decision is rebutted with the\n")
+	b.WriteString("  ADR reference, not renegotiated.\n\n")
+	p := filepath.Join(dir, name+"_review_brief.md")
+	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
+		return "", fmt.Errorf("write default review brief: %w", err)
+	}
+	return p, nil
 }
