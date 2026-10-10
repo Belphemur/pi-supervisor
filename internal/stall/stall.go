@@ -7,6 +7,7 @@ package stall
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"regexp"
@@ -353,12 +354,14 @@ type ModelScanner struct {
 	offset   int64
 	lastSize int64
 	lastIno  uint64
-	// lastMod guards the nothing-new short-circuit: an in-place rewrite can
-	// reuse the SAME inode AND the SAME size (remove+recreate does exactly
-	// that on ext4/overlayfs — caught by CI, never locally), so neither
-	// check alone proves the content unchanged. A bumped ModTime always
-	// means bytes worth (re)scanning.
-	lastMod time.Time
+	// head is a content fingerprint of the first headProbeBytes: mtime has
+	// COARSE granularity on some filesystems (second-resolution — a
+	// same-tick rewrite leaves it unchanged, kody PR#11), so the
+	// rewrite detector needs a content signal. head+size+inode together
+	// make a same-content false positive require an identical prefix AND
+	// identical size — which for a transcript rewrite means the models
+	// would be identical anyway.
+	head []byte
 	// partial carries the incomplete trailing line between reads: the offset
 	// commits to the raw end of what was read, so a record straddling a
 	// chunk boundary is only parsed once its newline has landed.
@@ -368,6 +371,29 @@ type ModelScanner struct {
 	last    string
 	seen    []string
 	seenSet map[string]bool
+}
+
+// headProbeBytes is how much of the file head the rewrite detector
+// fingerprints. An assistant record is a few KB, so 4KiB always covers the
+// first record's identity.
+const headProbeBytes = 4 << 10
+
+// readHead fingerprints the file head; a short/unreadable file returns what
+// it can (nil = unknown, treated as "same" so a transient stat error never
+// resets a healthy scanner).
+func readHead(path string) []byte {
+	buf := make([]byte, headProbeBytes)
+	n, err := readFileAt(path, buf, 0)
+	// ReadAt returns io.EOF when the file is shorter than the buffer — that
+	// is a SUCCESS here (the head is the whole file). Same trap the PR
+	// scanner's readers document.
+	if n <= 0 {
+		return nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil
+	}
+	return buf[:n]
 }
 
 // NewModelScanner starts a scanner for one transcript path.
@@ -413,6 +439,12 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 	}
 	size := fi.Size()
 	ino, inoOK := inodeOf(fi)
+	// Content fingerprint (kody PR#11: coarse mtimes make ModTime alone
+	// unreliable — a same-tick rewrite leaves it unchanged). head+size is
+	// the rewrite signal; inode is kept for the wholesale-replacement case.
+	head := readHead(s.path)
+	sameHead := len(head) == 0 || string(head) == string(s.head)
+
 	// Truncated/rotated/replaced — same discipline as PRURLScanner: the
 	// offset is meaningless, start over. A replacement file is NEW content:
 	// the used list resets with everything else, because keeping `seen`
@@ -424,25 +456,28 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 	}
 	if inoOK && s.lastIno != 0 && ino != s.lastIno {
 		s.reset()
+		sameHead = true // the inode reset already cleared state; don't double-reset
 	}
 	if inoOK {
 		s.lastIno = ino
 	}
-	// ModTime is the rewrite detector: a remove+recreate can reuse the same
-	// inode AND the same size (caught by CI on overlayfs), so neither proves
-	// the content unchanged. A bumped mtime with a caught-up offset and no
-	// size growth means an IN-PLACE REWRITE — the offset points past the new
-	// content, so it must reset to 0 (and the model state with it) or the
-	// scanner reads an empty window forever and reports the stale model.
-	rewritten := fi.ModTime().After(s.lastMod) && s.offset >= size && size == s.lastSize
+	// In-place rewrite: the offset is caught up, the size is unchanged, but
+	// the content fingerprint changed. Without this the nothing-new
+	// short-circuit below would report the stale model forever (CI-caught:
+	// remove+recreate reuses inode AND size).
+	rewritten := s.offset >= size && size == s.lastSize && !sameHead && s.head != nil
 	if rewritten {
 		s.reset()
 	}
-	// Nothing-new short-circuit: size, offset, and mtime all agree.
-	if size == s.lastSize && s.offset >= size && !fi.ModTime().After(s.lastMod) {
+	if len(head) > 0 {
+		s.head = head
+	}
+	// Nothing-new short-circuit: content fingerprint, size, and offset all
+	// agree (mtime is deliberately NOT part of this — coarse-granularity
+	// mtimes made the old check flaky).
+	if size == s.lastSize && s.offset >= size && sameHead {
 		return s.last, s.copySeen()
 	}
-	s.lastMod = fi.ModTime()
 
 	readTo := min(s.offset+modelChunkBytes, size)
 	buf := make([]byte, readTo-s.offset)
@@ -512,7 +547,6 @@ func (s *ModelScanner) reset() {
 	s.offset, s.lastSize, s.partial = 0, 0, ""
 	s.last = ""
 	s.seen, s.seenSet = nil, map[string]bool{}
-	s.lastMod = time.Time{}
 }
 
 func (s *ModelScanner) copySeen() []string {

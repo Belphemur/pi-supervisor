@@ -611,7 +611,7 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 	}
 	r.mu.Unlock()
 
-	if between {
+	if between && !noWait {
 		// The loop is BETWEEN ROUNDS (its inter-round backoff): no pi is
 		// reading the ctrl file yet, but one will. round() truncates the
 		// ctrl file BEFORE the spawn and the client publishes its pid right
@@ -672,7 +672,18 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 	if interrupt {
 		r.mu.Lock()
 		pid := r.pid
+		betweenNow := between && !r.active // still in the backoff gap
 		r.mu.Unlock()
+		if betweenNow || pid <= 0 {
+			// qodo PR#11 finding 6: the wait budget ran out inside the
+			// between-rounds gap. The NEXT round's pi is about to spawn;
+			// SIGINTing the group now would abort its own LAUNCH/RESUME
+			// prompt. Refuse loudly — an interrupt during a gap has no
+			// turn to drop and would murder the round it was meant for.
+			rep.Outcome = job.AckSendFail
+			rep.Detail = fmt.Sprintf("interrupt refused: the job is between rounds (round %d ended, next one behind a backoff) — there is no turn in flight to drop; re-send -i once the round is live", rep.Round)
+			return rep, fmt.Errorf("%s", rep.Detail)
+		}
 		if err := interruptPID(pid); err != nil {
 			rep.Outcome = job.AckSendFail
 			rep.Detail = fmt.Sprintf("interrupt requested but cannot SIGINT pi group (-%d): %v; frame not written", pid, err)
@@ -687,6 +698,21 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 		// client is already scheduling correctly.
 	}
 
+	// The pid snapshot can be stale: a FAST round can exit between
+	// waitForLiveRound's liveness check and this append (qodo PR#11 finding
+	// 5). Writing now would lose the frame to the next round's truncate
+	// while --no-wait reports it delivered. Re-check under the lock; a
+	// dead round is an honest refusal, not a silent loss.
+	r.mu.Lock()
+	stillLive := r.active && r.pid > 0
+	r.mu.Unlock()
+	if !stillLive {
+		rep.LiveRound = false
+		rep.Outcome = job.AckNoRound
+		rep.Detail = fmt.Sprintf("round %d exited after the liveness check — %s was NOT written; the next round re-truncates it, re-send once the new round is live",
+			rep.Round, rep.CtrlPath)
+		return rep, fault.New(fault.KindNoLiveRound, fmt.Errorf("%s", rep.Detail))
+	}
 	if err := appendCtrl(rep.CtrlPath, frame); err != nil {
 		rep.Outcome = job.AckSendFail
 		rep.Detail = fmt.Sprintf("cannot write %s: %v", rep.CtrlPath, err)
@@ -1127,6 +1153,21 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			s.deliverPendingReportSteer(r, round, steerStop, stopCh)
 		}()
 
+		// Model-identity watcher (ADR-0021, qodo PR#11 finding 2): the
+		// round-boundary scan alone leaves `status` showing the PREVIOUS
+		// round's model for the whole live round. Round-scoped ticker:
+		// drain-scans the transcript every 5s and updates state so status
+		// is current while the round runs.
+		modelStop, modelExited := make(chan struct{}), make(chan struct{})
+		if sess != "" {
+			go func() {
+				defer close(modelExited)
+				s.watchModel(r, sess, round, modelStop, stopCh)
+			}()
+		} else {
+			close(modelExited)
+		}
+
 		// Mid-round thread reminders (ADR-0019) run for EVERY round of a
 		// campaign — steer delivery needs a live round, not a transcript
 		// path, so round 1 of a fresh LAUNCH is covered too. No campaign
@@ -1159,6 +1200,8 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		<-remExited // reminder watcher likewise
 		close(steerStop)
 		<-steerExited // report-request delivery likewise
+		close(modelStop)
+		<-modelExited // model watcher likewise
 		close(markerStop)
 		<-markerExited // completion watcher likewise
 		// Adopt the transcript a fresh LAUNCH just created, so the gate below
@@ -1317,18 +1360,38 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			}
 			ms := r.modelScanner
 			r.mu.Unlock()
-			if cur, used := ms.Scan(); len(used) > 0 {
-				r.mu.Lock()
-				changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
-				if changed {
-					r.state.ModelsUsed = used
-					r.state.CurrentModel = cur
+			// Drain to EOF (qodo PR#11 finding 1 / kody): Scan consumes one
+			// 256KiB chunk per call, so a round that wrote more than one
+			// chunk would leave the tail unscanned until the NEXT round —
+			// possibly never, for a job that finishes here. The WHOLE drain
+			// is ONE state mutation + ONE persist: persisting per chunk made
+			// a multi-MB pinned session take dozens of atomic writes per
+			// boundary and stalled the replay tests (TestReplay*).
+			for i := 0; i < 10000; i++ {
+				cur, used := ms.Scan()
+				if cur == "" && len(used) == 0 {
+					break // idle: nothing consumed
 				}
-				name := r.job.Name
-				r.mu.Unlock()
-				if changed {
-					r.persistState()
+			}
+			// Apply the FINAL result — including an empty used list (qodo
+			// PR#11 finding 2): a replaced transcript with no assistant
+			// record yet must CLEAR the previous transcript's models, not
+			// keep them on display.
+			cur, used := ms.Current(), ms.Used()
+			r.mu.Lock()
+			changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
+			if changed {
+				r.state.ModelsUsed = used
+				r.state.CurrentModel = cur
+			}
+			name := r.job.Name
+			r.mu.Unlock()
+			if changed {
+				r.persistState()
+				if cur != "" {
 					s.logf(name, "model: %s (used this run: %s)", cur, strings.Join(used, ", "))
+				} else {
+					s.logf(name, "model: transcript replaced — model list cleared")
 				}
 			}
 		}
@@ -1436,12 +1499,24 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				r.closeSessWatch() // terminal from the loop's perspective; reap the watcher
 				return
 			}
+			// The answering model rides the terminal event (ADR-0021
+			// decision 4, qodo PR#11 finding 4): a watcher receiving done
+			// must be able to name what produced the run without a second
+			// status call.
+			mm := r.stateSnapshot()
+			modelNote := ""
+			if mm.CurrentModel != "" {
+				modelNote = " model=" + mm.CurrentModel
+				if len(mm.ModelsUsed) > 1 {
+					modelNote += " (models used this run: " + strings.Join(mm.ModelsUsed, ", ") + ")"
+				}
+			}
 			if markerSeen {
 				s.emit(name, "done", round, 0, dur, "",
-					"marker %q detected in session transcript — run is over", j.Marker)
+					"marker %q detected in session transcript — run is over%s", j.Marker, modelNote)
 			} else {
 				s.emit(name, "done", round, 0, dur, "",
-					"final report %s complete — run is over (ADR-0020)", j.FinalReport)
+					"final report %s complete — run is over (ADR-0020)%s", j.FinalReport, modelNote)
 			}
 			r.closeSessWatch() // terminal: reap the watcher (a run-log-only marker may never have pinned a transcript)
 			return
@@ -2520,6 +2595,65 @@ func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watc
 				s.setMarkerSeen(r, true, round)
 				return // latched; no further polling needed this round
 			}
+		}
+	}
+}
+
+// watchModel drains the model scanner on a ticker for ONE live round
+// (ADR-0021, qodo PR#11 finding 2): without it, `status` shows the previous
+// round's model for the entire live round, because the round-boundary scan
+// only runs after round() returns. Same lifecycle as every round-scoped
+// watcher: stopped at round end, final fold before exit so a record written
+// in the last seconds is not lost to the tick boundary.
+func (s *Supervisor) watchModel(r *runner, sess string, round int, watchStop, stopCh chan struct{}) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	apply := func() {
+		r.mu.Lock()
+		if r.modelScanner == nil || r.modelScanner.Path() != sess {
+			r.modelScanner = stall.NewModelScanner(sess)
+		}
+		ms := r.modelScanner
+		r.mu.Unlock()
+		// Drain to EOF, then apply the FINAL result ONCE. The old inner loop
+		// returned only when Scan returned empty — but a caught-up scanner
+		// returns the SAME non-empty result forever, so this spun at 100% CPU
+		// and never reached the select below: watchStop went unobserved and
+		// round end hung on <-modelExited.
+		for i := 0; i < 10000; i++ {
+			cur, used := ms.Scan()
+			if cur == "" && len(used) == 0 {
+				break // idle: nothing consumed
+			}
+		}
+		cur, used := ms.Current(), ms.Used()
+		r.mu.Lock()
+		changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
+		if changed {
+			r.state.ModelsUsed = used
+			r.state.CurrentModel = cur
+		}
+		name := r.job.Name
+		r.mu.Unlock()
+		if changed {
+			r.persistState()
+			if cur != "" {
+				s.logf(name, "round %d: model %s (used this run: %s)", round, cur, strings.Join(used, ", "))
+			} else {
+				s.logf(name, "round %d: transcript replaced — model list cleared", round)
+			}
+		}
+	}
+	apply() // first scan immediately: the round may already have records
+	for {
+		select {
+		case <-watchStop:
+			apply() // final fold
+			return
+		case <-stopCh:
+			return
+		case <-t.C:
+			apply()
 		}
 	}
 }

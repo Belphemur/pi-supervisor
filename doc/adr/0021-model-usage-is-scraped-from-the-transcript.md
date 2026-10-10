@@ -49,9 +49,10 @@ Every assistant record in the session JSONL already carries the truth:
    - `current_model` — the LAST model seen (what is answering right now,
      as of the last scan).
    Both reset on `restart --fresh` with the rest of the run-scoped state.
-4. **Surfaced everywhere the PR URL is surfaced.** `status <job>` carries
-   `models_used` + `current_model`; the round's terminal/fatal event info
-   names the current model; the report/final surfaces list it. A `""` means
+4. **Surfaced where an operator or watcher needs it.** `status <job>`
+   carries `models_used` + `current_model`; the round-boundary log line and
+   the live-round model watcher log changes; `done` event info names the
+   answering model (and the full list when more than one). A `""` means
    "nothing scraped yet", never "no model".
 5. **Never a gate.** Model identity is diagnostic. It must not influence
    completion, budget, or classification — the completion gate (ADR-0020)
@@ -65,6 +66,6 @@ Every assistant record in the session JSONL already carries the truth:
   network calls and no client changes — the transcript already has the data.
 - Multi-model runs (provider failover, operator swaps mid-run) are visible
   in the list the moment the next record lands.
-- The scanner reuses the PR scanner's proven incremental-read discipline;
-  the regex is pinned to assistant records' `provider`/`model` pair so
-  quoted text in message content cannot produce a false model identity.
+- The scanner reuses the PR scanner's proven incremental-read discipline
+  (offset, rotation check) but parses COMPLETE JSONL records with
+  `encoding/json`, discarding anything unrecognized — see decision 2.

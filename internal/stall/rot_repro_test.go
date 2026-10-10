@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestModelScannerSameSizeSameInoRewrite(t *testing.T) {
@@ -28,13 +27,9 @@ func TestModelScannerSameSizeSameInoRewrite(t *testing.T) {
 	if err := os.WriteFile(sess, []byte(b), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Deterministic mtime bump: timestamp granularity can swallow a fast
-	// rewrite on some filesystems, which is a REAL scanner limitation — so
-	// the test documents it by asserting with a forced 2s future mtime.
-	future := time.Now().Add(2 * time.Second)
-	if err := os.Chtimes(sess, future, future); err != nil {
-		t.Fatal(err)
-	}
+	// No mtime manipulation: the content fingerprint (head probe) is the
+	// detector, so coarse timestamp granularity cannot mask the rewrite.
+	// (The old Chtimes hack here masked a real bug in the mtime detector.)
 	cur, used := s.Scan()
 	if cur != "b/two" {
 		t.Fatalf("post-rewrite current = %q, want b/two (used=%v)", cur, used)
