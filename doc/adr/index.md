@@ -26,3 +26,4 @@ add or revise an ADR, add or update its row here in the same commit.**
 | [0018](0018-review-own-session.md) | Review campaigns run in their own session | Accepted | `review_brief` clears the build pin at arm; campaign LAUNCHes fresh |
 | [0019](0019-mid-round-thread-reminders.md) | Mid-round thread reminders | Accepted | Open threads re-steered into the live reviewing round; plain steer, no interrupt |
 | [0020](0020-report-is-the-completion-signal.md) | Report is the completion signal | Accepted | Supersedes ADR-0011's conjunction: full report = done; marker-but-no-report = 2 asks, then fatal |
+| [0021](0021-model-usage-is-scraped-from-the-transcript.md) | Model usage is scraped from the transcript | Accepted | `models_used` + `current_model` from assistant records' provider/model pair — the job def is a request, the transcript is evidence |

@@ -182,6 +182,14 @@ type State struct {
 	// transcript (ADR-0006). Best-effort: "" when the agent never linked a
 	// PR, even if it opened one.
 	PRURL string `json:"pr_url,omitempty"`
+	// ModelsUsed is every distinct model that answered at least one
+	// assistant record in this run, first-seen order (ADR-0021). Scraped
+	// from the transcript — the job's provider/model is a REQUEST, this is
+	// evidence. Reset by restart --fresh like the other run-scoped state.
+	ModelsUsed []string `json:"models_used,omitempty"`
+	// CurrentModel is the most recent model seen (what is answering right
+	// now, as of the last scan); "" before the first assistant record.
+	CurrentModel string `json:"current_model,omitempty"`
 }
 
 // ReviewStatus is the review slice of a job's status (ADR-0012). It lives in
@@ -259,6 +267,11 @@ type Status struct {
 	// PRURL is the pull-request URL found in the last round's transcript
 	// (ADR-0006); "" when none was linked.
 	PRURL string `json:"pr_url,omitempty"`
+	// ModelsUsed is every distinct model that answered this run, first-seen
+	// order (ADR-0021); CurrentModel is the latest. "" before the first
+	// assistant record lands.
+	ModelsUsed   []string `json:"models_used,omitempty"`
+	CurrentModel string   `json:"current_model,omitempty"`
 	// Tasks is the CURRENT plugin-task progress for the job's session store
 	// (ADR-0014 owner amendment): completed/total plus, ONLY on a failed
 	// lookup, a machine reason and a human explanation. nil = the daemon

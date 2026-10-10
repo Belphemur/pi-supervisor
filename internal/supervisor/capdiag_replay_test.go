@@ -92,7 +92,7 @@ func TestReplayPositionRestoreReportDrivenDone(t *testing.T) {
 	if err := s.Start("replaydone"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 60*time.Second, func() bool {
+	waitFor(t, 30*time.Second, func() bool {
 		st, err := job.LoadState("replaydone")
 		return err == nil && st.State == "done"
 	})
@@ -169,7 +169,7 @@ func TestReplayPositionRestoreMarkerWithoutReportAsksTwice(t *testing.T) {
 	if err := s.Start("replayask"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 120*time.Second, func() bool {
+	waitFor(t, 30*time.Second, func() bool {
 		st, err := job.LoadState("replayask")
 		return err == nil && st.State == "fatal"
 	})
@@ -240,7 +240,7 @@ func TestReplayPositionRestoreFatalIsAskFatalNotCapFatal(t *testing.T) {
 	if err := s.Start("replaynotcap"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 120*time.Second, func() bool {
+	waitFor(t, 30*time.Second, func() bool {
 		st, err := job.LoadState("replaynotcap")
 		return err == nil && st.State == "fatal"
 	})

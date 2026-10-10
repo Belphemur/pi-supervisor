@@ -6,9 +6,12 @@ package stall
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -300,6 +303,265 @@ func (s *PRURLScanner) PRURL() string {
 // large append; each consumes at most this much and the next continues from the
 // offset. Bounding a read is not the same as bounding what gets scanned.
 const prURLChunkBytes = 256 << 10
+
+// modelChunkBytes bounds ONE read of the model scanner. Same rationale as
+// prURLChunkBytes: bounding a read is not the same as bounding what gets
+// scanned — the offset bounds the total, and the partial-line carry makes
+// sure a record split across reads is parsed whole.
+const modelChunkBytes = 256 << 10
+
+// modelMaxPartial caps the carried incomplete trailing line. An assistant
+// record is a few KB; compaction records can reach megabytes. A line longer
+// than the cap has its model missed for THIS record (the offset has already
+// committed past it) — the honest tradeoff vs unbounded memory, and the
+// same cap discipline the client's control reader uses.
+const modelMaxPartial = 8 << 20
+
+// transcriptModelRecord is the slice of a session JSONL line the model
+// scanner needs. Parsed with encoding/json — never regex — so field
+// reordering, escaping, and formatting changes in pi's writer cannot break
+// the scrape (owner directive 2026-10-09). Only assistant records carry a
+// model: `message.role == "assistant"` plus a non-empty `message.model`.
+// A bare `"model"` string quoted in CONTENT (briefs, steers, toolResults)
+// names a request, not an answer, and is never inspected here.
+type transcriptModelRecord struct {
+	Message *struct {
+		Role     string `json:"role"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+	} `json:"message"`
+}
+
+// modelIdentity renders "provider/model" — the canonical surface form.
+func modelIdentity(provider, model string) string {
+	if provider == "" {
+		return model
+	}
+	return provider + "/" + model
+}
+
+// ModelScanner is the incremental model-identity scanner for one transcript
+// (ADR-0021). Same discipline as PRURLScanner: offset + inode rotation check,
+// append-only, never re-reads the whole file — but it parses complete JSONL
+// records (json.Unmarshal per line, with an incomplete trailing line carried
+// to the next read) instead of regexing raw bytes, so pi's writer can
+// reorder or reformat fields without breaking identity extraction. It is
+// the ONE component that derives model identity from the transcript;
+// nothing else re-derives it.
+type ModelScanner struct {
+	mu       sync.Mutex
+	path     string
+	offset   int64
+	lastSize int64
+	lastIno  uint64
+	// head is a content fingerprint of the first headProbeBytes: mtime has
+	// COARSE granularity on some filesystems (second-resolution — a
+	// same-tick rewrite leaves it unchanged, kody PR#11), so the
+	// rewrite detector needs a content signal. head+size+inode together
+	// make a same-content false positive require an identical prefix AND
+	// identical size — which for a transcript rewrite means the models
+	// would be identical anyway.
+	head []byte
+	// partial carries the incomplete trailing line between reads: the offset
+	// commits to the raw end of what was read, so a record straddling a
+	// chunk boundary is only parsed once its newline has landed.
+	partial string
+	// last is the most recent model seen (current_model); order remembers
+	// every distinct model in first-seen order (models_used).
+	last    string
+	seen    []string
+	seenSet map[string]bool
+}
+
+// headProbeBytes is how much of the file head the rewrite detector
+// fingerprints. An assistant record is a few KB, so 4KiB always covers the
+// first record's identity.
+const headProbeBytes = 4 << 10
+
+// readHead fingerprints the file head; a short/unreadable file returns what
+// it can (nil = unknown, treated as "same" so a transient stat error never
+// resets a healthy scanner).
+func readHead(path string) []byte {
+	buf := make([]byte, headProbeBytes)
+	n, err := readFileAt(path, buf, 0)
+	// ReadAt returns io.EOF when the file is shorter than the buffer — that
+	// is a SUCCESS here (the head is the whole file). Same trap the PR
+	// scanner's readers document.
+	if n <= 0 {
+		return nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil
+	}
+	return buf[:n]
+}
+
+// NewModelScanner starts a scanner for one transcript path.
+func NewModelScanner(path string) *ModelScanner {
+	return &ModelScanner{path: path, seenSet: map[string]bool{}}
+}
+
+// Path is the transcript this scanner reads, so a caller holding one per job
+// can tell whether it still matches the job's current session.
+func (s *ModelScanner) Path() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path
+}
+
+// Current is the most recent model seen ("provider/model"), "" before the
+// first assistant record lands.
+func (s *ModelScanner) Current() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
+}
+
+// Used is every distinct model in first-seen order. The slice is copied so
+// the caller cannot mutate the scanner's view.
+func (s *ModelScanner) Used() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.copySeen()
+}
+
+// Scan reads bytes appended since the previous call, parses every COMPLETE
+// line as JSON, and updates the current model and the used list. "" returns
+// are normal: no assistant record has landed yet, or nothing new was
+// appended.
+func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	fi, err := os.Stat(s.path)
+	if err != nil {
+		return s.last, s.copySeen(), false
+	}
+	size := fi.Size()
+	ino, inoOK := inodeOf(fi)
+	// Content fingerprint (kody PR#11: coarse mtimes make ModTime alone
+	// unreliable — a same-tick rewrite leaves it unchanged). head+size is
+	// the rewrite signal; inode is kept for the wholesale-replacement case.
+	head := readHead(s.path)
+	sameHead := len(head) == 0 || string(head) == string(s.head)
+
+	// Truncated/rotated/replaced — same discipline as PRURLScanner: the
+	// offset is meaningless, start over. A replacement file is NEW content:
+	// the used list resets with everything else, because keeping `seen`
+	// while clearing `last` would surface a current model missing from the
+	// used list. (A restart --fresh changes the path and recreates the
+	// scanner wholesale; this path covers in-place rewrites.)
+	if size < s.offset {
+		s.reset()
+	}
+	if inoOK && s.lastIno != 0 && ino != s.lastIno {
+		s.reset()
+		sameHead = true // the inode reset already cleared state; don't double-reset
+	}
+	if inoOK {
+		s.lastIno = ino
+	}
+	// In-place rewrite detection (kody PR#11): a remove+recreate can reuse
+	// the inode AND the size, so the content fingerprint is the signal. Two
+	// windows must both be covered:
+	//   - caught up (offset>=size): the classic case — without the reset the
+	//     nothing-new short-circuit reports the stale model forever.
+	//   - MID-CATCH-UP (lastSize==-1 sentinel): the old offset points into
+	//     the NEW file's middle; the head probe already differs, so reset and
+	//     re-read the replacement from byte 0 instead of skipping its head.
+	if s.head != nil && !sameHead && size == s.lastSize && s.offset >= size {
+		s.reset()
+	} else if s.head != nil && !sameHead && s.lastSize == -1 {
+		s.reset()
+	}
+	if len(head) > 0 {
+		s.head = head
+	}
+	// Nothing-new short-circuit: content fingerprint, size, and offset all
+	// agree (mtime is deliberately NOT part of this — coarse-granularity
+	// mtimes made the old check flaky).
+	if size == s.lastSize && s.offset >= size && sameHead {
+		return s.last, s.copySeen(), false
+	}
+
+	readTo := min(s.offset+modelChunkBytes, size)
+	buf := make([]byte, readTo-s.offset)
+	n, _ := readFileAt(s.path, buf, s.offset)
+	if n > 0 {
+		s.offset += int64(n)
+	}
+	if s.offset >= size {
+		s.lastSize = size
+	} else {
+		s.lastSize = -1 // force the next call to keep reading
+	}
+	if n <= 0 {
+		return s.last, s.copySeen(), false
+	}
+
+	// Split at the LAST newline: everything before it is whole records; the
+	// remainder is carried to the next read (a record split across chunk
+	// boundaries is parsed exactly once, whole).
+	data := s.partial + string(buf[:n])
+	if i := strings.LastIndexByte(data, '\n'); i >= 0 {
+		s.partial = data[i+1:]
+		data = data[:i+1]
+	} else {
+		// No newline in this read: the whole chunk is one growing line.
+		// The offset advanced, so consumed MUST be true — the drain loops
+		// break on false and would otherwise stop mid-record (kody PR#11
+		// re-review: these branches returned false and starved EOF).
+		if len(data) > modelMaxPartial {
+			// Runaway line (a multi-MB record): drop it rather than grow
+			// without bound. Its model is missed; the offset has already
+			// committed past it, so later records are unaffected.
+			s.partial = ""
+			return s.last, s.copySeen(), true
+		}
+		s.partial = data
+		return s.last, s.copySeen(), true
+	}
+	if len(s.partial) > modelMaxPartial {
+		s.partial = ""
+	}
+	s.scanLines(data)
+	return s.last, s.copySeen(), true
+}
+
+// scanLines parses whole LF-terminated lines and folds assistant records'
+// model identities into last/seen.
+func (s *ModelScanner) scanLines(data string) {
+	for line := range strings.SplitSeq(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec transcriptModelRecord
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue // non-JSON noise: ignore, matching the client reader
+		}
+		if rec.Message == nil || rec.Message.Role != "assistant" || rec.Message.Model == "" {
+			continue
+		}
+		s.last = modelIdentity(rec.Message.Provider, rec.Message.Model)
+		if !s.seenSet[s.last] {
+			s.seenSet[s.last] = true
+			s.seen = append(s.seen, s.last)
+		}
+	}
+}
+
+func (s *ModelScanner) reset() {
+	s.offset, s.lastSize, s.partial = 0, 0, ""
+	s.last = ""
+	s.seen, s.seenSet = nil, map[string]bool{}
+}
+
+func (s *ModelScanner) copySeen() []string {
+	out := make([]string, len(s.seen))
+	copy(out, s.seen)
+	return out
+}
 
 // readFileAt reads into buf at off, tolerating a short read: a PR link near the
 // tail is exactly what we came for, so partial data is better than none.
