@@ -461,12 +461,17 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 	if inoOK {
 		s.lastIno = ino
 	}
-	// In-place rewrite: the offset is caught up, the size is unchanged, but
-	// the content fingerprint changed. Without this the nothing-new
-	// short-circuit below would report the stale model forever (CI-caught:
-	// remove+recreate reuses inode AND size).
-	rewritten := s.offset >= size && size == s.lastSize && !sameHead && s.head != nil
-	if rewritten {
+	// In-place rewrite detection (kody PR#11): a remove+recreate can reuse
+	// the inode AND the size, so the content fingerprint is the signal. Two
+	// windows must both be covered:
+	//   - caught up (offset>=size): the classic case — without the reset the
+	//     nothing-new short-circuit reports the stale model forever.
+	//   - MID-CATCH-UP (lastSize==-1 sentinel): the old offset points into
+	//     the NEW file's middle; the head probe already differs, so reset and
+	//     re-read the replacement from byte 0 instead of skipping its head.
+	if s.head != nil && !sameHead && size == s.lastSize && s.offset >= size {
+		s.reset()
+	} else if s.head != nil && !sameHead && s.lastSize == -1 {
 		s.reset()
 	}
 	if len(head) > 0 {
@@ -503,15 +508,18 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 		data = data[:i+1]
 	} else {
 		// No newline in this read: the whole chunk is one growing line.
+		// The offset advanced, so consumed MUST be true — the drain loops
+		// break on false and would otherwise stop mid-record (kody PR#11
+		// re-review: these branches returned false and starved EOF).
 		if len(data) > modelMaxPartial {
 			// Runaway line (a multi-MB record): drop it rather than grow
 			// without bound. Its model is missed; the offset has already
 			// committed past it, so later records are unaffected.
 			s.partial = ""
-			return s.last, s.copySeen(), false
+			return s.last, s.copySeen(), true
 		}
 		s.partial = data
-		return s.last, s.copySeen(), false
+		return s.last, s.copySeen(), true
 	}
 	if len(s.partial) > modelMaxPartial {
 		s.partial = ""
