@@ -1381,6 +1381,27 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			// assistant record yet must CLEAR the previous transcript's
 			// models, not keep them on display.
 			s.applyModelUsage(r, ms, round)
+			// Apply the FINAL result — including an empty used list (qodo
+			// PR#11 finding 2): a replaced transcript with no assistant
+			// record yet must CLEAR the previous transcript's models, not
+			// keep them on display.
+			cur, used := ms.Current(), ms.Used()
+			r.mu.Lock()
+			changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
+			if changed {
+				r.state.ModelsUsed = used
+				r.state.CurrentModel = cur
+			}
+			name := r.job.Name
+			r.mu.Unlock()
+			if changed {
+				r.persistState()
+				if cur != "" {
+					s.logf(name, "model: %s (used this run: %s)", cur, strings.Join(used, ", "))
+				} else {
+					s.logf(name, "model: transcript replaced — model list cleared")
+				}
+			}
 		}
 
 		// A report that DECLARES itself incomplete is evidence AGAINST
@@ -2650,6 +2671,23 @@ func (s *Supervisor) watchModel(r *runner, sess string, round int, watchStop, st
 			}
 		}
 		s.applyModelUsage(r, ms, round)
+		cur, used := ms.Current(), ms.Used()
+		r.mu.Lock()
+		changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
+		if changed {
+			r.state.ModelsUsed = used
+			r.state.CurrentModel = cur
+		}
+		name := r.job.Name
+		r.mu.Unlock()
+		if changed {
+			r.persistState()
+			if cur != "" {
+				s.logf(name, "round %d: model %s (used this run: %s)", round, cur, strings.Join(used, ", "))
+			} else {
+				s.logf(name, "round %d: transcript replaced — model list cleared", round)
+			}
+		}
 	}
 	apply() // first scan immediately: the round may already have records
 	for {
