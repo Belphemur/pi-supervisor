@@ -381,8 +381,10 @@ type ModelScanner struct {
 	lastModSet bool
 	// partial carries the incomplete trailing line between reads: the offset
 	// commits to the raw end of what was read, so a record straddling a
-	// chunk boundary is only parsed once its newline has landed.
-	partial string
+	// chunk boundary is only parsed once its newline has landed. A []byte
+	// grown by append (never re-concatenated) — kody PR#12: string concat
+	// copied O(N²/chunk) bytes while a multi-MB compaction record grew.
+	partial []byte
 	// last is the most recent model seen (current_model); order remembers
 	// every distinct model in first-seen order (models_used).
 	last    string
@@ -519,7 +521,15 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 	// is acceptable here because same-tick HEAD edits are covered by the
 	// probe; this branch only needs edits that left the head untouched.
 	if s.lastModSet && !fi.ModTime().Equal(s.lastMod) &&
-		(s.offset >= size || size > s.lastSize) && s.lastSize > 0 {
+		(s.offset >= size || s.offset >= s.lastSize || size > s.lastSize) && s.lastSize > 0 {
+		// s.offset >= s.lastSize covers the GROWING rewrite (kody PR#12:
+		// remove+reproduce reusing the inode with a LARGER size — the old
+		// caught-up offset lands inside the new content, so bytes before it
+		// are unscanned new truth). A plain append ALSO bumps mtime with
+		// size > lastSize, but for an append offset < size still holds and
+		// offset < lastSize is false too — the guard combination
+		// (offset >= lastSize) is exactly "the old caught-up position has
+		// been passed or replaced", which an append never satisfies.
 		s.reset()
 	}
 	if len(head) > 0 {
@@ -549,32 +559,36 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 		return s.last, s.copySeen(), false
 	}
 
-	// Split at the LAST newline: everything before it is whole records; the
-	// remainder is carried to the next read (a record split across chunk
-	// boundaries is parsed exactly once, whole).
-	data := s.partial + string(buf[:n])
-	if i := strings.LastIndexByte(data, '\n'); i >= 0 {
-		s.partial = data[i+1:]
-		data = data[:i+1]
-	} else {
-		// No newline in this read: the whole chunk is one growing line.
-		// The offset advanced, so consumed MUST be true — the drain loops
-		// break on false and would otherwise stop mid-record (kody PR#11
-		// re-review: these branches returned false and starved EOF).
-		if len(data) > modelMaxPartial {
-			// Runaway line (a multi-MB record): drop it rather than grow
-			// without bound. Its model is missed; the offset has already
-			// committed past it, so later records are unaffected.
-			s.partial = ""
-			return s.last, s.copySeen(), true
+	// Append the new chunk to the carried partial WITHOUT re-copying the
+	// whole thing per chunk (kody PR#12: string concat was O(N²/chunk) on a
+	// growing multi-MB line — ~130MiB copied for an 8MiB record). Search
+	// only the NEW region for the last newline; the carried prefix is
+	// already newline-free by construction.
+	s.partial = append(s.partial, buf[:n]...)
+	newRegion := len(s.partial) - n
+	if i := bytes.LastIndexByte(s.partial[newRegion:], '\n'); i >= 0 {
+		abs := newRegion + i
+		whole := s.partial[:abs+1]
+		rest := append(s.partial[:0], s.partial[abs+1:]...)
+		s.partial = rest
+		if len(s.partial) > modelMaxPartial {
+			// Carried line exceeds the cap: drop it (model missed, offset
+			// already committed past it — later records are unaffected).
+			s.partial = s.partial[:0]
 		}
-		s.partial = data
+		s.scanLines(string(whole))
 		return s.last, s.copySeen(), true
 	}
+	// No newline in this read: the whole chunk is one growing line. The
+	// offset advanced, so consumed MUST be true — the drain loops break on
+	// false and would otherwise stop mid-record (kody PR#11 re-review).
 	if len(s.partial) > modelMaxPartial {
-		s.partial = ""
+		// Runaway line (a multi-MB record): drop it rather than grow
+		// without bound. Its model is missed; the offset has already
+		// committed past it, so later records are unaffected.
+		s.partial = s.partial[:0]
+		return s.last, s.copySeen(), true
 	}
-	s.scanLines(data)
 	return s.last, s.copySeen(), true
 }
 
@@ -617,7 +631,8 @@ func (s *ModelScanner) scanLines(data string) {
 }
 
 func (s *ModelScanner) reset() {
-	s.offset, s.lastSize, s.partial = 0, 0, ""
+	s.offset, s.lastSize = 0, 0
+	s.partial = s.partial[:0]
 	s.last = ""
 	s.seen, s.seenSet = nil, map[string]bool{}
 	s.lastTokens, s.lastCost = 0, 0
