@@ -325,6 +325,10 @@ const modelMaxPartial = 8 << 20
 // A bare `"model"` string quoted in CONTENT (briefs, steers, toolResults)
 // names a request, not an answer, and is never inspected here.
 type transcriptModelRecord struct {
+	// Type must be "message" (qodo PR#12 finding 6): any nested
+	// assistant-SHAPED object inside a different record type (compaction
+	// summaries, tool payloads) must not impersonate an answering model.
+	Type    string `json:"type"`
 	Message *struct {
 		Role     string `json:"role"`
 		Provider string `json:"provider"`
@@ -368,6 +372,13 @@ type ModelScanner struct {
 	// identical size — which for a transcript rewrite means the models
 	// would be identical anyway.
 	head []byte
+	// lastMod/lastModSet back the beyond-probe edit detector (qodo PR#12
+	// findings 3+4): a bumped mtime on a caught-up or growing file whose
+	// head probe is unchanged means bytes beyond the 4KiB probe were edited
+	// — reset and re-scan. lastModSet distinguishes "never seen" from
+	// "seen at t0" on coarse-mtime filesystems.
+	lastMod    time.Time
+	lastModSet bool
 	// partial carries the incomplete trailing line between reads: the offset
 	// commits to the raw end of what was read, so a record straddling a
 	// chunk boundary is only parsed once its newline has landed.
@@ -498,9 +509,24 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 	} else if s.head != nil && !sameHead && s.lastSize == -1 {
 		s.reset()
 	}
+	// qodo PR#12 findings 3+4: the head probe covers only the first 4KiB.
+	// A rewrite that PRESERVES that prefix — a growing rewrite (size larger,
+	// old offset points into the new content's middle) or a later-record
+	// edit at caught-up size — never trips the !sameHead branch above. The
+	// mtime is the secondary signal: a bumped mtime while the offset is
+	// caught up (or the file grew) means bytes we already scanned are no
+	// longer the whole truth — reset and re-scan. Coarse mtime granularity
+	// is acceptable here because same-tick HEAD edits are covered by the
+	// probe; this branch only needs edits that left the head untouched.
+	if s.lastModSet && !fi.ModTime().Equal(s.lastMod) &&
+		(s.offset >= size || size > s.lastSize) && s.lastSize > 0 {
+		s.reset()
+	}
 	if len(head) > 0 {
 		s.head = head
 	}
+	s.lastMod = fi.ModTime()
+	s.lastModSet = true
 	// Nothing-new short-circuit: content fingerprint, size, and offset all
 	// agree (mtime is deliberately NOT part of this — coarse-granularity
 	// mtimes made the old check flaky).
@@ -564,6 +590,9 @@ func (s *ModelScanner) scanLines(data string) {
 		if json.Unmarshal([]byte(line), &rec) != nil {
 			continue // non-JSON noise: ignore, matching the client reader
 		}
+		if rec.Type != "" && rec.Type != "message" {
+			continue // qodo PR#12 finding 6: only real message records answer
+		}
 		if rec.Message == nil || rec.Message.Role != "assistant" || rec.Message.Model == "" {
 			continue
 		}
@@ -572,14 +601,15 @@ func (s *ModelScanner) scanLines(data string) {
 			s.seenSet[s.last] = true
 			s.seen = append(s.seen, s.last)
 		}
-		// Usage: keep the LATEST cumulative totals — pi already reports
-		// them as running totals per record (owner directive 2026-10-10);
-		// summing would double-count every cached turn.
+		// Usage: keep the LATEST record's totals verbatim (owner directive
+		// 2026-10-10). Zero and positive are adopted ALIKE (qodo PR#12
+		// finding 5): a failover record that reports 0 cost is the newest
+		// truth — keeping the previous paid figure would publish a cost the
+		// current model never incurred. pi reports these as running totals
+		// per record; summing would double-count every cached turn.
 		if u := rec.Message.Usage; u != nil {
-			if u.TotalTokens > 0 {
-				s.lastTokens = u.TotalTokens
-			}
-			if u.Cost != nil && u.Cost.Total > 0 {
+			s.lastTokens = u.TotalTokens
+			if u.Cost != nil {
 				s.lastCost = u.Cost.Total
 			}
 		}
@@ -591,6 +621,7 @@ func (s *ModelScanner) reset() {
 	s.last = ""
 	s.seen, s.seenSet = nil, map[string]bool{}
 	s.lastTokens, s.lastCost = 0, 0
+	s.lastMod, s.lastModSet = time.Time{}, false
 }
 
 func (s *ModelScanner) copySeen() []string {

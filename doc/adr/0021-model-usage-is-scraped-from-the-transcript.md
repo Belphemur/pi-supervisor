@@ -75,3 +75,8 @@ Every assistant record in the session JSONL already carries the truth:
 - The scanner reuses the PR scanner's proven incremental-read discipline
   (offset, rotation check) but parses COMPLETE JSONL records with
   `encoding/json`, discarding anything unrecognized — see decision 2.
+- Usage totals (extension, 2026-10-10): `total_tokens`/`total_cost` mirror
+  the LATEST assistant record's `usage` verbatim — pi reports them as
+  running totals per record, so summing would double-count cached turns;
+  zero and positive are adopted alike so a failover's zero cost replaces
+  the previous paid figure.

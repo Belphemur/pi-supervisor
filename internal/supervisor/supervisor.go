@@ -613,7 +613,12 @@ func (s *Supervisor) Steer(name, text string, noWait, interrupt bool) (job.Steer
 	}
 	r.mu.Unlock()
 
-	if between && !noWait {
+	// qodo PR#12 finding 2: the between-rounds wait is NOT an ack wait —
+	// it finds the safe write point (pid published) before appending. It
+	// runs for noWait steers too: skipping it made a backoff-window steer
+	// return "no live round, nothing written" even when the next round
+	// would have started within the budget. (noWait only skips waitAck.)
+	if between {
 		// The loop is BETWEEN ROUNDS (its inter-round backoff): no pi is
 		// reading the ctrl file yet, but one will. round() truncates the
 		// ctrl file BEFORE the spawn and the client publishes its pid right
@@ -1161,14 +1166,15 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 		// drain-scans the transcript every 5s and updates state so status
 		// is current while the round runs.
 		modelStop, modelExited := make(chan struct{}), make(chan struct{})
-		if sess != "" {
-			go func() {
-				defer close(modelExited)
-				s.watchModel(r, sess, round, modelStop, stopCh)
-			}()
-		} else {
-			close(modelExited)
-		}
+		go func() {
+			defer close(modelExited)
+			// qodo PR#12 finding 1: spawn UNCONDITIONALLY. On a fresh LAUNCH
+			// the pre-round sess snapshot is empty but discovery populates
+			// the session path mid-round; watchModel resolves the CURRENT
+			// path each tick, so it picks the transcript up as soon as it
+			// exists instead of waiting for the round to end.
+			s.watchModel(r, sess, round, modelStop, stopCh)
+		}()
 
 		// Mid-round thread reminders (ADR-0019) run for EVERY round of a
 		// campaign — steer delivery needs a live round, not a transcript
@@ -1381,27 +1387,6 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			// assistant record yet must CLEAR the previous transcript's
 			// models, not keep them on display.
 			s.applyModelUsage(r, ms, round)
-			// Apply the FINAL result — including an empty used list (qodo
-			// PR#11 finding 2): a replaced transcript with no assistant
-			// record yet must CLEAR the previous transcript's models, not
-			// keep them on display.
-			cur, used := ms.Current(), ms.Used()
-			r.mu.Lock()
-			changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
-			if changed {
-				r.state.ModelsUsed = used
-				r.state.CurrentModel = cur
-			}
-			name := r.job.Name
-			r.mu.Unlock()
-			if changed {
-				r.persistState()
-				if cur != "" {
-					s.logf(name, "model: %s (used this run: %s)", cur, strings.Join(used, ", "))
-				} else {
-					s.logf(name, "model: transcript replaced — model list cleared")
-				}
-			}
 		}
 
 		// A report that DECLARES itself incomplete is evidence AGAINST
@@ -2648,11 +2633,22 @@ func (s *Supervisor) applyModelUsage(r *runner, ms *stall.ModelScanner, round in
 // only runs after round() returns. Same lifecycle as every round-scoped
 // watcher: stopped at round end, final fold before exit so a record written
 // in the last seconds is not lost to the tick boundary.
-func (s *Supervisor) watchModel(r *runner, sess string, round int, watchStop, stopCh chan struct{}) {
+func (s *Supervisor) watchModel(r *runner, sessHint string, round int, watchStop, stopCh chan struct{}) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	apply := func() {
 		r.mu.Lock()
+		// Resolve the CURRENT session path every tick (qodo PR#12 finding
+		// 1): a fresh LAUNCH's discovery populates SessionPath mid-round,
+		// after this watcher was spawned with an empty hint.
+		sess := r.job.SessionPath
+		if sess == "" {
+			sess = sessHint
+		}
+		if sess == "" {
+			r.mu.Unlock()
+			return
+		}
 		if r.modelScanner == nil || r.modelScanner.Path() != sess {
 			r.modelScanner = stall.NewModelScanner(sess)
 		}
