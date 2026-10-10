@@ -511,25 +511,19 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 	} else if s.head != nil && !sameHead && s.lastSize == -1 {
 		s.reset()
 	}
-	// qodo PR#12 findings 3+4: the head probe covers only the first 4KiB.
-	// A rewrite that PRESERVES that prefix — a growing rewrite (size larger,
-	// old offset points into the new content's middle) or a later-record
-	// edit at caught-up size — never trips the !sameHead branch above. The
-	// mtime is the secondary signal: a bumped mtime while the offset is
-	// caught up (or the file grew) means bytes we already scanned are no
-	// longer the whole truth — reset and re-scan. Coarse mtime granularity
-	// is acceptable here because same-tick HEAD edits are covered by the
-	// probe; this branch only needs edits that left the head untouched.
+	// qodo PR#12 findings 3+4, CORRECTED per kody's re-review: the mtime
+	// reset fires ONLY when the scanner is CAUGHT UP (offset >= size). The
+	// earlier "size > lastSize" form re-read the ENTIRE transcript on every
+	// 5s tick during an active round — every append bumps mtime, so the
+	// cost grew with transcript size × tick count for nothing. A caught-up
+	// file with a bumped mtime is an unambiguous in-place rewrite (nothing
+	// new to read, yet the content changed). The prefix-preserving GROWING
+	// rewrite is deliberately not reset: it is indistinguishable from an
+	// append without re-reading, the delta read still parses the new tail
+	// records, and the head probe plus this caught-up path cover the other
+	// shapes. Documented limitation, not a silent wrong-answer path.
 	if s.lastModSet && !fi.ModTime().Equal(s.lastMod) &&
-		(s.offset >= size || s.offset >= s.lastSize || size > s.lastSize) && s.lastSize > 0 {
-		// s.offset >= s.lastSize covers the GROWING rewrite (kody PR#12:
-		// remove+reproduce reusing the inode with a LARGER size — the old
-		// caught-up offset lands inside the new content, so bytes before it
-		// are unscanned new truth). A plain append ALSO bumps mtime with
-		// size > lastSize, but for an append offset < size still holds and
-		// offset < lastSize is false too — the guard combination
-		// (offset >= lastSize) is exactly "the old caught-up position has
-		// been passed or replaced", which an append never satisfies.
+		s.offset >= size && s.lastSize > 0 {
 		s.reset()
 	}
 	if len(head) > 0 {
