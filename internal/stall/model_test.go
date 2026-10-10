@@ -66,6 +66,30 @@ func TestModelScannerTracksUsedAndCurrent(t *testing.T) {
 		t.Fatalf("repeat duplicated the list: %v", used)
 	}
 
+	// Usage (owner directive 2026-10-10): pi's totalTokens / cost.total are
+	// RUNNING totals per record — the scanner keeps the LATEST, never sums
+	// (summing would double-count every cached turn).
+	writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"openrouter","model":"z-ai/glm-5.3-flash","usage":{"input":1225,"output":141,"cacheRead":331520,"totalTokens":332886,"cost":{"total":0.0102}}}}`)
+	s.Scan() // fold the record
+	tt, cost := s.LastUsage()
+	if tt != 332886 {
+		t.Fatalf("totalTokens = %d, want 332886", tt)
+	}
+	if cost < 0.010199 || cost > 0.010201 {
+		t.Fatalf("cost.total = %f, want ~0.0102", cost)
+	}
+	// A later record with LOWER cumulative totals (e.g. post-compaction)
+	// still replaces — latest wins, not max, not sum.
+	writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"openrouter","model":"z-ai/glm-5.3-flash","usage":{"input":100,"output":50,"totalTokens":200,"cost":{"total":0.0001}}}}`)
+	s.Scan() // fold the record
+	tt, cost = s.LastUsage()
+	if tt != 200 {
+		t.Fatalf("latest-wins violated: totalTokens = %d, want 200", tt)
+	}
+	if cost < 0.0000999 || cost > 0.0001001 {
+		t.Fatalf("latest-wins violated: cost = %f, want ~0.0001", cost)
+	}
+
 	// Nothing new appended: stable, no error.
 	cur2, used2, _ := s.Scan()
 	if cur2 != cur || len(used2) != 2 {

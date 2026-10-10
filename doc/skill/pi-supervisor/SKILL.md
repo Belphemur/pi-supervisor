@@ -261,9 +261,11 @@ Behavior:
   break it. The job def's `provider`/`model` is a REQUEST; these fields are
   EVIDENCE — on routed providers they diverge routinely. Only assistant
   records count: quoted "model" text in briefs, steers, or toolResults, and
-  user/toolResult roles, never produce an identity. Model swaps mid-run
-  (provider failover, operator swap) show up the moment the next assistant
-  record lands.
+  user/toolResult roles, never produce an identity. `total_tokens` /
+  `total_cost` mirror the latest assistant record's `usage` — pi reports
+  those as RUNNING totals, so they are kept verbatim (never summed). Model
+  swaps mid-run (provider failover, operator swap) show up the moment the
+  next assistant record lands.
 - **Finished run ⇒ immediate return.** If the job is already done/fatal/stopped
   when you arm, the watch does NOT block — it prints
   `THE RUN IS OVER — <job> <event>`, points at `status`, and says not to re-arm.

@@ -43,12 +43,18 @@ Every assistant record in the session JSONL already carries the truth:
    steers, and toolResults can never produce a false identity. The scanner
    is the ONE component that derives model identity; nothing else
    re-derives it (the marker funnel rule).
-3. **Two fields, one list.** State and status carry:
+3. **Two fields, one list — plus the latest cumulative usage.** State and
+   status carry:
    - `models_used` — the ordered, deduplicated list of every model that has
      answered at least one assistant record this run (first-seen order).
    - `current_model` — the LAST model seen (what is answering right now,
      as of the last scan).
-   Both reset on `restart --fresh` with the rest of the run-scoped state.
+   - `total_tokens` / `total_cost` — the LATEST assistant record's
+     `usage.totalTokens` / `usage.cost.total` (owner directive 2026-10-10).
+     pi already reports these as RUNNING totals per record, so the scanner
+     keeps the latest — it never sums, which would double-count every
+     cached turn.
+   All reset on `restart --fresh` with the rest of the run-scoped state.
 4. **Surfaced where an operator or watcher needs it.** `status <job>`
    carries `models_used` + `current_model`; the round-boundary log line and
    the live-round model watcher log changes; `done` event info names the

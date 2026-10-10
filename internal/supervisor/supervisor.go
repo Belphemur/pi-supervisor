@@ -264,6 +264,7 @@ func (r *runner) snapshot() job.Status {
 		CIStalls: r.state.CIStalls, ReportSteers: r.state.ReportSteers,
 		LastDiag: r.state.LastDiag, PRURL: r.state.PRURL,
 		ModelsUsed: r.state.ModelsUsed, CurrentModel: r.state.CurrentModel,
+		TotalTokens: r.state.TotalTokens, TotalCostTotal: r.state.TotalCostTotal,
 		LastUpdate: time.Now().Format(time.RFC3339),
 	}
 	if r.job.FinalReport != "" {
@@ -524,6 +525,7 @@ func (s *Supervisor) Restart(name string) error {
 	// must not be mixed with the previous run's list.
 	r.state.ModelsUsed = nil
 	r.state.CurrentModel = ""
+	r.state.TotalTokens, r.state.TotalCostTotal = 0, 0
 	// Run-scoped in-memory report-request state: a fresh run must not
 	// inherit an armed ask or spent grace budget (kody, PR#7).
 	r.pendingReportSteer = false
@@ -1374,27 +1376,11 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 					// condition never fired once any model was seen)
 				}
 			}
-			// Apply the FINAL result — including an empty used list (qodo
-			// PR#11 finding 2): a replaced transcript with no assistant
-			// record yet must CLEAR the previous transcript's models, not
-			// keep them on display.
-			cur, used := ms.Current(), ms.Used()
-			r.mu.Lock()
-			changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
-			if changed {
-				r.state.ModelsUsed = used
-				r.state.CurrentModel = cur
-			}
-			name := r.job.Name
-			r.mu.Unlock()
-			if changed {
-				r.persistState()
-				if cur != "" {
-					s.logf(name, "model: %s (used this run: %s)", cur, strings.Join(used, ", "))
-				} else {
-					s.logf(name, "model: transcript replaced — model list cleared")
-				}
-			}
+			// Apply the FINAL result once — including an empty used list
+			// (qodo PR#11 finding 2): a replaced transcript with no
+			// assistant record yet must CLEAR the previous transcript's
+			// models, not keep them on display.
+			s.applyModelUsage(r, ms, round)
 		}
 
 		// A report that DECLARES itself incomplete is evidence AGAINST
@@ -1508,6 +1494,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			modelNote := ""
 			if mm.CurrentModel != "" {
 				modelNote = " model=" + mm.CurrentModel
+				if mm.TotalTokens > 0 {
+					modelNote += fmt.Sprintf(" usage=%d tokens/$%.4f", mm.TotalTokens, mm.TotalCostTotal)
+				}
 				if len(mm.ModelsUsed) > 1 {
 					modelNote += " (models used this run: " + strings.Join(mm.ModelsUsed, ", ") + ")"
 				}
@@ -2600,6 +2589,38 @@ func (s *Supervisor) watchMarker(r *runner, sess, marker string, round int, watc
 	}
 }
 
+// applyModelUsage folds the scanner's current view into runner state (models
+// + latest cumulative usage, ADR-0021 + owner directive 2026-10-10) and
+// persists/logs when anything changed. One mutation, one persist — the
+// drain loops call this ONCE after reaching EOF.
+func (s *Supervisor) applyModelUsage(r *runner, ms *stall.ModelScanner, round int) {
+	cur, used := ms.Current(), ms.Used()
+	tokens, cost := ms.LastUsage()
+	r.mu.Lock()
+	changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur ||
+		r.state.TotalTokens != tokens || r.state.TotalCostTotal != cost
+	if changed {
+		r.state.ModelsUsed = used
+		r.state.CurrentModel = cur
+		r.state.TotalTokens = tokens
+		r.state.TotalCostTotal = cost
+	}
+	name := r.job.Name
+	r.mu.Unlock()
+	if changed {
+		r.persistState()
+		switch {
+		case cur != "" && tokens > 0:
+			s.logf(name, "round %d: model %s (used this run: %s) — %d tokens, $%.4f total",
+				round, cur, strings.Join(used, ", "), tokens, cost)
+		case cur != "":
+			s.logf(name, "round %d: model %s (used this run: %s)", round, cur, strings.Join(used, ", "))
+		default:
+			s.logf(name, "round %d: transcript replaced — model list cleared", round)
+		}
+	}
+}
+
 // watchModel drains the model scanner on a ticker for ONE live round
 // (ADR-0021, qodo PR#11 finding 2): without it, `status` shows the previous
 // round's model for the entire live round, because the round-boundary scan
@@ -2628,23 +2649,7 @@ func (s *Supervisor) watchModel(r *runner, sess string, round int, watchStop, st
 				// state-based condition never fired once any model was seen)
 			}
 		}
-		cur, used := ms.Current(), ms.Used()
-		r.mu.Lock()
-		changed := !equalStrings(r.state.ModelsUsed, used) || r.state.CurrentModel != cur
-		if changed {
-			r.state.ModelsUsed = used
-			r.state.CurrentModel = cur
-		}
-		name := r.job.Name
-		r.mu.Unlock()
-		if changed {
-			r.persistState()
-			if cur != "" {
-				s.logf(name, "round %d: model %s (used this run: %s)", round, cur, strings.Join(used, ", "))
-			} else {
-				s.logf(name, "round %d: transcript replaced — model list cleared", round)
-			}
-		}
+		s.applyModelUsage(r, ms, round)
 	}
 	apply() // first scan immediately: the round may already have records
 	for {

@@ -329,6 +329,12 @@ type transcriptModelRecord struct {
 		Role     string `json:"role"`
 		Provider string `json:"provider"`
 		Model    string `json:"model"`
+		Usage    *struct {
+			TotalTokens int64 `json:"totalTokens"`
+			Cost        *struct {
+				Total float64 `json:"total"`
+			} `json:"cost"`
+		} `json:"usage"`
 	} `json:"message"`
 }
 
@@ -371,6 +377,14 @@ type ModelScanner struct {
 	last    string
 	seen    []string
 	seenSet map[string]bool
+	// lastTokens / lastCost mirror the LATEST assistant record's cumulative
+	// usage (ADR-0021 extension, owner directive 2026-10-10): pi's
+	// usage.totalTokens and usage.cost.total are ALREADY running totals per
+	// record, so the scanner keeps the latest — never sums (summing would
+	// double-count every cached turn). Zero until the first record with
+	// usage lands.
+	lastTokens int64
+	lastCost   float64
 }
 
 // headProbeBytes is how much of the file head the rewrite detector
@@ -415,6 +429,16 @@ func (s *ModelScanner) Current() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.last
+}
+
+// LastUsage is the LATEST assistant record's cumulative usage (ADR-0021
+// extension): pi's usage.totalTokens / usage.cost.total are already running
+// totals, so the scanner keeps the latest rather than summing. Zero values
+// mean no record with usage has landed yet.
+func (s *ModelScanner) LastUsage() (totalTokens int64, totalCost float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTokens, s.lastCost
 }
 
 // Used is every distinct model in first-seen order. The slice is copied so
@@ -548,6 +572,17 @@ func (s *ModelScanner) scanLines(data string) {
 			s.seenSet[s.last] = true
 			s.seen = append(s.seen, s.last)
 		}
+		// Usage: keep the LATEST cumulative totals — pi already reports
+		// them as running totals per record (owner directive 2026-10-10);
+		// summing would double-count every cached turn.
+		if u := rec.Message.Usage; u != nil {
+			if u.TotalTokens > 0 {
+				s.lastTokens = u.TotalTokens
+			}
+			if u.Cost != nil && u.Cost.Total > 0 {
+				s.lastCost = u.Cost.Total
+			}
+		}
 	}
 }
 
@@ -555,6 +590,7 @@ func (s *ModelScanner) reset() {
 	s.offset, s.lastSize, s.partial = 0, 0, ""
 	s.last = ""
 	s.seen, s.seenSet = nil, map[string]bool{}
+	s.lastTokens, s.lastCost = 0, 0
 }
 
 func (s *ModelScanner) copySeen() []string {
