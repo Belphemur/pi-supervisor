@@ -325,10 +325,20 @@ const modelMaxPartial = 8 << 20
 // A bare `"model"` string quoted in CONTENT (briefs, steers, toolResults)
 // names a request, not an answer, and is never inspected here.
 type transcriptModelRecord struct {
+	// Type must be "message" (qodo PR#12 finding 6): any nested
+	// assistant-SHAPED object inside a different record type (compaction
+	// summaries, tool payloads) must not impersonate an answering model.
+	Type    string `json:"type"`
 	Message *struct {
 		Role     string `json:"role"`
 		Provider string `json:"provider"`
 		Model    string `json:"model"`
+		Usage    *struct {
+			TotalTokens int64 `json:"totalTokens"`
+			Cost        *struct {
+				Total float64 `json:"total"`
+			} `json:"cost"`
+		} `json:"usage"`
 	} `json:"message"`
 }
 
@@ -362,15 +372,32 @@ type ModelScanner struct {
 	// identical size — which for a transcript rewrite means the models
 	// would be identical anyway.
 	head []byte
+	// lastMod/lastModSet back the beyond-probe edit detector (qodo PR#12
+	// findings 3+4): a bumped mtime on a caught-up or growing file whose
+	// head probe is unchanged means bytes beyond the 4KiB probe were edited
+	// — reset and re-scan. lastModSet distinguishes "never seen" from
+	// "seen at t0" on coarse-mtime filesystems.
+	lastMod    time.Time
+	lastModSet bool
 	// partial carries the incomplete trailing line between reads: the offset
 	// commits to the raw end of what was read, so a record straddling a
-	// chunk boundary is only parsed once its newline has landed.
-	partial string
+	// chunk boundary is only parsed once its newline has landed. A []byte
+	// grown by append (never re-concatenated) — kody PR#12: string concat
+	// copied O(N²/chunk) bytes while a multi-MB compaction record grew.
+	partial []byte
 	// last is the most recent model seen (current_model); order remembers
 	// every distinct model in first-seen order (models_used).
 	last    string
 	seen    []string
 	seenSet map[string]bool
+	// lastTokens / lastCost mirror the LATEST assistant record's cumulative
+	// usage (ADR-0021 extension, owner directive 2026-10-10): pi's
+	// usage.totalTokens and usage.cost.total are ALREADY running totals per
+	// record, so the scanner keeps the latest — never sums (summing would
+	// double-count every cached turn). Zero until the first record with
+	// usage lands.
+	lastTokens int64
+	lastCost   float64
 }
 
 // headProbeBytes is how much of the file head the rewrite detector
@@ -415,6 +442,16 @@ func (s *ModelScanner) Current() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.last
+}
+
+// LastUsage is the LATEST assistant record's cumulative usage (ADR-0021
+// extension): pi's usage.totalTokens / usage.cost.total are already running
+// totals, so the scanner keeps the latest rather than summing. Zero values
+// mean no record with usage has landed yet.
+func (s *ModelScanner) LastUsage() (totalTokens int64, totalCost float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastTokens, s.lastCost
 }
 
 // Used is every distinct model in first-seen order. The slice is copied so
@@ -474,9 +511,26 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 	} else if s.head != nil && !sameHead && s.lastSize == -1 {
 		s.reset()
 	}
+	// qodo PR#12 findings 3+4, CORRECTED per kody's re-review: the mtime
+	// reset fires ONLY when the scanner is CAUGHT UP (offset >= size). The
+	// earlier "size > lastSize" form re-read the ENTIRE transcript on every
+	// 5s tick during an active round — every append bumps mtime, so the
+	// cost grew with transcript size × tick count for nothing. A caught-up
+	// file with a bumped mtime is an unambiguous in-place rewrite (nothing
+	// new to read, yet the content changed). The prefix-preserving GROWING
+	// rewrite is deliberately not reset: it is indistinguishable from an
+	// append without re-reading, the delta read still parses the new tail
+	// records, and the head probe plus this caught-up path cover the other
+	// shapes. Documented limitation, not a silent wrong-answer path.
+	if s.lastModSet && !fi.ModTime().Equal(s.lastMod) &&
+		s.offset >= size && s.lastSize > 0 {
+		s.reset()
+	}
 	if len(head) > 0 {
 		s.head = head
 	}
+	s.lastMod = fi.ModTime()
+	s.lastModSet = true
 	// Nothing-new short-circuit: content fingerprint, size, and offset all
 	// agree (mtime is deliberately NOT part of this — coarse-granularity
 	// mtimes made the old check flaky).
@@ -499,32 +553,40 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 		return s.last, s.copySeen(), false
 	}
 
-	// Split at the LAST newline: everything before it is whole records; the
-	// remainder is carried to the next read (a record split across chunk
-	// boundaries is parsed exactly once, whole).
-	data := s.partial + string(buf[:n])
-	if i := strings.LastIndexByte(data, '\n'); i >= 0 {
-		s.partial = data[i+1:]
-		data = data[:i+1]
-	} else {
-		// No newline in this read: the whole chunk is one growing line.
-		// The offset advanced, so consumed MUST be true — the drain loops
-		// break on false and would otherwise stop mid-record (kody PR#11
-		// re-review: these branches returned false and starved EOF).
-		if len(data) > modelMaxPartial {
-			// Runaway line (a multi-MB record): drop it rather than grow
-			// without bound. Its model is missed; the offset has already
-			// committed past it, so later records are unaffected.
-			s.partial = ""
-			return s.last, s.copySeen(), true
+	// Append the new chunk to the carried partial WITHOUT re-copying the
+	// whole thing per chunk (kody PR#12: string concat was O(N²/chunk) on a
+	// growing multi-MB line — ~130MiB copied for an 8MiB record). Search
+	// only the NEW region for the last newline; the carried prefix is
+	// already newline-free by construction.
+	s.partial = append(s.partial, buf[:n]...)
+	newRegion := len(s.partial) - n
+	if i := bytes.LastIndexByte(s.partial[newRegion:], '\n'); i >= 0 {
+		abs := newRegion + i
+		// Materialize whole as an independent string BEFORE moving the
+		// trailing partial over the buffer's head (kody PR#12: whole shared
+		// s.partial's backing array, so the move corrupted the first
+		// complete record — its model was silently dropped).
+		whole := string(s.partial[:abs+1])
+		rest := append(s.partial[:0], s.partial[abs+1:]...)
+		s.partial = rest
+		if len(s.partial) > modelMaxPartial {
+			// Carried line exceeds the cap: drop it (model missed, offset
+			// already committed past it — later records are unaffected).
+			s.partial = s.partial[:0]
 		}
-		s.partial = data
+		s.scanLines(whole)
 		return s.last, s.copySeen(), true
 	}
+	// No newline in this read: the whole chunk is one growing line. The
+	// offset advanced, so consumed MUST be true — the drain loops break on
+	// false and would otherwise stop mid-record (kody PR#11 re-review).
 	if len(s.partial) > modelMaxPartial {
-		s.partial = ""
+		// Runaway line (a multi-MB record): drop it rather than grow
+		// without bound. Its model is missed; the offset has already
+		// committed past it, so later records are unaffected.
+		s.partial = s.partial[:0]
+		return s.last, s.copySeen(), true
 	}
-	s.scanLines(data)
 	return s.last, s.copySeen(), true
 }
 
@@ -540,6 +602,9 @@ func (s *ModelScanner) scanLines(data string) {
 		if json.Unmarshal([]byte(line), &rec) != nil {
 			continue // non-JSON noise: ignore, matching the client reader
 		}
+		if rec.Type != "" && rec.Type != "message" {
+			continue // qodo PR#12 finding 6: only real message records answer
+		}
 		if rec.Message == nil || rec.Message.Role != "assistant" || rec.Message.Model == "" {
 			continue
 		}
@@ -548,13 +613,28 @@ func (s *ModelScanner) scanLines(data string) {
 			s.seenSet[s.last] = true
 			s.seen = append(s.seen, s.last)
 		}
+		// Usage: keep the LATEST record's totals verbatim (owner directive
+		// 2026-10-10). Zero and positive are adopted ALIKE (qodo PR#12
+		// finding 5): a failover record that reports 0 cost is the newest
+		// truth — keeping the previous paid figure would publish a cost the
+		// current model never incurred. pi reports these as running totals
+		// per record; summing would double-count every cached turn.
+		if u := rec.Message.Usage; u != nil {
+			s.lastTokens = u.TotalTokens
+			if u.Cost != nil {
+				s.lastCost = u.Cost.Total
+			}
+		}
 	}
 }
 
 func (s *ModelScanner) reset() {
-	s.offset, s.lastSize, s.partial = 0, 0, ""
+	s.offset, s.lastSize = 0, 0
+	s.partial = s.partial[:0]
 	s.last = ""
 	s.seen, s.seenSet = nil, map[string]bool{}
+	s.lastTokens, s.lastCost = 0, 0
+	s.lastMod, s.lastModSet = time.Time{}, false
 }
 
 func (s *ModelScanner) copySeen() []string {

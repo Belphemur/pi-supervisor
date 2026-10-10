@@ -190,6 +190,13 @@ type State struct {
 	// CurrentModel is the most recent model seen (what is answering right
 	// now, as of the last scan); "" before the first assistant record.
 	CurrentModel string `json:"current_model,omitempty"`
+	// TotalTokens / TotalCostTotal mirror the LATEST assistant record's
+	// cumulative usage (ADR-0021 extension, owner directive 2026-10-10):
+	// pi's usage.totalTokens / usage.cost.total are already running totals
+	// per record, so the scanner keeps the latest — never sums. Zero until
+	// the first record with usage lands; reset by restart --fresh.
+	TotalTokens    int64   `json:"total_tokens,omitempty"`
+	TotalCostTotal float64 `json:"total_cost,omitempty"`
 }
 
 // ReviewStatus is the review slice of a job's status (ADR-0012). It lives in
@@ -272,6 +279,10 @@ type Status struct {
 	// assistant record lands.
 	ModelsUsed   []string `json:"models_used,omitempty"`
 	CurrentModel string   `json:"current_model,omitempty"`
+	// TotalTokens / TotalCostTotal: the latest assistant record's cumulative
+	// usage (already running totals in pi's records; never summed here).
+	TotalTokens    int64   `json:"total_tokens,omitempty"`
+	TotalCostTotal float64 `json:"total_cost,omitempty"`
 	// Tasks is the CURRENT plugin-task progress for the job's session store
 	// (ADR-0014 owner amendment): completed/total plus, ONLY on a failed
 	// lookup, a machine reason and a human explanation. nil = the daemon
