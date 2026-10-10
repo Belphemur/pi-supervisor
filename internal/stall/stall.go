@@ -562,7 +562,11 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 	newRegion := len(s.partial) - n
 	if i := bytes.LastIndexByte(s.partial[newRegion:], '\n'); i >= 0 {
 		abs := newRegion + i
-		whole := s.partial[:abs+1]
+		// Materialize whole as an independent string BEFORE moving the
+		// trailing partial over the buffer's head (kody PR#12: whole shared
+		// s.partial's backing array, so the move corrupted the first
+		// complete record — its model was silently dropped).
+		whole := string(s.partial[:abs+1])
 		rest := append(s.partial[:0], s.partial[abs+1:]...)
 		s.partial = rest
 		if len(s.partial) > modelMaxPartial {
@@ -570,7 +574,7 @@ func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 			// already committed past it — later records are unaffected).
 			s.partial = s.partial[:0]
 		}
-		s.scanLines(string(whole))
+		s.scanLines(whole)
 		return s.last, s.copySeen(), true
 	}
 	// No newline in this read: the whole chunk is one growing line. The
