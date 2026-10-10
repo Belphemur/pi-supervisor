@@ -17,7 +17,7 @@ func TestModelScannerMultiChunkBacklogDrainedByCallSite(t *testing.T) {
 	// > 2 chunks of records: 300 records x ~1.2KiB = ~360KiB.
 	var b strings.Builder
 	models := []string{}
-	for i := 0; i < 300; i++ {
+	for i := range 300 {
 		m := "model-" + string(rune('a'+i%26)) + "-" + string(rune('a'+i/26))
 		models = append(models, "prov/"+m)
 		b.WriteString(`{"type":"message","message":{"role":"assistant","provider":"prov","model":"` + m + `"}}` + "\n")
@@ -27,7 +27,7 @@ func TestModelScannerMultiChunkBacklogDrainedByCallSite(t *testing.T) {
 	}
 	s := NewModelScanner(sess)
 	// The call-site contract (supervisor drain loop): scan until idle.
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		cur, used := s.Scan()
 		if len(used) == len(models) && cur == models[len(models)-1] {
 			break
@@ -68,7 +68,7 @@ func TestModelScannerOversizedPartialDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = f.Close()
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		cur, used := s.Scan()
 		if cur == "q/after" && len(used) == 1 {
 			return // drained through the dropped line to the new record
