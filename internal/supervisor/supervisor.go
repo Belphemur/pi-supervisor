@@ -1367,7 +1367,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			// is ONE state mutation + ONE persist: persisting per chunk made
 			// a multi-MB pinned session take dozens of atomic writes per
 			// boundary and stalled the replay tests (TestReplay*).
-			for i := 0; i < 10000; i++ {
+			for range 10000 {
 				cur, used := ms.Scan()
 				if cur == "" && len(used) == 0 {
 					break // idle: nothing consumed
@@ -2620,7 +2620,7 @@ func (s *Supervisor) watchModel(r *runner, sess string, round int, watchStop, st
 		// returns the SAME non-empty result forever, so this spun at 100% CPU
 		// and never reached the select below: watchStop went unobserved and
 		// round end hung on <-modelExited.
-		for i := 0; i < 10000; i++ {
+		for range 10000 {
 			cur, used := ms.Scan()
 			if cur == "" && len(used) == 0 {
 				break // idle: nothing consumed
