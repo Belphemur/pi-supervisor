@@ -2293,6 +2293,16 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 			return 1, 0, 0
 		}
 		promptPath = wrapped
+	} else if reviewing && resume {
+		// Owner directive 2026-10-10: a reviewing round NEVER resumes with
+		// the build continuation — the build context says "work complete",
+		// so the agent re-verifies and exits without addressing threads
+		// (the campaign that never starts). Arm-time now generates a brief
+		// for jobs without one; reaching here means an older state slipped
+		// past arming. Fail the round loudly rather than burn it on the
+		// wrong prompt.
+		s.logf(j.Name, "round %d: REFUSED: reviewing round has no review brief — write review_brief into the job def and re-arm (never the build continuation)", round)
+		return 1, 0, 0
 	} else if resume {
 		promptPath = j.Cont
 	}

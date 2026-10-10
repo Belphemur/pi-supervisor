@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"pi-supervisor/internal/job"
-	"pi-supervisor/internal/journal"
 	"pi-supervisor/internal/review"
 )
 
@@ -148,16 +147,13 @@ func TestCampaignArmedWithReviewBriefLaunchesFreshSession(t *testing.T) {
 	}
 }
 
-// The poison case, pinned as behavior: WITHOUT review_brief the campaign
-// resumes the build session (legacy), and the operator is warned in the
-// journal.
-func TestCampaignArmedWithoutReviewBriefKeepsBuildSession(t *testing.T) {
+// Owner directive 2026-10-10, superseding the legacy poison behavior: WITHOUT
+// review_brief the campaign gets a GENERATED brief and its OWN session — the
+// build continuation is never resumed for a review round. The generated brief
+// is persisted on the job def.
+func TestCampaignArmedWithoutReviewBriefGeneratesBrief(t *testing.T) {
 	testEnv(t)
 	j, buildSess := doneJobWithReview(t, "rlegacy", "")
-
-	var logs safeBuf
-	prev := journal.SetOutput(&logs)
-	defer journal.SetOutput(prev)
 
 	s := New()
 	if err := s.LoadJobs(); err != nil {
@@ -169,13 +165,25 @@ func TestCampaignArmedWithoutReviewBriefKeepsBuildSession(t *testing.T) {
 	if _, err := s.StartReview(context.Background(), j.Name, 54, 1, "acceptance"); err != nil {
 		t.Fatalf("StartReview: %v", err)
 	}
-	if got := mustStateJobSession(t, j.Name); got != buildSess {
-		t.Fatalf("session pin after arm = %q, want the build session %q (legacy: no review_brief)", got, buildSess)
+	got := mustStateJobSession(t, j.Name)
+	if got == buildSess {
+		t.Fatalf("session pin after arm = the build session %q — a generated brief must give the campaign its OWN session", got)
+	}
+	saved, err := job.Load(filepath.Join(job.JobsDir(), j.Name+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.ReviewBrief == "" {
+		t.Fatal("no review brief generated for a job without one")
+	}
+	body, err := os.ReadFile(saved.ReviewBrief)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "post_replies") {
+		t.Fatalf("generated brief lacks the reply workflow: %q", body)
 	}
 	waitForCampaignEnd(t, s, j.Name)
-	if !strings.Contains(logs.String(), "WITHOUT review_brief") {
-		t.Fatalf("missing legacy-poison warning in journal: %q", logs.String())
-	}
 }
 
 // mustStateJobSession reads the PERSISTED job file's session pin.

@@ -41,9 +41,19 @@ state and loses the campaign machinery.
   re-LAUNCH) holds WITHIN the campaign — one campaign, one session.
 - `round()` selects the prompt: LAUNCH + `reviewing` ⇒ `review_brief`
   (never the build brief — it asks for work the campaign must not redo).
-- Without `review_brief`, the legacy behavior stands (resume the build
-  session) and the daemon journals a WARN telling the operator to add it.
-  No silent behavior change for existing job defs.
+- Without `review_brief` (AMENDED 2026-10-10, owner directive): the daemon
+  GENERATES a default review brief at arm time —
+  `~/.pi/supervisor/briefs/<job>_review_brief.md` — persists it on the job
+  def, clears the build pin, and the campaign LAUNCHes with it. The build
+  continuation is NEVER sent to a review round: the earlier legacy fallback
+  (resume the build session with `cont`) reproduced the exact poison this
+  ADR describes — the agent's context says the work is complete, so it
+  re-verified and exited without addressing threads, and the review never
+  started (mealime-redesign, flambette#68). The generated brief is generic
+  and deterministic; PR-specific state is read LIVE every round via the
+  shim's `list_threads`, and the daemon's mandatory-reply contract is
+  wrapped around the file by `writeCampaignRoundPrompt`. An operator brief
+  always wins when present.
 - The build session file is never deleted — it stays the build phase's
   record.
 - A stop mid-campaign + watch-driven resume (ADR-0017) resumes the
@@ -66,8 +76,11 @@ state and loses the campaign machinery.
 - `session_path` on a job now means "the CURRENT phase's session": the
   build session until the first campaign arm, the campaign session after.
   Status/`session_bytes` follow the current session.
-- Existing jobs without `review_brief` behave exactly as before, with a
-  warning pointing at the fix.
+- Existing jobs without `review_brief` no longer need one to run a working
+  campaign: arm time generates the brief and gives the campaign its own
+  session (amendment above). The build continuation path for review rounds
+  is structurally unreachable — `round()` REFUSES a reviewing resume with
+  no brief instead of falling back to `cont`.
 - Each re-armed campaign (including manual re-entry after a spent campaign)
   starts another fresh session; the previous campaign's session file
   remains on disk as its record.
