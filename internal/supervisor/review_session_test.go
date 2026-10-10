@@ -16,32 +16,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"pi-supervisor/internal/job"
 	"pi-supervisor/internal/review"
 )
-
-// safeBuf is a mutex-guarded strings.Builder: journal handlers write from
-// their own goroutines.
-type safeBuf struct {
-	mu sync.Mutex
-	sb strings.Builder
-}
-
-func (b *safeBuf) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.sb.Write(p)
-}
-
-func (b *safeBuf) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.sb.String()
-}
 
 // doneJobWithReview builds a done job (marker latched, pr_url linked, build
 // session pinned) and returns it with the build session's path.
