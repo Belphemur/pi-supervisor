@@ -429,13 +429,13 @@ func (s *ModelScanner) Used() []string {
 // line as JSON, and updates the current model and the used list. "" returns
 // are normal: no assistant record has landed yet, or nothing new was
 // appended.
-func (s *ModelScanner) Scan() (current string, used []string) {
+func (s *ModelScanner) Scan() (current string, used []string, consumed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	fi, err := os.Stat(s.path)
 	if err != nil {
-		return s.last, s.copySeen()
+		return s.last, s.copySeen(), false
 	}
 	size := fi.Size()
 	ino, inoOK := inodeOf(fi)
@@ -476,7 +476,7 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 	// agree (mtime is deliberately NOT part of this — coarse-granularity
 	// mtimes made the old check flaky).
 	if size == s.lastSize && s.offset >= size && sameHead {
-		return s.last, s.copySeen()
+		return s.last, s.copySeen(), false
 	}
 
 	readTo := min(s.offset+modelChunkBytes, size)
@@ -491,7 +491,7 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 		s.lastSize = -1 // force the next call to keep reading
 	}
 	if n <= 0 {
-		return s.last, s.copySeen()
+		return s.last, s.copySeen(), false
 	}
 
 	// Split at the LAST newline: everything before it is whole records; the
@@ -508,16 +508,16 @@ func (s *ModelScanner) Scan() (current string, used []string) {
 			// without bound. Its model is missed; the offset has already
 			// committed past it, so later records are unaffected.
 			s.partial = ""
-			return s.last, s.copySeen()
+			return s.last, s.copySeen(), false
 		}
 		s.partial = data
-		return s.last, s.copySeen()
+		return s.last, s.copySeen(), false
 	}
 	if len(s.partial) > modelMaxPartial {
 		s.partial = ""
 	}
 	s.scanLines(data)
-	return s.last, s.copySeen()
+	return s.last, s.copySeen(), true
 }
 
 // scanLines parses whole LF-terminated lines and folds assistant records'

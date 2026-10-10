@@ -19,7 +19,7 @@ func TestModelScannerSameSizeSameInoRewrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewModelScanner(sess)
-	if cur, _ := s.Scan(); cur != "a/one" {
+	if cur, _, _ := s.Scan(); cur != "a/one" {
 		t.Fatalf("pre-rewrite current = %q", cur)
 	}
 	// Rewrite in place (truncate + write, same fd-level path) with a fresh
@@ -30,7 +30,7 @@ func TestModelScannerSameSizeSameInoRewrite(t *testing.T) {
 	// No mtime manipulation: the content fingerprint (head probe) is the
 	// detector, so coarse timestamp granularity cannot mask the rewrite.
 	// (The old Chtimes hack here masked a real bug in the mtime detector.)
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "b/two" {
 		t.Fatalf("post-rewrite current = %q, want b/two (used=%v)", cur, used)
 	}

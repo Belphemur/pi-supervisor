@@ -35,13 +35,13 @@ func TestModelScannerTracksUsedAndCurrent(t *testing.T) {
 	// Quoted "model" text in a USER message is NOT an answer — the pair in
 	// the assistant header is the only signal.
 	writeLine(t, sess, `{"type":"message","message":{"role":"user","content":"use model glm-5.3-flash please"}}`)
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "" || len(used) != 0 {
 		t.Fatalf("user-message quote leaked into model identity: cur=%q used=%v", cur, used)
 	}
 
 	writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"opencode-go","model":"step-5-preview-free","usage":{}}}`)
-	cur, used = s.Scan()
+	cur, used, _ = s.Scan()
 	if cur != "opencode-go/step-5-preview-free" {
 		t.Fatalf("current = %q, want opencode-go/step-5-preview-free", cur)
 	}
@@ -51,7 +51,7 @@ func TestModelScannerTracksUsedAndCurrent(t *testing.T) {
 
 	// A model swap mid-run appends to the list and moves current.
 	writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"openrouter","model":"z-ai/glm-5.3-flash","usage":{}}}`)
-	cur, used = s.Scan()
+	cur, used, _ = s.Scan()
 	if cur != "openrouter/z-ai/glm-5.3-flash" {
 		t.Fatalf("current after swap = %q", cur)
 	}
@@ -61,13 +61,13 @@ func TestModelScannerTracksUsedAndCurrent(t *testing.T) {
 
 	// Repeats do not duplicate.
 	writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"openrouter","model":"z-ai/glm-5.3-flash","usage":{}}}`)
-	_, used = s.Scan()
+	_, used, _ = s.Scan()
 	if len(used) != 2 {
 		t.Fatalf("repeat duplicated the list: %v", used)
 	}
 
 	// Nothing new appended: stable, no error.
-	cur2, used2 := s.Scan()
+	cur2, used2, _ := s.Scan()
 	if cur2 != cur || len(used2) != 2 {
 		t.Fatalf("idle scan changed the view: %q %v", cur2, used2)
 	}
@@ -80,7 +80,7 @@ func TestModelScannerSurvivesRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewModelScanner(sess)
-	if cur, _ := s.Scan(); cur != "a/one" {
+	if cur, _, _ := s.Scan(); cur != "a/one" {
 		t.Fatalf("pre-rotation current = %q", cur)
 	}
 	// Rotate: same length, different inode (write a different-content file
@@ -92,7 +92,7 @@ func TestModelScannerSurvivesRotation(t *testing.T) {
 	if err := os.WriteFile(sess, []byte(`{"type":"message","message":{"role":"assistant","provider":"b","model":"two"}}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "b/two" {
 		t.Fatalf("post-rotation current = %q, want b/two", cur)
 	}
@@ -125,7 +125,7 @@ func TestModelScannerSplitsAcrossReadsAreParsedWhole(t *testing.T) {
 	if err := os.WriteFile(sess, []byte(rec[:idx]), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if cur, used := s.Scan(); cur != "" || len(used) != 0 {
+	if cur, used, _ := s.Scan(); cur != "" || len(used) != 0 {
 		t.Fatalf("half a record produced a model: cur=%q used=%v", cur, used)
 	}
 	f, err := os.OpenFile(sess, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -136,7 +136,7 @@ func TestModelScannerSplitsAcrossReadsAreParsedWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = f.Close()
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "prov-x/model-y" {
 		t.Fatalf("carried record not parsed whole: cur=%q used=%v", cur, used)
 	}
@@ -154,7 +154,7 @@ func TestModelScannerFieldOrderAndUnknownFieldsIrrelevant(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewModelScanner(sess)
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "prov-b/m-b" || len(used) != 1 {
 		t.Fatalf("reordered/unknown fields broke parsing: cur=%q used=%v", cur, used)
 	}
@@ -177,7 +177,7 @@ func TestModelScannerDiscardsUnknownRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewModelScanner(sess)
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "p/real" || len(used) != 1 || used[0] != "p/real" {
 		t.Fatalf("noise leaked into identity: cur=%q used=%v", cur, used)
 	}
@@ -193,11 +193,11 @@ func TestModelScannerLongBoundaryStraddle(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewModelScanner(sess)
-	if _, _ = s.Scan(); s.Path() != sess {
+	if _, _, _ = s.Scan(); s.Path() != sess {
 		t.Fatal("path mismatch")
 	}
 	writeLine(t, sess, `{"type":"message","message":{"role":"assistant","provider":"p2","model":"m2"}}`)
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "p2/m2" || len(used) != 1 {
 		t.Fatalf("record after filler not found: cur=%q used=%v", cur, used)
 	}

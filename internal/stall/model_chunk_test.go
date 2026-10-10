@@ -28,12 +28,12 @@ func TestModelScannerMultiChunkBacklogDrainedByCallSite(t *testing.T) {
 	s := NewModelScanner(sess)
 	// The call-site contract (supervisor drain loop): scan until idle.
 	for range 100 {
-		cur, used := s.Scan()
+		cur, used, _ := s.Scan()
 		if len(used) == len(models) && cur == models[len(models)-1] {
 			break
 		}
 	}
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	// Record 300 (1-based) = index 299: 299%26=13 → 'n', 299/26=11 → 'l'.
 	if cur != "prov/model-n-l" { //nolint:dupl // expectation spelled out on purpose
 		t.Fatalf("drain missed the tail: cur=%q used=%d", cur, len(used))
@@ -53,7 +53,7 @@ func TestModelScannerOversizedPartialDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewModelScanner(sess)
-	cur, used := s.Scan()
+	cur, used, _ := s.Scan()
 	if cur != "" || len(used) != 0 {
 		t.Fatalf("oversized partial produced a model: cur=%q used=%v", cur, used)
 	}
@@ -69,11 +69,11 @@ func TestModelScannerOversizedPartialDropped(t *testing.T) {
 	}
 	_ = f.Close()
 	for range 200 {
-		cur, used := s.Scan()
+		cur, used, _ := s.Scan()
 		if cur == "q/after" && len(used) == 1 {
 			return // drained through the dropped line to the new record
 		}
 	}
-	cur, used = s.Scan()
+	cur, used, _ = s.Scan()
 	t.Fatalf("post-drop drain never reached the new record: cur=%q used=%v", cur, used)
 }

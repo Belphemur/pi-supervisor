@@ -1368,9 +1368,10 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			// a multi-MB pinned session take dozens of atomic writes per
 			// boundary and stalled the replay tests (TestReplay*).
 			for range 10000 {
-				cur, used := ms.Scan()
-				if cur == "" && len(used) == 0 {
-					break // idle: nothing consumed
+				_, _, consumed := ms.Scan()
+				if !consumed {
+					break // idle: EOF reached (kody: the old state-based
+					// condition never fired once any model was seen)
 				}
 			}
 			// Apply the FINAL result — including an empty used list (qodo
@@ -2621,9 +2622,10 @@ func (s *Supervisor) watchModel(r *runner, sess string, round int, watchStop, st
 		// and never reached the select below: watchStop went unobserved and
 		// round end hung on <-modelExited.
 		for range 10000 {
-			cur, used := ms.Scan()
-			if cur == "" && len(used) == 0 {
-				break // idle: nothing consumed
+			_, _, consumed := ms.Scan()
+			if !consumed {
+				break // idle: no bytes consumed, EOF reached (kody: the old
+				// state-based condition never fired once any model was seen)
 			}
 		}
 		cur, used := ms.Current(), ms.Used()
