@@ -19,8 +19,8 @@ func TestFreshCampaignSessionGeneratesBriefWhenAbsent(t *testing.T) {
 
 	s := New()
 	wt := t.TempDir()
-	j := job.Job{Name: "briefless", Worktree: wt, Brief: filepath.Join(wt, "b.md"), Cont: filepath.Join(wt, "c.txt")}
-	j.SessionPath = filepath.Join(t.TempDir(), "build-session.jsonl")
+	j := job.Job{Name: "briefless", Worktree: wt, Brief: filepath.Join(wt, "b.md"), Cont: filepath.Join(wt, "c.txt"),
+		SessionPath: filepath.Join(t.TempDir(), "build-session.jsonl")}
 	if err := os.WriteFile(j.SessionPath, []byte(`{"x":1}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +78,8 @@ func TestFreshCampaignSessionKeepsOperatorBrief(t *testing.T) {
 	if err := os.WriteFile(brief, []byte("# operator brief"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	j := job.Job{Name: "withbrief", Worktree: wt, Brief: filepath.Join(wt, "b.md"), ReviewBrief: brief}
-	j.SessionPath = filepath.Join(t.TempDir(), "build-session.jsonl")
+	j := job.Job{Name: "withbrief", Worktree: wt, Brief: filepath.Join(wt, "b.md"), ReviewBrief: brief,
+		SessionPath: filepath.Join(t.TempDir(), "build-session.jsonl")}
 	if err := os.MkdirAll(job.JobsDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
