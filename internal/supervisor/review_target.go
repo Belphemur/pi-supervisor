@@ -1,13 +1,17 @@
 package supervisor
 
 import (
+	"net/url"
 	"os/exec"
-	"strings"
-
 	"pi-supervisor/internal/review"
+	"regexp"
+	"strings"
 )
 
-// reviewTarget resolves the GitHub owner/repo/PR a review campaign targets.
+// scpLike matches user@host:path (git's scp-like syntax) and bare host:path.
+var scpLike = regexp.MustCompile(`^(?:[\w.-]+@)?([\w.-]+):(.+)$`)
+
+// reviewTarget resolves the GitHub owner/repo/PR a review campaign operates on.
 //
 // DRY: the PR's owner and repo are read out of the ALREADY-scraped pr_url
 // (ADR-0006) when the agent linked one, and only fall back to `git remote`
@@ -30,42 +34,103 @@ func reviewTarget(worktree, prURL string, pr int) (owner, repo string, number in
 	return o, rp, pr, pr > 0
 }
 
-// remoteRepo derives owner/repo from the worktree's `origin` remote, the same
-// way the retired reply_review.py helper did — so a manual review works on a
-// job whose agent never linked its PR.
+// remoteRepo derives owner/repo from the worktree's git remotes — origin
+// first, then any other remote. A worktree may legitimately use a different
+// remote name (upstream, a fork remote, a deploy name); the review must work
+// for ANY repo the job happens to sit in (owner directive 2026-10-10), so a
+// non-origin name is never a dead end.
 func remoteRepo(worktree string) (owner, repo string, ok bool) {
 	if worktree == "" {
 		return "", "", false
 	}
-	out, err := func() ([]byte, error) {
-		cmd := exec.Command("git", "-C", worktree, "remote", "get-url", "origin")
+	run := func(args ...string) ([]byte, error) {
+		cmd := exec.Command("git", append([]string{"-C", worktree}, args...)...)
 		cmd.Env = envWithoutGitVars() // GIT_DIR from a hook env redirects -C at the wrong repo
 		return cmd.Output()
-	}()
+	}
+	if out, err := run("remote", "get-url", "origin"); err == nil {
+		if o, r, good := parseGitRemote(strings.TrimSpace(string(out))); good {
+			return o, r, true
+		}
+	}
+	out, err := run("remote", "-v")
 	if err != nil {
 		return "", "", false
 	}
-	return parseGitRemote(strings.TrimSpace(string(out)))
+	seen := map[string]bool{}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		// "name\turl (fetch)" — parse both fetch and push, dedupe by URL.
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		u := fields[1]
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		if o, r, good := parseGitRemote(u); good {
+			return o, r, true
+		}
+	}
+	return "", "", false
 }
 
 // parseGitRemote extracts owner/repo from any of the shapes git emits:
-// git@github.com:owner/repo.git, https://github.com/owner/repo(.git), or an
-// ssh:// URL.
-func parseGitRemote(url string) (owner, repo string, ok bool) {
-	if url == "" {
+// git@github.com:owner/repo.git, https://github.com/owner/repo(.git), an
+// ssh:// URL (with optional port), scp-like syntax, and GitHub Enterprise
+// Server hosts (any hostname containing "github", e.g.
+// github.mycompany.com). A host with no github marker is not a GitHub
+// remote — the review surface is GitHub-only, so failing here is correct.
+func parseGitRemote(raw string) (owner, repo string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return "", "", false
 	}
-	path := url
-	if i := strings.Index(path, "github.com"); i >= 0 {
-		path = path[i+len("github.com"):]
-	} else {
-		return "", "", false
+
+	// URL forms: https://, ssh://, git:// — parse with net/url. The scp-like
+	// normalization applies ONLY when there is no scheme: "https://..." also
+	// matches host:path with host="https" (two colons), and rewriting it
+	// corrupts the URL.
+	normalized := raw
+	if !strings.Contains(raw, "://") {
+		if m := scpLike.FindStringSubmatch(raw); m != nil {
+			normalized = "ssh://" + m[1] + "/" + m[2]
+		}
 	}
-	path = strings.TrimLeft(path, ":/")
-	path = strings.TrimSuffix(strings.TrimSuffix(path, "/"), ".git")
-	parts := strings.Split(path, "/")
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", false
+	if strings.Contains(normalized, "://") {
+		u, err := url.Parse(normalized)
+		if err == nil && u.Host != "" {
+			host := u.Hostname()
+			if !isGitHubHost(host) {
+				return "", "", false
+			}
+			parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+			if len(parts) >= 2 && parts[0] != "" {
+				return parts[0], strings.TrimSuffix(parts[1], ".git"), true
+			}
+			return "", "", false
+		}
 	}
-	return parts[0], parts[1], true
+
+	// Bare host:path without a scheme (git@github.com:owner/repo.git).
+	if m := scpLike.FindStringSubmatch(raw); m != nil {
+		if !isGitHubHost(m[1]) {
+			return "", "", false
+		}
+		path := strings.TrimSuffix(m[2], ".git")
+		parts := strings.Split(path, "/")
+		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+			return parts[0], parts[1], true
+		}
+	}
+	return "", "", false
+}
+
+// isGitHubHost: github.com or any GitHub Enterprise host (hostname contains
+// "github"). Anything else (gitlab, bitbucket, a bare IP) is not a target —
+// the review verbs are GitHub mutations.
+func isGitHubHost(host string) bool {
+	h := strings.ToLower(host)
+	return h == "github.com" || strings.Contains(h, "github")
 }
