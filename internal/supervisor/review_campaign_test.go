@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"os/exec"
 	"testing"
 	"time"
 )
@@ -121,7 +122,12 @@ func TestParseGitRemote(t *testing.T) {
 		{"https://github.com/o/r.git", "o", "r", true},
 		{"https://github.com/o/r", "o", "r", true},
 		{"ssh://git@github.com/o/r.git", "o", "r", true},
+		{"ssh://git@github.com:22/o/r.git", "o", "r", true},
+		{"git@github.mycompany.com:o/r.git", "o", "r", true},     // GHES
+		{"https://github.mycompany.com/o/r.git", "o", "r", true}, // GHES https
+		{"gh:o/r.git", "", "", false},                            // bare alias, no host
 		{"https://gitlab.com/o/r.git", "", "", false},
+		{"https://bitbucket.org/o/r.git", "", "", false},
 		{"", "", "", false},
 	}
 	for _, c := range cases {
@@ -133,6 +139,36 @@ func TestParseGitRemote(t *testing.T) {
 		if ok && (o != c.owner || rp != c.repo) {
 			t.Errorf("parseGitRemote(%q) = %s/%s, want %s/%s", c.in, o, rp, c.owner, c.repo)
 		}
+	}
+}
+
+// remoteRepo works for ANY repo the job's worktree sits in: origin first,
+// then any other remote name (a worktree may use upstream/fork/deploy names).
+func TestRemoteRepoFallsBackToNonOriginRemote(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = envWithoutGitVars()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	run("remote", "add", "upstream", "git@github.com:Belphemur/pi-supervisor.git")
+	o, r, ok := remoteRepo(dir)
+	if !ok || o != "Belphemur" || r != "pi-supervisor" {
+		t.Fatalf("remoteRepo = %s/%s ok=%v, want Belphemur/pi-supervisor", o, r, ok)
+	}
+	// A remote pointing at a NON-GitHub host must not win over a GitHub
+	// remote: the loop keeps scanning past unparseable URLs. `git remote -v`
+	// lists alphabetically (gitlab < ghnext < upstream), so ghnext is the
+	// first GitHub hit here.
+	run("remote", "add", "gitlab", "https://gitlab.com/o/r.git")
+	run("remote", "add", "ghnext", "git@github.com:Belphemur/flambette.git")
+	o, r, ok = remoteRepo(dir)
+	if !ok || o != "Belphemur" || r != "flambette" {
+		t.Fatalf("remoteRepo with mixed hosts = %s/%s ok=%v, want Belphemur/flambette (first GitHub remote alphabetically)", o, r, ok)
 	}
 }
 
