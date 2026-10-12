@@ -468,6 +468,9 @@ def _piwatch_command(raw_args, **_kw):
 
 _TOOL_SCHEMA_BASE = {"type": "object"}
 
+# The toolset namespace this plugin registers under.
+TOOLSET = "pi_supervisor"
+
 
 def register(ctx):
     """Register the pi-supervisor tools and the /piwatch slash command."""
@@ -475,6 +478,7 @@ def register(ctx):
 
     ctx.register_tool(
         name="pi_status",
+        toolset=TOOLSET,
         schema={
             **_TOOL_SCHEMA_BASE,
             "description": (
@@ -489,6 +493,7 @@ def register(ctx):
     )
     ctx.register_tool(
         name="pi_steer",
+        toolset=TOOLSET,
         schema={
             **_TOOL_SCHEMA_BASE,
             "description": (
@@ -510,6 +515,7 @@ def register(ctx):
     )
     ctx.register_tool(
         name="pi_logs",
+        toolset=TOOLSET,
         schema={
             **_TOOL_SCHEMA_BASE,
             "description": "Tail a job's run log (last N lines, default 50).",
@@ -523,6 +529,7 @@ def register(ctx):
     )
     ctx.register_tool(
         name="pi_review",
+        toolset=TOOLSET,
         schema={
             **_TOOL_SCHEMA_BASE,
             "description": (
@@ -544,6 +551,7 @@ def register(ctx):
     )
     ctx.register_tool(
         name="pi_ack",
+        toolset=TOOLSET,
         schema={
             **_TOOL_SCHEMA_BASE,
             "description": (
@@ -561,6 +569,7 @@ def register(ctx):
     )
     ctx.register_tool(
         name="pi_watch",
+        toolset=TOOLSET,
         schema={
             **_TOOL_SCHEMA_BASE,
             "description": (
@@ -580,6 +589,7 @@ def register(ctx):
     )
     ctx.register_tool(
         name="pi_watch_probe",
+        toolset=TOOLSET,
         schema={
             **_TOOL_SCHEMA_BASE,
             "description": (

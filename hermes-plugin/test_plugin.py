@@ -468,12 +468,13 @@ def test_probe_timeout_is_not_an_arm(results_dir, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_register_registers_all_tools_and_command():
-    registered = {"tools": [], "commands": [], "schemas": {}}
+    registered = {"tools": [], "commands": [], "schemas": {}, "toolsets": []}
 
     class RegCtx:
-        def register_tool(self, name, schema, handler):
+        def register_tool(self, name, toolset, schema, handler):
             registered["tools"].append(name)
             registered["schemas"][name] = schema
+            registered["toolsets"].append(toolset)
 
         def register_command(self, name, handler, description="", args_hint=""):
             registered["commands"].append(name)
@@ -484,5 +485,6 @@ def test_register_registers_all_tools_and_command():
         "pi_watch", "pi_watch_probe",
     ]
     assert registered["commands"] == ["piwatch"]
+    assert set(registered["toolsets"]) == {"pi_supervisor"}
     # pi_watch must never accept a foreground/background flag from the model.
     assert set(registered["schemas"]["pi_watch"]["properties"]) == {"job", "persist"}
