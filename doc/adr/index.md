@@ -27,3 +27,4 @@ add or revise an ADR, add or update its row here in the same commit.**
 | [0019](0019-mid-round-thread-reminders.md) | Mid-round thread reminders | Accepted | Open threads re-steered into the live reviewing round; plain steer, no interrupt |
 | [0020](0020-report-is-the-completion-signal.md) | Report is the completion signal | Accepted | Supersedes ADR-0011's conjunction: full report = done; marker-but-no-report = 2 asks, then fatal |
 | [0021](0021-model-usage-is-scraped-from-the-transcript.md) | Model usage is scraped from the transcript | Accepted | `models_used` + `current_model` from assistant records' provider/model pair — the job def is a request, the transcript is evidence |
+| [0022](0022-hermes-plugin.md) | Hermes plugin — typed tools, server-side watch arm | Accepted | `hermes-plugin/` ships with the daemon; `pi_watch` arms via `ctx.dispatch_tool` (flags in code, verified) — flash models can no longer drop the notify flag |
