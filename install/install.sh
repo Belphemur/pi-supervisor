@@ -137,6 +137,62 @@ for hook in pre-push post-push; do
   fi
 done
 
+# The Hermes plugin (ADR-0022): typed tools wrapping this CLI plus the
+# verified watch arm. Synced by STAGED SWAP, never rm-then-copy in place:
+# the candidate is built in a sibling temp dir, doctor-verified THERE, and
+# only then renamed over the installed dir — a failed copy or doctor check
+# leaves the previous working plugin untouched (rename over the same parent
+# is atomic; the old dir is only removed after the new one is in place). If
+# the final rename somehow fails, the old dir is moved back. Plugins are
+# loaded in-process so a stale real dir must be replaced wholesale; the
+# plugin dir must survive independently of any checkout. hermes missing
+# from PATH degrades to a warning — the daemon install must never fail on
+# the agent tooling.
+echo "==> Hermes plugin (ADR-0022)"
+PLUGIN_SRC="${REPO_DIR}/hermes-plugin"
+PLUGIN_DST="${HERMES_HOME}/plugins/pi-supervisor"
+if [ ! -f "${PLUGIN_SRC}/plugin.yaml" ] || [ ! -f "${PLUGIN_SRC}/plugin.py" ]; then
+  echo "    ERROR: ${PLUGIN_SRC}/plugin.yaml or plugin.py not found"
+  exit 1
+fi
+PLUGIN_TMP="${PLUGIN_DST}.candidate.$$"
+PLUGIN_OLD="${PLUGIN_DST}.previous.$$"
+cleanup_candidate() { rm -rf "${PLUGIN_TMP}"; }
+mkdir -p "${PLUGIN_TMP}"
+if ! cp "${PLUGIN_SRC}/"*.py "${PLUGIN_SRC}/"*.yaml "${PLUGIN_SRC}/"*.md "${PLUGIN_TMP}/"; then
+  echo "    ERROR: copying the plugin candidate failed; the installed plugin is untouched"
+  cleanup_candidate
+  exit 1
+fi
+if command -v hermes >/dev/null 2>&1; then
+  if hermes plugins doctor "${PLUGIN_TMP}" --ci; then
+    echo "    doctor: pi-supervisor plugin candidate clean"
+  else
+    echo "    ERROR: hermes plugins doctor failed for the pi-supervisor plugin candidate"
+    echo "           the previously installed plugin at ${PLUGIN_DST} is left untouched"
+    cleanup_candidate
+    exit 1
+  fi
+else
+  echo "    WARNING: hermes not on PATH — plugin synced but NOT doctor-verified."
+  echo "             run: hermes plugins doctor ${PLUGIN_DST} --ci"
+fi
+# Swap only after the candidate is verified. mv inside the same parent is a
+# rename: either the old or the new dir is at PLUGIN_DST, never neither.
+rm -rf "${PLUGIN_OLD}"
+if [ -d "${PLUGIN_DST}" ]; then
+  mv "${PLUGIN_DST}" "${PLUGIN_OLD}" || { echo "    ERROR: could not stage the old plugin"; cleanup_candidate; exit 1; }
+fi
+if mv "${PLUGIN_TMP}" "${PLUGIN_DST}"; then
+  rm -rf "${PLUGIN_OLD}"
+else
+  echo "    ERROR: could not move the candidate into place; restoring the previous plugin"
+  [ -d "${PLUGIN_OLD}" ] && mv "${PLUGIN_OLD}" "${PLUGIN_DST}"
+  cleanup_candidate
+  exit 1
+fi
+echo "    installed: ${PLUGIN_DST} (staged swap, $(ls "${PLUGIN_DST}" | wc -l) files)"
+
 echo "==> enabling service"
 systemctl --user daemon-reload
 # `enable --now` is a NO-OP on an already-active unit: it enables the unit but
