@@ -103,13 +103,15 @@ skill as the only memory.
 
 - Arm correctness no longer depends on model fidelity. The plugin works on
   flash-tier models; the diagnosed failure class is structurally removed.
-- The one unproven link is **nested dispatch**: the plugin guide documents
-  `ctx.dispatch_tool` from slash-command handlers and hook callbacks; calling
-  it from inside a *tool* handler must be proven live before this is called
-  done. Fallback if it fails: `pi_watch` refuses with the manual-arm
-  instruction (the skill's incantation) rather than degrading to an
-  unanchored spawn — a watch spawned without session anchoring has nowhere
-  to deliver, which is the ADR-0003 failure mode again.
+- **Nested dispatch is proven live** (2026-10-12, first install): a one-shot
+  Hermes session called `pi_watch(job="hermes-plugin")`; the handler's
+  `ctx.dispatch_tool("terminal", …)` armed the run, and the verification read
+  `notify_on_complete: true` from the proc JSON — `{"armed": true,
+  "notify_verified": true, "persist_on_release": true}`. Note for testers:
+  delegate-task children run a RESTRICTED toolset without plugin tools — the
+  live test must be a real session (`hermes chat -q` or a gateway session),
+  not a delegation child. Fallback path (manual-arm refusal on missing
+  `dispatch_tool`) is implemented and unit-tested.
 - install.sh gains a plugin step: sync `hermes-plugin/` to
   `~/.hermes/plugins/pi-supervisor/` (idempotent), then
   `hermes plugins doctor pi-supervisor` gates the install like the other
