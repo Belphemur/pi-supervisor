@@ -18,10 +18,29 @@ Pure Python stdlib only.
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
-CLI = "pi-supervisor"
+
+def _resolve_cli() -> str:
+    """Absolute path of the pi-supervisor CLI (install.sh builds it into
+    ~/.local/bin, which the Hermes process is NOT guaranteed to have on PATH).
+    Resolve once at import: PATH override, then `which`, then the known
+    install location, then the bare name (degrades to today's behavior)."""
+    override = os.environ.get("PI_SUPERVISOR_CLI")
+    if override:
+        return override
+    found = shutil.which("pi-supervisor")
+    if found:
+        return found
+    installed = Path.home() / ".local" / "bin" / "pi-supervisor"
+    if installed.exists():
+        return str(installed)
+    return "pi-supervisor"
+
+
+CLI = _resolve_cli()
 
 # ADR-0008 exit codes.
 EXIT_OK = 0
@@ -36,21 +55,21 @@ _JOB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # (tools/process_registry_results.py: get_hermes_home()/logs/process-results).
 PROC_RESULTS_SUBPATH = Path("logs") / "process-results"
 
-# Non-terminal events a -t watch releases on (ADR-0014: trust-but-verify —
-# the LLM wakes, verifies the claim, re-arms). Terminal events (done/fatal/
-# stopped/review_*) are the end of the line and are deliberately absent.
-RELEASE_EVENTS = [
-    "task_completed", "task_lookup_failed", "round_done", "backoff",
-    "ci_stall", "instant_exit", "empty_turn", "report_requested",
-    "report_resteer", "review_threads_appeared", "job_started",
-]
+# The ONLY non-terminal events on which `pi-supervisor watch <job> -t` exits
+# (cmd/pi-supervisor: the client exits 0 on the terminal set done/fatal/
+# stopped/review_done/review_exhausted AND, by the ADR-0014 owner decision,
+# on task_completed/task_lookup_failed; every OTHER event keeps the stream
+# open even under -t). This list must name release events that ACTUALLY
+# release the process — claiming round_done/backoff would promise a wake-up
+# that never comes, because the background run never completes on them.
+RELEASE_EVENTS = ["task_completed", "task_lookup_failed"]
 
 # The manual-arm incantation, returned whenever the plugin cannot arm through
 # dispatch_tool: a watch spawned WITHOUT session anchoring has nowhere to
 # deliver the terminal event (ADR-0003 failure mode), so we refuse rather
 # than degrade to an unanchored spawn.
 MANUAL_ARM_INCATATION = (
-    'terminal(command="pi-supervisor watch <job> -t", background=true, '
+    f'terminal(command="{CLI} watch <job> -t", background=true, '
     'notify=true, persist_on_release=true)'
 )
 
@@ -228,7 +247,12 @@ def _pi_review(args, **_kw):
         return _dump({"ok": False, "usage_error": True, "error": err})
     pr = a.get("pr") or 0
     auto = bool(a.get("auto"))
-    rounds = a.get("rounds") or 0
+    # An OMITTED rounds and an EXPLICIT rounds=0 are different requests: the
+    # CLI's --rounds 0 derives the budget from the open-thread count while
+    # omitting the flag takes the CLI default (5). Truthiness conflation
+    # silently replaced the documented derive request with the default.
+    raw_rounds = a.get("rounds")
+    rounds = 0 if raw_rounds is None else raw_rounds
     type_ = a.get("type_") or a.get("type") or ""
     try:
         pr = int(pr)
@@ -249,7 +273,7 @@ def _pi_review(args, **_kw):
         })
     argv = ["review", job]
     argv += ["--pr", str(pr)] if pr else ["--auto"]
-    if rounds:
+    if raw_rounds is not None:
         argv += ["--rounds", str(rounds)]
     if type_:
         if type_ not in ("acceptance", "rebuttal"):
@@ -336,11 +360,17 @@ def _verify_arm(dispatch_result, proc_results_dir=None):
             "armed WITHOUT notify_on_complete (the dropped-parameter failure "
             "this plugin exists to prevent) — RE-ARM REQUIRED"
         ))
+    # The arm ALWAYS carries persist_on_release (invariant 6: the delivery
+    # arm must outlive the arming session), and the spawn echoes the flag
+    # back only when it took (terminal_tool_background.py). An absent or
+    # false echo means the watch will die with this session — same
+    # dropped-parameter class, same loud refusal.
     if result.get("persist_on_release") is not True:
-        info["persist_warning"] = (
-            "persist_on_release not confirmed in the dispatch result; the watch "
-            "dies with the arming session"
-        )
+        return False, dict(info, why=(
+            "armed WITHOUT confirmed persist_on_release: the watch dies with "
+            "the arming session and a terminal event could go unwitnessed — "
+            "RE-ARM REQUIRED"
+        ))
 
     # Belt and braces: a fast-exiting process already has its record on disk.
     results_dir = Path(proc_results_dir) if proc_results_dir else _proc_results_dir()
@@ -360,12 +390,15 @@ def _verify_arm(dispatch_result, proc_results_dir=None):
     return True, info
 
 
-def arm_watch(ctx, job, persist=True, proc_results_dir=None):
+def arm_watch(ctx, job, proc_results_dir=None):
     """The verified arm, shared by the pi_watch tool and /piwatch.
 
-    Flags are CODE (dispatch args), never model output. On any dispatch
-    failure the return is a loud refusal with the manual-arm incantation —
-    never a degraded unanchored spawn.
+    Flags are CODE (dispatch args), never model output. persist_on_release
+    is ALWAYS true (invariant 6) — there is no caller opt-out, because a
+    watch that dies with the arming session is the failure this plugin
+    exists to prevent. On any dispatch or verification failure the return
+    is a loud refusal with the manual-arm incantation — never a degraded
+    unanchored spawn.
     """
     err = _job(job)
     if err:
@@ -378,11 +411,11 @@ def arm_watch(ctx, job, persist=True, proc_results_dir=None):
             "manual_arm": MANUAL_ARM_INCATATION,
         })
     arm = {
-        "command": f"pi-supervisor watch {job} -t",
+        "command": f"{CLI} watch {job} -t",
         "background": True,
         "notify": True,
         "notify_on_complete": True,   # legacy alias; explicit notify wins
-        "persist_on_release": bool(persist),
+        "persist_on_release": True,   # always: the arm must outlive the session
     }
     try:
         raw = dispatch("terminal", arm)
@@ -405,20 +438,26 @@ def arm_watch(ctx, job, persist=True, proc_results_dir=None):
         "ok": True, "armed": True, "job": job,
         "notify_verified": True,
         "proc": info.get("proc"),
-        "persist_on_release": bool(persist),
+        "persist_on_release": True,
         "releases_on": RELEASE_EVENTS,
-        "note": ("verify task claims on release; re-arm until a TERMINAL event "
-                 "(done/fatal/stopped/review_done/review_exhausted)"),
-        **{k: v for k, v in info.items()
-           if k in ("persist_warning", "record_verified")},
+        "note": ("these events EXIT the watch process (wake + verify + re-arm); "
+                 "all other events are streamed but do NOT release it. "
+                 "Terminal events (done/fatal/stopped/review_done/"
+                 "review_exhausted) end the run — no re-arm."),
+        **{k: v for k, v in info.items() if k in ("record_verified",)},
     })
 
 
-def _pi_watch(args, **_kw):
-    """pi_watch(job, persist=True) — arm the -t watch, verify, report."""
+def _pi_watch(args, ctx=None, **_kw):
+    """pi_watch(job) — arm the -t watch, verify, report.
+
+    ctx comes from the register() closure of the plugin instance that
+    registered THIS handler; the module-global is only a fallback for
+    direct/test calls. There is no persist argument: the arm is always
+    persist_on_release=true (invariant 6), so a model cannot opt out.
+    """
     a = args or {}
-    return arm_watch(_WATCH_CTX[0], a.get("job") or "",
-                     persist=bool(a.get("persist", True)))
+    return arm_watch(ctx or _WATCH_CTX[0], a.get("job") or "")
 
 
 def _pi_watch_probe(args, **_kw):
@@ -446,12 +485,17 @@ def _pi_watch_probe(args, **_kw):
     return _dump(payload)
 
 
-# ctx captured at register() time so handlers can reach it (dispatch_tool
-# carries the parent agent's session anchoring).
+# Fallback ctx for direct/test calls. The LIVE handlers registered by
+# register() bind their own register-time ctx in a closure — never this
+# global — so two plugin loads in one process can never dispatch through
+# each other's context. The ctx object itself is session-stateless: the
+# dispatched terminal arm's session anchoring is resolved at dispatch time
+# from the calling thread's session ContextVars (terminal_tool), not from
+# the ctx object.
 _WATCH_CTX = [None]
 
 
-def _piwatch_command(raw_args, **_kw):
+def _piwatch_command(raw_args, ctx=None, **_kw):
     """/piwatch <job> — the same verified arm, human path."""
     job = (raw_args or "").strip().split()
     if not job:
@@ -459,7 +503,7 @@ def _piwatch_command(raw_args, **_kw):
             "ok": False, "usage_error": True, "armed": False,
             "error": "usage: /piwatch <job>",
         })
-    return arm_watch(_WATCH_CTX[0], job[0])
+    return arm_watch(ctx or _WATCH_CTX[0], job[0])
 
 
 # --------------------------------------------------------------------------
@@ -575,17 +619,19 @@ def register(ctx):
             "description": (
                 "THE ARM: launch `pi-supervisor watch <job> -t` as a verified "
                 "Hermes background run with notify. Flags are set in code and "
-                "the arm is verified (notify_on_complete=true) before success "
-                "is reported. Releases on non-terminal events — verify task "
-                "claims, then re-arm — and holds until a terminal event."
+                "the arm is verified (notify_on_complete AND persist_on_release "
+                "echoed true) before success is reported. The process exits on "
+                "task_completed/task_lookup_failed (wake, verify the claim, "
+                "re-arm) and on terminal events (done/fatal/stopped/"
+                "review_done/review_exhausted); every other event keeps it "
+                "running."
             ),
             "properties": {
                 "job": {"type": "string"},
-                "persist": {"type": "boolean", "description": "persist_on_release (default true)"},
             },
             "required": ["job"],
         },
-        handler=_pi_watch,
+        handler=lambda args, **kw: _pi_watch(args, ctx=ctx),
     )
     ctx.register_tool(
         name="pi_watch_probe",
@@ -608,7 +654,7 @@ def register(ctx):
 
     ctx.register_command(
         "piwatch",
-        handler=_piwatch_command,
+        handler=lambda raw_args, **kw: _piwatch_command(raw_args, ctx=ctx),
         description="Arm a verified pi-supervisor watch on a job (same as pi_watch)",
         args_hint="<job>",
     )

@@ -28,9 +28,9 @@ degrades to a warning, never failing the daemon install).
 | `pi_status(job?)` | `pi-supervisor status [job]`; single-job form returned parsed (the daemon's one JSON document) |
 | `pi_steer(job, message, interrupt?, no_wait?)` | `pi-supervisor steer <job> [-i] [-n] <msg>`; surfaces the factual report (forwarded / held / no live round / not confirmed) |
 | `pi_logs(job, lines=50)` | `pi-supervisor logs <job> <lines>` |
-| `pi_review(job, pr?, auto?, rounds?, type_?)` | `pi-supervisor review <job> [--pr N \| --auto] [--rounds N] [--type …]`; `--pr` and `--auto` mutually exclusive (validated in the plugin, exit-2 shape) |
+| `pi_review(job, pr?, auto?, rounds?, type_?)` | `pi-supervisor review <job> [--pr N \| --auto] [--rounds N] [--type …]`; `--pr` and `--auto` mutually exclusive (validated in the plugin, exit-2 shape); an EXPLICIT `rounds: 0` is passed through as `--rounds 0` (the CLI's derive-from-open-threads budget) — only an omitted `rounds` takes the CLI default |
 | `pi_ack(job, event_id)` | `pi-supervisor ack <job> --event <id>`; ack_id comes from the `bulk_resolve_requested` watch event (NOTE: the CLI takes the job positional — deviation from the ADR sketch, the CLI contract wins) |
-| `pi_watch(job, persist=True)` | **THE ARM** — dispatches `terminal(command="pi-supervisor watch <job> -t", background=true, notify=true, notify_on_complete=true, persist_on_release=…)` and VERIFIES it (see below) |
+| `pi_watch(job)` | **THE ARM** — dispatches `terminal(command="<cli> watch <job> -t", background=true, notify=true, notify_on_complete=true, persist_on_release=true)` and VERIFIES it (see below). There is no persistence opt-out: the arm always persists (invariant 6). `<cli>` is the resolved absolute path of the pi-supervisor binary (PATH, then the installer's `~/.local/bin`), so the arm works even when Hermes has no `~/.local/bin` on PATH |
 | `pi_watch_probe(job, timeout_s=600)` | plain one-shot `watch` WITHOUT `-t` — exits on the first event; result marked `probe: true`; never the delivery arm |
 
 Slash command: `/piwatch <job>` — the same verified arm for the human path.
@@ -50,7 +50,10 @@ from the `terminal` tool result:
 2. a `session_id` (process id) is present;
 3. `notify_on_complete: true` (a `subagent_note` in the result — the
    delegated-child demotion — also fails the arm);
-4. belt and braces: if the process already completed, its record at
+4. `persist_on_release: true` — the arm always sends it and the spawn echoes
+   it only when it took; an unconfirmed echo means the watch would die with
+   the arming session, the same dropped-parameter class, and fails the arm;
+5. belt and braces: if the process already completed, its record at
    `~/.hermes/logs/process-results/<session_id>.json` must also carry
    `notify_on_complete: true`.
 
@@ -63,8 +66,12 @@ deliver — the ADR-0003 failure mode.
 
 Delivery stays invariant-6-pure: the blocking watch client armed as a
 background run is the ONLY delivery path. No cron, no webhook, no polling —
-and none will be added. Non-terminal events release the watch on purpose
-(ADR-0014): verify the claim, then re-arm.
+and none will be added. `releases_on` names exactly the non-terminal events
+on which `watch -t` actually exits — `task_completed` and
+`task_lookup_failed` (the ADR-0014 owner decision in the CLI's watch loop);
+the LLM wakes, verifies the claim, and re-arms. Every OTHER non-terminal
+event (round_done, backoff, ci_stall, …) is streamed but does NOT release
+the process, so the result never promises a wake-up that cannot happen.
 
 ## Tests
 

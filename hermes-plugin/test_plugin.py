@@ -143,13 +143,13 @@ def test_status_single_job_runs_status_job(results_dir, monkeypatch):
 
     monkeypatch.setattr(plugin.subprocess, "run", fake_run)
     payload = json.loads(plugin._pi_status({"job": "j"}))
-    assert seen["argv"] == ["pi-supervisor", "status", "j"]
+    assert seen["argv"] == [plugin.CLI, "status", "j"]
     assert payload["status"] == {"state": "done"}
 
 
 def test_status_all_jobs_passes_text_through(results_dir, monkeypatch):
     def fake_run(argv, **_kw):
-        assert argv == ["pi-supervisor", "status"]
+        assert argv == [plugin.CLI, "status"]
         return subprocess.CompletedProcess(argv, 0, "JOBS table...", "")
 
     monkeypatch.setattr(plugin.subprocess, "run", fake_run)
@@ -174,7 +174,7 @@ def test_steer_flag_order_and_message(results_dir, monkeypatch):
 
     monkeypatch.setattr(plugin.subprocess, "run", fake_run)
     plugin._pi_steer({"job": "j", "message": "do X", "interrupt": True, "no_wait": True})
-    assert seen["argv"] == ["pi-supervisor", "steer", "j", "-i", "-n", "do X"]
+    assert seen["argv"] == [plugin.CLI, "steer", "j", "-i", "-n", "do X"]
 
 
 def test_steer_requires_message(results_dir, monkeypatch):
@@ -208,8 +208,34 @@ def test_review_manual_args(results_dir, monkeypatch):
 
     monkeypatch.setattr(plugin.subprocess, "run", fake_run)
     plugin._pi_review({"job": "j", "pr": 12, "rounds": 3, "type_": "rebuttal"})
-    assert seen["argv"] == ["pi-supervisor", "review", "j", "--pr", "12",
+    assert seen["argv"] == [plugin.CLI, "review", "j", "--pr", "12",
                             "--rounds", "3", "--type", "rebuttal"]
+
+
+def test_review_rounds_zero_is_explicit_not_omitted(results_dir, monkeypatch):
+    # rounds=0 is the documented "derive from the open-thread count" budget
+    # (the CLI's --rounds 0); omitting the flag takes the CLI default of 5.
+    seen = {}
+
+    def fake_run(argv, **_kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "armed", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    plugin._pi_review({"job": "j", "auto": True, "rounds": 0})
+    assert seen["argv"] == [plugin.CLI, "review", "j", "--auto", "--rounds", "0"]
+
+
+def test_review_rounds_omitted_stays_omitted(results_dir, monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **_kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "armed", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    plugin._pi_review({"job": "j", "auto": True})
+    assert seen["argv"] == [plugin.CLI, "review", "j", "--auto"]
 
 
 def test_review_auto_args(results_dir, monkeypatch):
@@ -221,7 +247,7 @@ def test_review_auto_args(results_dir, monkeypatch):
 
     monkeypatch.setattr(plugin.subprocess, "run", fake_run)
     plugin._pi_review({"job": "j", "auto": True})
-    assert seen["argv"] == ["pi-supervisor", "review", "j", "--auto"]
+    assert seen["argv"] == [plugin.CLI, "review", "j", "--auto"]
 
 
 def test_review_bad_type_is_usage_error(results_dir, monkeypatch):
@@ -238,7 +264,7 @@ def test_ack_shape(results_dir, monkeypatch):
 
     monkeypatch.setattr(plugin.subprocess, "run", fake_run)
     plugin._pi_ack({"job": "j", "event_id": "evt-1"})
-    assert seen["argv"] == ["pi-supervisor", "ack", "j", "--event", "evt-1"]
+    assert seen["argv"] == [plugin.CLI, "ack", "j", "--event", "evt-1"]
 
 
 def test_ack_requires_event(results_dir, monkeypatch):
@@ -344,11 +370,23 @@ def test_verify_arm_empty_fails(results_dir):
     assert armed is False
 
 
-def test_verify_arm_persist_not_confirmed_warns(results_dir):
+def test_verify_arm_persist_not_confirmed_fails(results_dir):
+    # Invariant 6: the arm ALWAYS carries persist_on_release, and the spawn
+    # echoes it only when it took. An unconfirmed echo is the same
+    # dropped-parameter class as a lost notify — fail loud, never warn.
     result = good_dispatch_result(persist_on_release=False)
     armed, info = plugin._verify_arm(result, str(results_dir))
-    assert armed is True
-    assert "persist_warning" in info
+    assert armed is False
+    assert "persist_on_release" in info["why"]
+    assert "RE-ARM REQUIRED" in info["why"]
+
+
+def test_verify_arm_persist_absent_fails(results_dir):
+    result = json.loads(good_dispatch_result())
+    result.pop("persist_on_release")
+    armed, info = plugin._verify_arm(json.dumps(result), str(results_dir))
+    assert armed is False
+    assert "RE-ARM REQUIRED" in info["why"]
 
 
 # --------------------------------------------------------------------------
@@ -361,23 +399,29 @@ def test_arm_watch_success_path(results_dir):
     assert out["armed"] is True
     assert out["notify_verified"] is True
     assert out["proc"] == "proc_abc123def456"
-    assert out["releases_on"][0] == "task_completed"
+    assert out["releases_on"] == ["task_completed", "task_lookup_failed"]
     # Flags are CODE: the dispatch args carry them even if the model drops them.
     name, args = ctx.dispatched
     assert name == "terminal"
-    assert args["command"] == "pi-supervisor watch myjob -t"
+    assert args["command"] == f"{plugin.CLI} watch myjob -t"
     assert args["background"] is True
     assert args["notify"] is True
     assert args["notify_on_complete"] is True
     assert args["persist_on_release"] is True
 
 
-def test_arm_watch_persist_false(results_dir):
+def test_arm_watch_has_no_persist_opt_out(results_dir):
+    # There is NO caller- or model-controlled persistence opt-out: the arm
+    # always persists (invariant 6). The old `persist` parameter is gone.
+    import inspect
+
+    sig = inspect.signature(plugin.arm_watch)
+    assert "persist" not in sig.parameters
     ctx = FakeCtx(good_dispatch_result())
-    out = json.loads(plugin.arm_watch(ctx, "myjob", persist=False,
-                                      proc_results_dir=str(results_dir)))
+    out = json.loads(plugin._pi_watch({"job": "myjob", "persist": False},
+                                      ctx=ctx))
     assert out["armed"] is True
-    assert ctx.dispatched[1]["persist_on_release"] is False
+    assert ctx.dispatched[1]["persist_on_release"] is True
 
 
 def test_arm_watch_no_dispatch_tool_refuses_with_manual_arm(results_dir):
@@ -425,7 +469,7 @@ def test_piwatch_command_arms(results_dir):
     finally:
         plugin._WATCH_CTX[0] = None
     assert out["armed"] is True
-    assert ctx.dispatched[1]["command"] == "pi-supervisor watch myjob -t"
+    assert ctx.dispatched[1]["command"] == f"{plugin.CLI} watch myjob -t"
 
 
 def test_piwatch_command_empty_args(results_dir):
@@ -447,7 +491,7 @@ def test_probe_runs_plain_watch_without_t(results_dir, monkeypatch):
 
     monkeypatch.setattr(plugin.subprocess, "run", fake_run)
     payload = json.loads(plugin._pi_watch_probe({"job": "j", "timeout_s": 5}))
-    assert seen["argv"] == ["pi-supervisor", "watch", "j"]  # NO -t, ever
+    assert seen["argv"] == [plugin.CLI, "watch", "j"]  # NO -t, ever
     assert seen["kw"]["timeout"] == 5
     assert payload["probe"] is True
 
@@ -486,5 +530,47 @@ def test_register_registers_all_tools_and_command():
     ]
     assert registered["commands"] == ["piwatch"]
     assert set(registered["toolsets"]) == {"pi_supervisor"}
-    # pi_watch must never accept a foreground/background flag from the model.
-    assert set(registered["schemas"]["pi_watch"]["properties"]) == {"job", "persist"}
+    # pi_watch must never accept a foreground/background flag from the model,
+    # and never a persistence opt-out (invariant 6: always persist).
+    assert set(registered["schemas"]["pi_watch"]["properties"]) == {"job"}
+    assert "derive" in registered["schemas"]["pi_review"]["properties"]["rounds"]["description"]
+
+
+def test_register_binds_its_own_ctx_not_the_global(results_dir):
+    # Each register() call binds ITS ctx into the handlers' closures; a
+    # second load in the same process can never dispatch through the first
+    # load's context (the kody cross-contamination shape).
+    class ArmCtx:
+        def __init__(self, tag):
+            self.tag = tag
+            self.dispatched = None
+            self._handler = None
+            self._command = None
+
+        def dispatch_tool(self, name, args):
+            self.dispatched = (name, args)
+            return json.dumps({"output": "Background process started",
+                               "session_id": f"proc_{self.tag}",
+                               "notify_on_complete": True,
+                               "persist_on_release": True})
+
+        def register_tool(self, name, toolset, schema, handler):
+            if name == "pi_watch":
+                self._handler = handler
+
+        def register_command(self, name, handler, description="", args_hint=""):
+            self._command = handler
+
+    first, second = ArmCtx("a"), ArmCtx("b")
+    plugin.register(first)
+    plugin.register(second)
+    # first's pi_watch handler dispatches through FIRST's ctx...
+    out = json.loads(first._handler({"job": "j"}))
+    assert first.dispatched[1]["command"].endswith(" watch j -t")
+    assert second.dispatched is None
+    assert out["proc"] == "proc_a"
+    # ...and second's /piwatch command through SECOND's, never the global.
+    plugin._WATCH_CTX[0] = None  # the global fallback must not rescue it
+    out = json.loads(second._command("j"))
+    assert out["armed"] is True
+    assert second.dispatched[1]["command"].endswith(" watch j -t")
