@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.9.1
+version: 1.10.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -229,6 +229,19 @@ it**. It cannot go anywhere else.
 # consumed a backoff, and the fatal 34s later reached nobody). -t holds ONE
 # process until the run is actually over and survives daemon restarts via
 # ADR-0015 reconnect.
+#
+# PREFERRED (ADR-0022): if your session has the pi-supervisor plugin tools —
+# any session started after `hermes plugins enable pi-supervisor`; check via
+# tool_search for "pi_watch" — use the TOOL, never a hand-armed terminal run.
+# It sets the flags in code and VERIFIES the arm (notify_on_complete=true in
+# the proc JSON) before reporting success, which structurally removes the
+# silent-arm class below:
+pi_watch(job="power-top")            # persist defaults to true
+# FALLBACK — sessions without the plugin tools (pre-enable sessions, delegate
+# children, restricted toolsets): arm manually AND verify — the tool result
+# must say "Background process started" AND
+# ~/.hermes/logs/process-results/<proc>.json must record notify_on_complete:
+# true (re-arm with minimal reasoning if not; see troubleshooting).
 terminal(command="pi-supervisor watch power-top -t", background=true, notify=true, persist_on_release=true)
 ```
 
@@ -335,7 +348,7 @@ Behavior:
 | `status` shows `marker_found: true` but the job is not `done` | the marker was seen but `final_report` does not exist yet. ADR-0020: the daemon asks twice (`report_requested` events, `report_steers` in status) and then fatals — check `report_steers`; if it is still 0 with rounds lasting seconds, the steer window is too short (known design limit for sub-second rounds; real rounds are minutes) |
 | job state `fatal`, diag "3 consecutive instant exits" | session context wall — start a fresh session (new job or clear state) or trim the session |
 | `status` says fatal but the armed watch never reported it | the watch was a one-shot (no `-t`): it exits after its FIRST event (`round_done`/`backoff`) and must be re-armed — the fatal after that had no listener. Arm `watch -t` (background+notify). If the stream was live across a daemon restart, the client now reconnects and the missed terminal arrives as the precheck (ADR-0015); only a connection that never answered fails at once. |
-| the arm looked correct (`-t`, background+notify) but the terminal event still reached nobody | the arm went out SILENT because the tool call lost its parameters: the arming model can OMIT trailing optional params (`notify`, even `background`) while the arguments JSON stays valid (`finish=tool_calls`) — flash-tier models under reasoning load, proven 2026-10-12 by direct OpenRouter repro (0 reasoning tokens → 3/3 params; 117+ → 2/3). The executor applies defaults, so the run is background-silent or foreground. VERIFY every arm: the tool result must say "Background process started" AND `~/.hermes/logs/process-results/<proc>.json` must record `notify_on_complete: true` and the `persist_on_release` flag — if not, re-arm with minimal reasoning (or switch model) before walking away. A foregrounded arm dies at the 600s cap mid-wait. |
+| the arm looked correct (`-t`, background+notify) but the terminal event still reached nobody | **First: if the session has the pi-supervisor plugin tools, arm with `pi_watch(job=…)` (ADR-0022) — the flags are set in code and the arm is verified, so this failure class cannot occur.** Otherwise the arm went out SILENT because the tool call lost its parameters: the arming model can OMIT trailing optional params (`notify`, even `background`) while the arguments JSON stays valid (`finish=tool_calls`) — flash-tier models under reasoning load, proven 2026-10-12 by direct OpenRouter repro (0 reasoning tokens → 3/3 params; 117+ → 2/3). The executor applies defaults, so the run is background-silent or foreground. VERIFY every arm: the tool result must say "Background process started" AND `~/.hermes/logs/process-results/<proc>.json` must record `notify_on_complete: true` and the `persist_on_release` flag — if not, re-arm with minimal reasoning (or switch model) before walking away. A foregrounded arm dies at the 600s cap mid-wait. |
 | job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |
 || job ends `fatal` with "round cap reached without marker" but the code is committed + pushed and a PR exists | **The marker WAS emitted but the gate could not latch it.** Verify before concluding anything is wrong: `grep -c '<MARKER>' <session_path>` and, decisively, `grep '<MARKER>' <session_path> | grep -c '"role":"assistant"'` — a non-zero count in an ASSISTANT message proves the agent finished (per ADR-0011 only assistant text counts). Then check whether the FINAL REPORT exists; pi often finishes the work, emits the marker, and dies before writing the report. In that case the supervisor cannot be trusted to have recorded the outcome — re-derive it yourself from the commits (`git log <base>..HEAD`, `git diff --stat`) and RE-RUN the gates rather than trusting the run log, then write the missing report. Re-running the gates is not optional: a run log claiming "CI 8/8 green, all shipped" is a self-report. |
 | `start` says `unknown job` right after you wrote `jobs/<name>.json` | the daemon loads job DEFINITIONS from disk only on `pi-supervisor reload` — writing the JSON does not register it. Reload, then start. |
