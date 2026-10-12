@@ -6,6 +6,7 @@ provides_tools:
   - pi_status
   - pi_steer
   - pi_logs
+  - pi_start
   - pi_review
   - pi_ack
   - pi_watch

@@ -255,6 +255,67 @@ def test_review_bad_type_is_usage_error(results_dir, monkeypatch):
     assert payload["usage_error"] is True
 
 
+def test_start_runs_start_job(results_dir, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **_kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    out = json.loads(plugin._pi_start({"job": "j"}))
+    assert calls == [[plugin.CLI, "start", "j"]]
+    assert out["ok"] is True
+
+
+def test_start_reload_runs_reload_then_start(results_dir, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **_kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    out = json.loads(plugin._pi_start({"job": "j", "reload": True}))
+    assert calls == [[plugin.CLI, "reload"], [plugin.CLI, "start", "j"]]
+    assert out["ok"] is True
+
+
+def test_start_reload_failure_aborts_before_start(results_dir, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **_kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, "reload failed: bad yaml", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    out = json.loads(plugin._pi_start({"job": "j", "reload": True}))
+    assert calls == [[plugin.CLI, "reload"]]  # start was NEVER attempted
+    assert out["ok"] is False
+    assert out["refused"] is True
+    assert out["stage"] == "reload"
+
+
+def test_start_reload_dropped_param_defaults_to_false(results_dir, monkeypatch):
+    """A dropped `reload` arg must degrade to a plain start, never skip it."""
+    calls = []
+
+    def fake_run(argv, **_kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    out = json.loads(plugin._pi_start({"job": "j", "reload": None}))
+    assert calls == [[plugin.CLI, "start", "j"]]
+    assert out["ok"] is True
+
+
+def test_start_bad_job_name_is_usage_error(results_dir, monkeypatch):
+    out = json.loads(plugin._pi_start({"job": "-weird"}))
+    assert out["ok"] is False
+    assert out["usage_error"] is True
+
+
 def test_ack_shape(results_dir, monkeypatch):
     seen = {}
 
@@ -525,8 +586,8 @@ def test_register_registers_all_tools_and_command():
 
     plugin.register(RegCtx())
     assert registered["tools"] == [
-        "pi_status", "pi_steer", "pi_logs", "pi_review", "pi_ack",
-        "pi_watch", "pi_watch_probe",
+        "pi_status", "pi_steer", "pi_logs", "pi_start", "pi_review",
+        "pi_ack", "pi_watch", "pi_watch_probe",
     ]
     assert registered["commands"] == ["piwatch"]
     assert set(registered["toolsets"]) == {"pi_supervisor"}

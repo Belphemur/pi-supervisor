@@ -286,6 +286,32 @@ def _pi_review(args, **_kw):
     return _dump(payload)
 
 
+def _pi_start(args, **_kw):
+    """pi_start(job, reload=False) -> `pi-supervisor start <job>`.
+
+    Round 1 LAUNCHes, later rounds RESUME the pinned session (daemon
+    rule). reload=true first runs the daemon-wide `pi-supervisor reload` —
+    the daemon loads job DEFINITIONS from disk only on reload, so a
+    just-written jobs/<name>.json is unknown until it runs ("unknown job"
+    would otherwise be the answer). A reload failure aborts BEFORE the
+    start: starting with a stale def is the silent-wrong-brief failure.
+    A done job refuses with exit 1 ("already done") unless a review
+    campaign is armed (ADR-0016).
+    """
+    a = args or {}
+    job = a.get("job") or ""
+    err = _job(job)
+    if err:
+        return _dump({"ok": False, "usage_error": True, "error": err})
+    if a.get("reload"):
+        payload, _ = run_cli(["reload"])
+        if not payload.get("ok"):
+            payload["stage"] = "reload"
+            return _dump(payload)
+    payload, _ = run_cli(["start", job])
+    return _dump(payload)
+
+
 def _pi_ack(args, **_kw):
     """pi_ack(job, event_id) -> `pi-supervisor ack <job> --event <id>`.
 
@@ -570,6 +596,30 @@ def register(ctx):
             "required": ["job"],
         },
         handler=_pi_logs,
+    )
+    ctx.register_tool(
+        name="pi_start",
+        toolset=TOOLSET,
+        schema={
+            **_TOOL_SCHEMA_BASE,
+            "description": (
+                "Start (or resume) a pi-supervisor job: round 1 LAUNCHes, later "
+                "rounds RESUME the pinned session. reload=true first runs the "
+                "daemon-wide reload so a just-written jobs/<name>.json is "
+                "registered (the daemon loads job definitions ONLY on reload); "
+                "a reload failure aborts before starting. A done job refuses "
+                "with exit 1 unless a review campaign is armed."
+            ),
+            "properties": {
+                "job": {"type": "string"},
+                "reload": {
+                    "type": "boolean",
+                    "description": "run `pi-supervisor reload` first (needed after writing/editing the job JSON)",
+                },
+            },
+            "required": ["job"],
+        },
+        handler=_pi_start,
     )
     ctx.register_tool(
         name="pi_review",

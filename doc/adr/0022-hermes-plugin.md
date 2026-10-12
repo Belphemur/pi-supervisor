@@ -59,7 +59,9 @@ skill as the only memory.
    (ADR-0008: 0 success / 1 refused / 2 usage). The plugin shells out and
    maps the exit codes; it never duplicates `internal/control` wire shapes in
    Python. (Owner decision 2026-10-12.) Tools: `pi_status`, `pi_steer`,
-   `pi_ack`, `pi_review`, `pi_logs` — typed parameters, JSON results.
+   `pi_ack`, `pi_review`, `pi_logs`, `pi_start` (with the daemon-only-loads-
+   defs-on-reload rule folded in as a `reload` flag whose failure aborts
+   before the start) — typed parameters, JSON results.
 3. **`pi_watch(job)` performs the arm server-side.** The handler invokes
    Hermes' documented `ctx.dispatch_tool("terminal", …)` — the plugin-guide
    contract: "call any other tool with the parent agent's context
