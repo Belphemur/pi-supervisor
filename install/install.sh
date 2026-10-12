@@ -137,6 +137,37 @@ for hook in pre-push post-push; do
   fi
 done
 
+# The Hermes plugin (ADR-0022): typed tools wrapping this CLI plus the
+# verified watch arm. Synced by COPY (rm+cp), never a symlink — the plugin
+# dir must survive independently of any checkout, same reasoning as the
+# skill's dangling-link guard, and plugins are loaded in-process so a stale
+# real dir must be replaced wholesale. Gated by `hermes plugins doctor` like
+# every other verification step; hermes missing from PATH degrades to a
+# warning — the daemon install must never fail on the agent tooling.
+echo "==> Hermes plugin (ADR-0022)"
+PLUGIN_SRC="${REPO_DIR}/hermes-plugin"
+PLUGIN_DST="${HERMES_HOME}/plugins/pi-supervisor"
+if [ ! -f "${PLUGIN_SRC}/plugin.yaml" ] || [ ! -f "${PLUGIN_SRC}/plugin.py" ]; then
+  echo "    ERROR: ${PLUGIN_SRC}/plugin.yaml or plugin.py not found"
+  exit 1
+fi
+mkdir -p "$(dirname "${PLUGIN_DST}")"
+rm -rf "${PLUGIN_DST}"
+mkdir -p "${PLUGIN_DST}"
+cp "${PLUGIN_SRC}/"*.py "${PLUGIN_SRC}/"*.yaml "${PLUGIN_SRC}/"*.md "${PLUGIN_DST}/"
+echo "    installed: ${PLUGIN_DST} (copy, $(ls "${PLUGIN_DST}" | wc -l) files)"
+if command -v hermes >/dev/null 2>&1; then
+  if hermes plugins doctor "${PLUGIN_DST}" --ci; then
+    echo "    doctor: pi-supervisor plugin clean"
+  else
+    echo "    ERROR: hermes plugins doctor failed for the pi-supervisor plugin"
+    exit 1
+  fi
+else
+  echo "    WARNING: hermes not on PATH — plugin synced but NOT doctor-verified."
+  echo "             run: hermes plugins doctor ${PLUGIN_DST} --ci"
+fi
+
 echo "==> enabling service"
 systemctl --user daemon-reload
 # `enable --now` is a NO-OP on an already-active unit: it enables the unit but
