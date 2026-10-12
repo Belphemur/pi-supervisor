@@ -1,0 +1,12 @@
+name: pi-supervisor
+version: 0.1.0
+description: pi-supervisor delegation supervisor — status, steer, review, verified watch arming
+author: Antoine Aflalo (Belphemur), Hermes Agent
+provides_tools:
+  - pi_status
+  - pi_steer
+  - pi_logs
+  - pi_review
+  - pi_ack
+  - pi_watch
+  - pi_watch_probe
