@@ -322,10 +322,24 @@ func (s *Supervisor) ExpireReviewAcks() {
 // liveReview returns the job's campaign and the round currently executing.
 // The round comes from the LIVE runner, which is what makes the resolve guard
 // un-forgeable by the client.
+//
+// State note: a live campaign ALWAYS runs under `reviewing`, never
+// `running` (supervisor.go Start: "A live campaign always runs under
+// `reviewing`, never `running`", ADR-0016) — the loop's budget/gate
+// selection keys off that state. Checking `running` here (the original
+// condition) therefore refused EVERY shim call of EVERY campaign round:
+// the pi session was live (steers delivered, reminders re-steered) while
+// post_replies/list_threads bounced with no-live-round (observed on
+// mealime-philosophy-fix round 4, 2026-10-12). Accept both the campaign
+// state and `running` (the report-declares-incomplete continuation can
+// set `running` while a campaign object is still armed).
 func (s *Supervisor) liveReview(r *runner) (*reviewCampaign, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.review == nil || !r.active || r.state.State != "running" {
+	if r.review == nil || !r.active {
+		return nil, 0
+	}
+	if st := r.state.State; st != "reviewing" && st != "running" {
 		return nil, 0
 	}
 	return r.review, r.state.Round
