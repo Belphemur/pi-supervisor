@@ -58,19 +58,19 @@ echo "    installed: ${SKILL_LINK_DIR}/pi-supervisor -> $(readlink -f "${SKILL_L
 # The review shim (ADR-0012) is the ONLY way a pi review round reaches GitHub,
 # so it is part of the install, not an optional extra: a review round whose
 # transport is missing fails at the first verb. Installed as a symlink to the
-# canonical copy in doc/skill/pi_supervisor_review/, so edits land in one place.
+# canonical copy in doc/skill/pi-supervisor-review/, so edits land in one place.
 echo "==> review shim"
 install -d "$BIN_DIR"
-if [ ! -f "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review" ]; then
-  echo "    ERROR: ${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review not found"
+if [ ! -f "${SKILL_SRC}/pi-supervisor-review/_pi-supervisor-review" ]; then
+  echo "    ERROR: ${SKILL_SRC}/pi-supervisor-review/_pi-supervisor-review not found"
   exit 1
 fi
 if [ -e "${BIN_DIR}/_pi-supervisor-review" ] && [ ! -L "${BIN_DIR}/_pi-supervisor-review" ]; then
   echo "    existing real file ${BIN_DIR}/_pi-supervisor-review found; replacing with symlink"
   rm -f "${BIN_DIR}/_pi-supervisor-review"
 fi
-ln -sfn "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review" "${BIN_DIR}/_pi-supervisor-review"
-chmod +x "${SKILL_SRC}/pi_supervisor_review/_pi-supervisor-review"
+ln -sfn "${SKILL_SRC}/pi-supervisor-review/_pi-supervisor-review" "${BIN_DIR}/_pi-supervisor-review"
+chmod +x "${SKILL_SRC}/pi-supervisor-review/_pi-supervisor-review"
 # Same dangling-link proof as the skill: a shim that cannot resolve is a
 # review round failing at the first verb, not an install.
 if [ ! -r "${BIN_DIR}/_pi-supervisor-review" ]; then
@@ -85,21 +85,21 @@ fi
 # working when the daemon cannot resolve the canonical dir. Guarded like the
 # Hermes link above: never clobber a real file, never leave a dangling link.
 PI_SKILL_DIR="${HOME}/.pi/agent/skills"
-if [ ! -f "${SKILL_SRC}/pi_supervisor_review/SKILL.md" ]; then
-  echo "    ERROR: ${SKILL_SRC}/pi_supervisor_review/SKILL.md not found"
+if [ ! -f "${SKILL_SRC}/pi-supervisor-review/SKILL.md" ]; then
+  echo "    ERROR: ${SKILL_SRC}/pi-supervisor-review/SKILL.md not found"
   exit 1
 fi
 install -d "$PI_SKILL_DIR"
-if [ -e "${PI_SKILL_DIR}/pi_supervisor_review" ] && [ ! -L "${PI_SKILL_DIR}/pi_supervisor_review" ]; then
-  echo "    ERROR: ${PI_SKILL_DIR}/pi_supervisor_review exists and is not a symlink — refusing to clobber"
+if [ -e "${PI_SKILL_DIR}/pi-supervisor-review" ] && [ ! -L "${PI_SKILL_DIR}/pi-supervisor-review" ]; then
+  echo "    ERROR: ${PI_SKILL_DIR}/pi-supervisor-review exists and is not a symlink — refusing to clobber"
   exit 1
 fi
-ln -sfn "${SKILL_SRC}/pi_supervisor_review" "${PI_SKILL_DIR}/pi_supervisor_review"
-if [ ! -r "${PI_SKILL_DIR}/pi_supervisor_review/SKILL.md" ]; then
-  echo "    ERROR: ${PI_SKILL_DIR}/pi_supervisor_review does not resolve to the review skill"
+ln -sfn "${SKILL_SRC}/pi-supervisor-review" "${PI_SKILL_DIR}/pi-supervisor-review"
+if [ ! -r "${PI_SKILL_DIR}/pi-supervisor-review/SKILL.md" ]; then
+  echo "    ERROR: ${PI_SKILL_DIR}/pi-supervisor-review does not resolve to the review skill"
   exit 1
 fi
-echo "    installed: ${PI_SKILL_DIR}/pi_supervisor_review -> $(readlink -f "${PI_SKILL_DIR}/pi_supervisor_review")"
+echo "    installed: ${PI_SKILL_DIR}/pi-supervisor-review -> $(readlink -f "${PI_SKILL_DIR}/pi-supervisor-review")"
 # The shim resolves pi-supervisor from PATH; if the user's PATH misses BIN_DIR
 # the shim would fail at exec time rather than at install time, so check here.
 if ! command -v pi-supervisor >/dev/null 2>&1; then

@@ -14,7 +14,7 @@
 // closed enums used to describe the same wire field — `Response.Reason` —
 // with underscore spellings here and hyphen spellings in review, so a shim
 // matching one silently missed the other. The published values are a contract
-// (ADR-0012 §2.4, doc/skill/pi_supervisor_review/SKILL.md), so the HYPHEN
+// (ADR-0012 §2.4, doc/skill/pi-supervisor-review/SKILL.md), so the HYPHEN
 // spellings won: this package's own `no_live_round` was retired to match
 // review's already-published `no-live-round`.
 package fault

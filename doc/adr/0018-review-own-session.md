@@ -32,7 +32,7 @@ state and loses the campaign machinery.
 - `job.review_brief` (path): the entry prompt for a campaign's fresh
   session. Typically: the PR, the worktree, what the build delivered, and
   the review contract (the shim's six verbs via the injected
-  `pi_supervisor_review` skill).
+  `pi-supervisor-review` skill).
 - At ARM time — both the manual `review <job> --pr N` and the auto gate
   trigger — when `review_brief` is set, the daemon clears `session_path`
   and persists the clearing BEFORE the first round reads the job. The

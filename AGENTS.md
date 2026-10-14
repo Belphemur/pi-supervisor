@@ -31,7 +31,7 @@ the same commit; this file links to it instead of duplicating it.
 | `internal/stall/stall.go` | CI/review stall detector (ADR-0004): tails the session JSONL for CI-wait markers; stall = marker + idle window; drives the finish-the-report intervention at the cap. Same tail scrapes the round's GitHub PR URL (ADR-0006) |
 | `internal/review/` | GitHub client for ADR-0012: GraphQL for review threads (the only surface with thread identity/`isResolved`/author), REST for PR + CI metadata, one shared token source (ghinstallation for the App, `gh auth token` fallback). Holds the closed `Reason` enum that maps to exit codes |
 | `internal/supervisor/review_*.go` | The review surface: campaign state + answer-before-resolve guard (`review_campaign.go`), the six verbs (`review_action.go`), campaign arming + client cache (`review_start.go`), the `done → reviewing` auto-trigger (`review_auto.go`), ack expiry (`ExpireAcks`) |
-| `doc/skill/pi_supervisor_review/` | The injected review-round skill + the `_pi-supervisor-review` shim pi calls (ADR-0012) |
+| `doc/skill/pi-supervisor-review/` | The injected review-round skill + the `_pi-supervisor-review` shim pi calls (ADR-0012) |
 | `internal/control/control.go` | Unix-socket server: one-shot request/response + streaming `watch` (pushes events, closes on terminal) |
 | `install/install.sh` | Build + systemd unit + Hermes skill symlink + verification |
 | `install/pi-supervisor.service` | `Type=notify` user unit (`WatchdogSec=120`) |

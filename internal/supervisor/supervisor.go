@@ -2111,18 +2111,18 @@ var reviewSkillDirImpl = func() string {
 	if err != nil {
 		return ""
 	}
-	cand := filepath.Join(home, ".pi", "agent", "skills", "pi_supervisor_review")
+	cand := filepath.Join(home, ".pi", "agent", "skills", "pi-supervisor-review")
 	if fi, err := os.Stat(filepath.Join(cand, "SKILL.md")); err == nil && !fi.IsDir() {
 		return cand
 	}
 	return ""
 }
 
-// reviewSkillDir resolves the pi_supervisor_review skill directory — the
+// reviewSkillDir resolves the pi-supervisor-review skill directory — the
 // shim's usage contract — so every campaign round can be seeded with it
 // explicitly (owner directive 2026-10-08). The shim is installed as a
 // symlink to the canonical copy's dir, so resolving it yields the skill dir
-// itself; the pi discovery symlink (~/.pi/agent/skills/pi_supervisor_review,
+// itself; the pi discovery symlink (~/.pi/agent/skills/pi-supervisor-review,
 // created by install.sh) is the fallback. "" when neither resolves: the
 // caller logs a warning and the round runs without the skill (the wrapped
 // prompt's mandatory-reply contract still carries the obligation).
@@ -2138,7 +2138,7 @@ func reviewSkillDir() string {
 // (qodo PR#10 finding 2 / kody).
 //
 // Dedup compares RESOLVED locations (qodo PR#10 finding 1): an operator
-// entry named pi_supervisor_review that resolves elsewhere — a stale or
+// entry named pi-supervisor-review that resolves elsewhere — a stale or
 // hand-made copy — is NOT the installed contract, so the canonical dir is
 // still appended (pi loads both, the daemon's copy is authoritative).
 // Basename matching is only trusted after EvalSymlinks agrees the two
@@ -2149,7 +2149,7 @@ func campaignSkills(jobSkills []string) (skills []string, injected string, resol
 		return jobSkills, "", true
 	}
 	// Normalize (kody PR#10 round 2): the discovery fallback returns the
-	// raw SYMLINK (~/.pi/agent/skills/pi_supervisor_review), which would
+	// raw SYMLINK (~/.pi/agent/skills/pi-supervisor-review), which would
 	// never string-match a resolved canonical path or a job entry and so
 	// double-inject. Resolve once so every comparison below happens in
 	// resolved-land.
@@ -2346,7 +2346,7 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 			// mealime-presence campaign with zero shim calls (qodo PR#10
 			// finding 2 / kody).
 			journal.Subsys("job").Warn(
-				"review skill pi_supervisor_review could NOT be resolved (no shim on PATH, no ~/.pi/agent/skills link) — campaign round runs without the shim contract; install pi-supervisor to fix",
+				"review skill pi-supervisor-review could NOT be resolved (no shim on PATH, no ~/.pi/agent/skills link) — campaign round runs without the shim contract; install pi-supervisor to fix",
 				"job", j.Name, "round", round)
 		case injected != "":
 			s.logf(j.Name, "round %d: review skill injected into the round (%s)", round, injected)

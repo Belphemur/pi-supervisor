@@ -469,7 +469,7 @@ plus a machine-readable `reason` from a closed enum.
 
 - **Surface.** `pi-supervisor review <job> --pr <N> [--rounds N=5] [--type acceptance|rebuttal] [--json]` / `review <job> --auto` / `ack --event <ack_id>`. `--pr` and `--auto` are mutually exclusive. `--rounds` is the campaign's `MaxRounds` — **default 5** (a review round is hours-long; an operator count beats a heuristic); `--rounds 0` auto-derives `ceil(open / review.per_round)` (`per_round` 12) capped by `review.max_rounds` (12). `--type` is the campaign's round character, uniform across its rounds and recorded per round so `watch`/`status` surface `#acceptance` vs `#rebuttal`; mixed campaigns are two campaigns.
 - **The review skill is daemon-injected, deterministically.** Every campaign
-  round is spawned with `pi_supervisor_review` appended to the job's skill
+  round is spawned with `pi-supervisor-review` appended to the job's skill
   list (resolved from the installed shim's canonical dir; deduped against an
   operator-listed copy), and install.sh also links it into pi's own discovery
   dir as the fallback. Never rely on the job's `skills` list to carry it —
@@ -478,7 +478,7 @@ plus a machine-readable `reason` from a closed enum.
   every open thread); the skill carries the MECHANICS (verbs, `PRRT_` ids,
   reply-before-resolve, pagination exhaustion).
 - **One instruction source, not two.** `--skill` defaults to
-  **`pi_supervisor_review`**, which carries the triage vocabulary (fix /
+  **`pi-supervisor-review`**, which carries the triage vocabulary (fix /
   explain-non-issue / defer-out-of-scope) *and* the shim contract. It is NOT
   `answer-code-review`: that skill's body is a set of instructions to run
   `reply_review.py`, so injecting it alongside a contract that forbids the
@@ -491,7 +491,7 @@ plus a machine-readable `reason` from a closed enum.
   reaches GitHub: `list_threads` | `thread_detail` | `post_replies` |
   `resolve_thread` | `bulk_resolve` | `check_ci`. The shim
   (`_pi-supervisor-review`, installed on PATH by `install.sh` as a symlink to
-  the canonical copy in `doc/skill/pi_supervisor_review/`) is a CLI speaking the
+  the canonical copy in `doc/skill/pi-supervisor-review/`) is a CLI speaking the
   daemon's JSON control protocol directly over the unix socket — not an MCP
   plugin process. New endpoint, additive: `POST /review/action`.
 - **Call order is load-bearing: `post_replies` → `resolve_thread`, always.** The

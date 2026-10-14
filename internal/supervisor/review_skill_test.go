@@ -28,11 +28,11 @@ func skillFixture(t *testing.T) string {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home) // windows fallback for os.UserHomeDir
-	canonical := filepath.Join(home, "canonical", "pi_supervisor_review")
+	canonical := filepath.Join(home, "canonical", "pi-supervisor-review")
 	if err := os.MkdirAll(canonical, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(canonical, "SKILL.md"), []byte("---\nname: pi_supervisor_review\n---\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(canonical, "SKILL.md"), []byte("---\nname: pi-supervisor-review\n---\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(canonical, "_pi-supervisor-review"), []byte("#!/bin/sh\n"), 0o755); err != nil {
@@ -85,10 +85,10 @@ func TestCampaignSkillsInjectsReviewSkill(t *testing.T) {
 	}
 
 	// kody PR#10 round 2: reviewSkillDir's fallback returns the RAW symlink
-	// (~/.pi/.../pi_supervisor_review). Simulate it by stubbing the resolver
+	// (~/.pi/.../pi-supervisor-review). Simulate it by stubbing the resolver
 	// to return the symlink path, with the canonical dir already listed: the
 	// injected dir must be normalized before comparison — no duplicate.
-	raw := filepath.Join(t.TempDir(), "skills", "pi_supervisor_review")
+	raw := filepath.Join(t.TempDir(), "skills", "pi-supervisor-review")
 	if err := os.MkdirAll(filepath.Dir(raw), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestCampaignSkillsInjectsReviewSkill(t *testing.T) {
 
 	// A STALE copy with the same basename that resolves ELSEWHERE is NOT the
 	// contract: the canonical dir is still appended (qodo PR#10 finding 1).
-	stale := filepath.Join(t.TempDir(), "pi_supervisor_review")
+	stale := filepath.Join(t.TempDir(), "pi-supervisor-review")
 	if err := os.MkdirAll(stale, 0o755); err != nil {
 		t.Fatal(err)
 	}
