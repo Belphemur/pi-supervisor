@@ -1351,9 +1351,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			}
 			sc := r.prScanner
 			r.mu.Unlock()
-			if u := sc.PRURL(); u != "" {
-				s.recordPR(r, u)
-			}
+			s.recordScrapedPR(r, sc)
 		}
 
 		// Model identity (ADR-0021): scanned whenever a session exists,
@@ -2111,18 +2109,18 @@ var reviewSkillDirImpl = func() string {
 	if err != nil {
 		return ""
 	}
-	cand := filepath.Join(home, ".pi", "agent", "skills", "pi_supervisor_review")
+	cand := filepath.Join(home, ".pi", "agent", "skills", "pi-supervisor-review")
 	if fi, err := os.Stat(filepath.Join(cand, "SKILL.md")); err == nil && !fi.IsDir() {
 		return cand
 	}
 	return ""
 }
 
-// reviewSkillDir resolves the pi_supervisor_review skill directory — the
+// reviewSkillDir resolves the pi-supervisor-review skill directory — the
 // shim's usage contract — so every campaign round can be seeded with it
 // explicitly (owner directive 2026-10-08). The shim is installed as a
 // symlink to the canonical copy's dir, so resolving it yields the skill dir
-// itself; the pi discovery symlink (~/.pi/agent/skills/pi_supervisor_review,
+// itself; the pi discovery symlink (~/.pi/agent/skills/pi-supervisor-review,
 // created by install.sh) is the fallback. "" when neither resolves: the
 // caller logs a warning and the round runs without the skill (the wrapped
 // prompt's mandatory-reply contract still carries the obligation).
@@ -2138,7 +2136,7 @@ func reviewSkillDir() string {
 // (qodo PR#10 finding 2 / kody).
 //
 // Dedup compares RESOLVED locations (qodo PR#10 finding 1): an operator
-// entry named pi_supervisor_review that resolves elsewhere — a stale or
+// entry named pi-supervisor-review that resolves elsewhere — a stale or
 // hand-made copy — is NOT the installed contract, so the canonical dir is
 // still appended (pi loads both, the daemon's copy is authoritative).
 // Basename matching is only trusted after EvalSymlinks agrees the two
@@ -2149,7 +2147,7 @@ func campaignSkills(jobSkills []string) (skills []string, injected string, resol
 		return jobSkills, "", true
 	}
 	// Normalize (kody PR#10 round 2): the discovery fallback returns the
-	// raw SYMLINK (~/.pi/agent/skills/pi_supervisor_review), which would
+	// raw SYMLINK (~/.pi/agent/skills/pi-supervisor-review), which would
 	// never string-match a resolved canonical path or a job entry and so
 	// double-inject. Resolve once so every comparison below happens in
 	// resolved-land.
@@ -2346,7 +2344,7 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 			// mealime-presence campaign with zero shim calls (qodo PR#10
 			// finding 2 / kody).
 			journal.Subsys("job").Warn(
-				"review skill pi_supervisor_review could NOT be resolved (no shim on PATH, no ~/.pi/agent/skills link) — campaign round runs without the shim contract; install pi-supervisor to fix",
+				"review skill pi-supervisor-review could NOT be resolved (no shim on PATH, no ~/.pi/agent/skills link) — campaign round runs without the shim contract; install pi-supervisor to fix",
 				"job", j.Name, "round", round)
 		case injected != "":
 			s.logf(j.Name, "round %d: review skill injected into the round (%s)", round, injected)
@@ -2748,7 +2746,7 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 	// on the round AFTER the one that opened it.
 	defer func() {
 		d.Poll() // final verdict is irrelevant; only the PR scrape matters
-		s.recordPR(r, d.PRURL())
+		s.recordScrapedPR(r, d)
 	}()
 	for {
 		select {
@@ -2758,7 +2756,7 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 			return
 		case <-t.C:
 			stalled, marker := d.Poll()
-			s.recordPR(r, d.PRURL())
+			s.recordScrapedPR(r, d)
 			if !stalled {
 				continue
 			}
@@ -2885,22 +2883,78 @@ func equalStrings(a, b []string) bool {
 }
 
 // recordPR stores the first pull-request URL seen in the round's transcript
-// on the runner (ADR-0006). Best-effort and eventually consistent: an empty
-// url means "not linked", never "no PR exists". Lock order stays s.mu -> r.mu:
-// this is called from the watcher goroutine with neither held.
-func (s *Supervisor) recordPR(r *runner, url string) {
+// on the runner (ADR-0006), GATED by ADR-0023: the URL is stored only when
+// its owner/repo matches one of the worktree's GitHub remotes. A transcript
+// link is untrusted — the agent may cite a PR it merely read — and a stored
+// foreign URL would arm a review campaign on the wrong repo (the
+// addictedproxy-llm-seo2 chimera: nuxt/nuxt#3237 from a scraped nuxt URL plus
+// a manual --pr 3237). A rejected URL changes nothing — no state, no log —
+// and the caller feeds it back to the scraper (SkipPRURL) so the scrape keeps
+// looking. Best-effort and eventually consistent: an empty url means "not
+// linked", never "no PR exists". Lock order stays s.mu -> r.mu: this is
+// called from the watcher goroutine with neither held.
+func (s *Supervisor) recordPR(r *runner, url string) bool {
 	if url == "" {
-		return
+		return false
+	}
+	// Short-circuit when the URL is already stored: the polled watchdog and the
+	// recordScrapedPR re-pull both hand us URLs every tick, so a stored PR URL
+	// would otherwise re-run acceptPRURL (a `git remote` fork) on every call.
+	// state.PRURL is only ever set to an ACCEPTED url, so an equal value is
+	// provably accepted and needs no re-validation (ADR-0023 perf).
+	r.mu.Lock()
+	if r.state.PRURL == url {
+		r.mu.Unlock()
+		return true
+	}
+	// r.job is replaced by Reload under r.mu; read fields here rather than past
+	// the acceptPRURL call so the git fork never races with a Reload write.
+	worktree := r.job.Worktree
+	name := r.job.Name
+	r.mu.Unlock()
+	if !acceptPRURL(url, worktree) {
+		return false
 	}
 	r.mu.Lock()
-	fresh := r.state.PRURL != url
+	fresh := r.state.PRURL != url // re-check: a concurrent caller may have stored it
 	if fresh {
 		r.state.PRURL = url
 	}
-	name := r.job.Name
 	r.mu.Unlock()
 	if fresh {
 		s.logf(name, "pull request: %s", url)
+	}
+	return true
+}
+
+// prScraper is either scrape mechanism (the stall Detector and the
+// PRURLScanner): it latches a PR URL and can be told to forget one the
+// ADR-0023 gate rejected, so the scrape keeps looking for a matching link.
+type prScraper interface {
+	PRURL() string
+	SkipPRURL(url string)
+}
+
+// recordScrapedPR funnels one scraped URL through the recordPR gate; on
+// rejection the scraper forgets the URL so a surviving matching link can latch
+// instead. It re-pulls immediately after each rejection: the PRURLScanner is
+// one-shot per round-start call, and a matching link written before a rejected
+// one sits in already-read bytes — without a re-pull it would not be stored
+// until the next tick.
+//
+// The loop always terminates: recordPR short-circuits on a stored URL, and the
+// skipped set only grows (SkipPRURL rewinds the read window but never re-latches
+// a rejected URL), so PRURL() eventually returns "".
+func (s *Supervisor) recordScrapedPR(r *runner, sc prScraper) {
+	for {
+		u := sc.PRURL()
+		if u == "" {
+			return
+		}
+		if s.recordPR(r, u) {
+			return
+		}
+		sc.SkipPRURL(u)
 	}
 }
 

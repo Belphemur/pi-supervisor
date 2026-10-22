@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -40,13 +41,14 @@ var prRe = regexp.MustCompile(`https://github\.com/[^/" ]+/[^/" ]+/pull/[0-9]+`)
 // Detector tails one session JSONL.
 type Detector struct {
 	path       string
-	idle       time.Duration // quiet time after the last CI marker that constitutes a stall
-	offset     int64         // next byte to read
-	size       int64         // last known file size
-	lastGrowth time.Time     // when bytes were last seen
-	ciMode     bool          // armed by a CI/review marker in recent content
-	marker     string        // most recent matched text
-	prURL      string        // first PR URL seen since the detector was created
+	idle       time.Duration   // quiet time after the last CI marker that constitutes a stall
+	offset     int64           // next byte to read
+	size       int64           // last known file size
+	lastGrowth time.Time       // when bytes were last seen
+	ciMode     bool            // armed by a CI/review marker in recent content
+	marker     string          // most recent matched text
+	prURL      string          // first PR URL seen since the detector was created
+	prSkipped  map[string]bool // URLs the supervisor rejected (ADR-0023): never re-latch
 	// Empty-turn stall bookkeeping (ADR-0010).
 	lastGrowthSize int64 // file size at the last empty-turn evaluation
 	toolCalls      int   // tool_use markers seen since the last empty-turn evaluation
@@ -115,8 +117,11 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 			_ = f.Close()
 			if rerr == nil || rerr == io.EOF {
 				if d.prURL == "" {
-					if m := prRe.Find(buf); m != nil {
-						d.prURL = string(m)
+					for _, m := range prRe.FindAll(buf, -1) {
+						if !d.prSkipped[string(m)] {
+							d.prURL = string(m)
+							break
+						}
 					}
 				}
 				// Count tool invocations in this slice so EmptyTurn can tell
@@ -153,6 +158,21 @@ func (d *Detector) Poll() (stalled bool, marker string) {
 // if the agent has not linked one (ADR-0006).
 func (d *Detector) PRURL() string { return d.prURL }
 
+// SkipPRURL records a URL the supervisor's recordPR gate REJECTED (ADR-0023:
+// its owner/repo does not match the worktree's remotes). The latch is dropped
+// so a later matching link can latch, and the URL is never re-latched even if
+// it appears again in bytes read afterwards. The scrape stays repo-blind —
+// the supervisor owns the validation, the scraper only owns "keep looking".
+func (d *Detector) SkipPRURL(url string) {
+	if d.prSkipped == nil {
+		d.prSkipped = map[string]bool{}
+	}
+	d.prSkipped[url] = true
+	if d.prURL == url {
+		d.prURL = ""
+	}
+}
+
 // PRURLScanner finds the last PR link in a transcript that is still growing.
 //
 // It exists because the two obvious implementations are each wrong in one
@@ -180,6 +200,7 @@ type PRURLScanner struct {
 	lastSize int64
 	lastIno  uint64
 	last     string
+	skipped  map[string]bool // URLs the supervisor rejected (ADR-0023)
 }
 
 // NewPRURLScanner starts a scanner for one transcript path.
@@ -294,9 +315,44 @@ func (s *PRURLScanner) PRURL() string {
 	// the offset commit: the overlap already re-reads every byte a split match
 	// could straddle, and trimming has twice cost real links.
 	if all := prRe.FindAll(buf, -1); len(all) > 0 {
-		s.last = string(all[len(all)-1])
+		// Last link the supervisor has not rejected (ADR-0023): a skipped URL
+		// must not hide a real one found later in the same read.
+		for _, a := range slices.Backward(all) {
+			if !s.skipped[string(a)] {
+				s.last = string(a)
+				break
+			}
+		}
 	}
 	return s.last
+}
+
+// SkipPRURL records a URL the supervisor's recordPR gate REJECTED (ADR-0023).
+// If it is the current latch it is dropped, so a later matching link can
+// replace it; the URL is never re-latched afterwards.
+//
+// The read offset is rewound by the overlap window so the next PRURL() re-covers
+// the byte region that produced the rejected latch. The backward scan
+// (slices.Backward, newest-first) then skips the rejected URL and picks a
+// surviving matching link written before it — one that a single incremental
+// read would otherwise commit past. Bounded by prOverlapBytes and clamped at 0,
+// so it re-reads at most one overlap window; the skipped set only grows, so
+// the scan always terminates on a non-skipped URL or an empty pull.
+func (s *PRURLScanner) SkipPRURL(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.skipped == nil {
+		s.skipped = map[string]bool{}
+	}
+	s.skipped[url] = true
+	if s.last == url {
+		s.last = ""
+	}
+	if s.offset > prOverlapBytes {
+		s.offset -= prOverlapBytes
+	} else {
+		s.offset = 0
+	}
 }
 
 // prURLChunkBytes bounds ONE read. Several calls may be needed to catch up on a

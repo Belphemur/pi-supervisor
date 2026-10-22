@@ -98,7 +98,7 @@ jobs:
       # The review shim is executed by pi inside every review round. A syntax
       # error breaks the campaign at its first verb, so it is gated like code.
       - name: Shim syntax
-        run: bash -n doc/skill/pi_supervisor_review/_pi-supervisor-review
+        run: bash -n doc/skill/pi-supervisor-review/_pi-supervisor-review
 
   live-shim:
     name: shim contract (no daemon, no network)
@@ -119,8 +119,8 @@ jobs:
         env:
           PI_SUPERVISOR_BIN: ${{ github.workspace }}/bin/pi-supervisor
         run: |
-          chmod +x doc/skill/pi_supervisor_review/_pi-supervisor-review
-          shim=doc/skill/pi_supervisor_review/_pi-supervisor-review
+          chmod +x doc/skill/pi-supervisor-review/_pi-supervisor-review
+          shim=doc/skill/pi-supervisor-review/_pi-supervisor-review
           fail=0
           check() { # desc, expected_exit, args...
             desc="$1"; want="$2"; shift 2

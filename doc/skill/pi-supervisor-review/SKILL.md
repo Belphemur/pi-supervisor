@@ -1,5 +1,5 @@
 ---
-name: pi_supervisor_review
+name: pi-supervisor-review
 description: "Route PR review actions through the supervisor shim."
 version: 1.0.0
 author: Antoine Aflalo (Belphemur), Hermes Agent

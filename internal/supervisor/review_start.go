@@ -173,10 +173,15 @@ func (s *Supervisor) StartReview(ctx context.Context, name string, pr, rounds in
 		r.mu.Unlock()
 		return nil, review.ErrUsage("job %q is already running; stop it before arming a review", name)
 	}
-	owner, repo, target, ok := reviewTarget(r.job.Worktree, r.state.PRURL, pr)
+	owner, repo, target, ok, divergent := reviewTarget(r.job.Worktree, r.state.PRURL, pr)
 	if !ok {
 		r.mu.Unlock()
 		return nil, review.ErrUsage("cannot determine the GitHub repo/PR for job %q (pass --pr with a linked pr_url, or set pr_url via the transcript)", name)
+	}
+	if divergent {
+		// ADR-0023 defense-in-depth: the stored URL names another repo. The
+		// remote already decided; this note only documents why.
+		s.logf(name, "review: pr_url %q does not name %s/%s; the worktree remote is the authority (ADR-0023)", r.state.PRURL, owner, repo)
 	}
 	if rounds <= 0 {
 		rounds = s.reviewDefaultRounds()

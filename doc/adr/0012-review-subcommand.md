@@ -40,7 +40,7 @@ agent's head turn to turn, with no bounded budget the operator can set.
 This replaces that with a **daemon-owned review loop**: the supervisor drives
 the outer round loop (poll → decide → trigger pi → poll) while pi executes one
 round's fixes. `pi-supervisor` fully replaces `reply_review.py`: instead of the
-agent shelling out to ad-hoc Python, an injected skill (`pi_supervisor_review`)
+agent shelling out to ad-hoc Python, an injected skill (`pi-supervisor-review`)
 carries the contract plus a CLI shim (`_pi-supervisor-review`), and pi's system
 prompt routes every read/reply/resolve through it. The daemon serves the reads
 and records the writes the shim asks for; it is never the deciding surface.
@@ -60,7 +60,7 @@ design (§8, Q7), the `--skill` default (§8, Q2), and the error taxonomy (§2.4
 | Concern | Owner | Mechanism |
 |---|---|---|
 | **Outer loop** (poll GH → decide "one more pi round?" → enforce budget) | the daemon | the round loop + one GitHub client |
-| **Fix execution + triage** (read a thread, classify fix/explain/defer, reply, resolve, push) | pi, via `pi_supervisor_review` + `_pi-supervisor-review` | shim → daemon control socket |
+| **Fix execution + triage** (read a thread, classify fix/explain/defer, reply, resolve, push) | pi, via `pi-supervisor-review` + `_pi-supervisor-review` | shim → daemon control socket |
 | **Mutation surface** (post reply, resolve thread, post comment) | the daemon, as a server | GitHub GraphQL — only when the shim asks; the daemon never decides to |
 
 pi does **not** shell out to `gh` for a review round. The MCP plugin server is
@@ -69,8 +69,8 @@ directly over the unix socket, and the daemon's GitHub auth never reaches pi.
 
 ### 2. The shim contract (what the LLM calls)
 
-The contract ships as an injected skill (`pi_supervisor_review`, under
-`doc/skill/pi_supervisor_review/`) that the system prompt loads for review
+The contract ships as an injected skill (`pi-supervisor-review`, under
+`doc/skill/pi-supervisor-review/`) that the system prompt loads for review
 rounds. It is two things: a plain-language directive (*route every GitHub
 review action to the pi-supervisor at `$PI_SUPERVISOR_SOCKET` via
 `_pi-supervisor-review`; never call `gh` or `reply_review.py` from the
@@ -453,13 +453,13 @@ what the loser would have cost.
   `@coderabbitai review`. No `review.trigger_comment`. *KISS:* a config knob for
   a string that never varies in this deployment is surface without a user;
   changing bots is an ADR amendment.
-- **Q2 — `--skill` defaults to `pi_supervisor_review`, not
+- **Q2 — `--skill` defaults to `pi-supervisor-review`, not
   `answer-code-review`.** An earlier draft defaulted to `answer-code-review` for
   "unchanged triage rules" while §2 forbids the agent from touching
   `reply_review.py` — but that skill's body is a set of instructions to run
   exactly that script. Injecting both puts two contradictory directives in one
   prompt, and an LLM will follow whichever it reads last. *DRY:* the triage rules
-  are extracted into `pi_supervisor_review`; there is one instruction source, not
+  are extracted into `pi-supervisor-review`; there is one instruction source, not
   two that disagree. `answer-code-review` remains available via explicit
   `--skill` for prose reference, and stays the default for **non**-review jobs.
 - **Q3 — Two SDKs, not one.** `go-githubv4` cannot do REST Actions queries and
@@ -601,7 +601,7 @@ proven without a live PR — which is exactly why the write test exists.
   a closed error enum, and `--json` throughout. This constraint is what removed
   the human ACK from the design.
 - `answer-code-review` is retired **as the review-jobs default**: its triage
-  rules live in `pi_supervisor_review`, its query shapes are inherited by the
+  rules live in `pi-supervisor-review`, its query shapes are inherited by the
   daemon, and its `gh`/`reply_review.py` plumbing is replaced by the shim.
   Non-review jobs are untouched.
 - No new daemon process model and no new credential surface: two GitHub SDK

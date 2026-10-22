@@ -25,7 +25,7 @@ import (
 // shim matches on one of. fault imports nothing, so review importing it
 // keeps the dependency graph acyclic; ExitCode() rides along as a method on
 // the alias, and the strings are unchanged, so every published reason
-// (ADR-0012 §2.4, doc/skill/pi_supervisor_review/SKILL.md) still arrives
+// (ADR-0012 §2.4, doc/skill/pi-supervisor-review/SKILL.md) still arrives
 // byte-identical.
 type Reason = fault.Kind
 
