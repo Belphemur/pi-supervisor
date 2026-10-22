@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -316,9 +317,9 @@ func (s *PRURLScanner) PRURL() string {
 	if all := prRe.FindAll(buf, -1); len(all) > 0 {
 		// Last link the supervisor has not rejected (ADR-0023): a skipped URL
 		// must not hide a real one found later in the same read.
-		for i := len(all) - 1; i >= 0; i-- {
-			if !s.skipped[string(all[i])] {
-				s.last = string(all[i])
+		for _, a := range slices.Backward(all) {
+			if !s.skipped[string(a)] {
+				s.last = string(a)
 				break
 			}
 		}
