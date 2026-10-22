@@ -166,24 +166,29 @@ func TestReviewTargetRepoComesFromRemoteNotScrapedURL(t *testing.T) {
 	}
 }
 
-// The URL number is adopted only when the URL names the SAME repo
-// reviewTarget returns. A link to a DIFFERENT remote's repo must not donate
-// its number to the primary repo — that is the chimera shape again, one
-// remote over.
-func TestReviewTargetRejectsNumberFromOtherRepoURL(t *testing.T) {
+// ADR-0023 + owner directive (2026-10-10): a scraped URL that matches ANY
+// configured remote (not just origin) is a real link the agent opened in this
+// worktree, so it donates its number to THAT remote's repo. This is what makes a
+// fork-origin/upstream-PR workflow reviewable (qodo + kody). A scrape that
+// matches NO remote stays divergent — the chimera shape, one remote over, and
+// (per TestReviewTargetRepoComesFromRemoteNotScrapedURL) a foreign URL like
+// nuxt/nuxt never reaches here anyway (acceptPRURL discards it first).
+func TestReviewTargetMatchesAnyRemoteNotJustOrigin(t *testing.T) {
 	dir := t.TempDir()
 	gitWorktree(t, dir,
-		"https://github.com/owner/project.git",
-		"https://github.com/forker/project.git")
+		"https://github.com/owner/project.git",  // origin
+		"https://github.com/forker/project.git") // a second, non-origin remote
 
-	// Stored (acceptPRURL passes: it matches a worktree remote), but the
-	// number must not be applied to owner/project.
+	// The fork remote is configured, so its PR URL is accepted and arms forker.
 	o, rp, n, ok, divergent := reviewTarget(dir, "https://github.com/forker/project/pull/12", 0)
-	if ok {
-		t.Fatalf("number from a different repo's URL leaked: %s/%s#%d ok=%v", o, rp, n, ok)
+	if !ok || o != "forker" || rp != "project" || n != 12 || divergent {
+		t.Fatalf("fork-remote URL: reviewTarget = %s/%s#%d ok=%v divergent=%v, want forker/project#12, non-divergent", o, rp, n, ok, divergent)
 	}
-	if !divergent {
-		t.Fatal("a URL for another remote's repo is still divergent")
+
+	// --pr still overrides the number of a matched (non-origin) remote.
+	o, rp, n, ok, divergent = reviewTarget(dir, "https://github.com/forker/project/pull/12", 99)
+	if !ok || o != "forker" || rp != "project" || n != 99 || divergent {
+		t.Fatalf("--pr override on fork remote: reviewTarget = %s/%s#%d ok=%v divergent=%v, want forker/project#99", o, rp, n, ok, divergent)
 	}
 }
 

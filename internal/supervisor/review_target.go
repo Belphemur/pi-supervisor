@@ -28,13 +28,23 @@ func reviewTarget(worktree, prURL string, pr int) (owner, repo string, number in
 	owner, repo = remotes[0].owner, remotes[0].repo
 	if prURL != "" {
 		if uo, ur, un, good := review.ParsePRURL(prURL); good {
-			if strings.EqualFold(uo, owner) && strings.EqualFold(ur, repo) {
-				number = un
-			} else {
-				// Defense-in-depth: the URL named some other repo (possibly
-				// another worktree remote). It must not donate its number to
-				// the primary repo — that is the chimera shape again, one
-				// remote over.
+			// ADR-0023 + owner directive (2026-10-10): a worktree may carry
+			// remotes under any name (upstream, a fork remote, a deploy name);
+			// a scraped URL that names ANY of them is a real link the agent
+			// opened in this worktree, so it donates its number to THAT remote's
+			// repo. A scrape matching NO configured remote is the chimera shape
+			// (foreign repo) and stays divergent. prURL reaching here is already
+			// acceptPRURL-validated, so it matches a configured remote by
+			// construction; the loop re-checks defensively so an un-gated caller
+			// still cannot arm a repo the worktree does not own.
+			matched := false
+			for _, rm := range remotes {
+				if strings.EqualFold(rm.owner, uo) && strings.EqualFold(rm.repo, ur) {
+					owner, repo, number, matched = rm.owner, rm.repo, un, true
+					break
+				}
+			}
+			if !matched {
 				divergent = true
 			}
 		}
