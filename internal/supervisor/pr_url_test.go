@@ -25,6 +25,9 @@ func prFixture(t *testing.T) (*Supervisor, string) {
 	testEnv(t)
 
 	dir := t.TempDir()
+	// ADR-0023: a scraped URL is stored only when its owner/repo matches a
+	// worktree remote, so the fixture carries the matching remote.
+	gitWorktree(t, dir, "https://github.com/Belphemur/XPoint.git")
 	sess := filepath.Join(dir, "session.jsonl")
 	if err := os.WriteFile(sess, []byte(`{"content":"round 1 started"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)

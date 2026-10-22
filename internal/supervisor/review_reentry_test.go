@@ -77,6 +77,7 @@ func TestReviewReentryDoneJobRunsCampaign(t *testing.T) {
 	pi := fakePiPath(t)
 
 	dir := t.TempDir()
+	gitWorktree(t, dir, "https://github.com/Belphemur/flambette.git") // ADR-0023: the review target comes from the worktree remote
 	brief := filepath.Join(dir, "brief.md")
 	if err := os.WriteFile(brief, []byte("TEST_SLOW SECS=1"), 0o644); err != nil {
 		t.Fatal(err)
@@ -167,6 +168,7 @@ func TestStartStillRefusesDoneWithoutCampaign(t *testing.T) {
 	pi := fakePiPath(t)
 
 	dir := t.TempDir()
+	gitWorktree(t, dir, "https://github.com/Belphemur/flambette.git") // ADR-0023: the review target comes from the worktree remote
 	brief := filepath.Join(dir, "brief.md")
 	if err := os.WriteFile(brief, []byte("TEST_SLOW SECS=1"), 0o644); err != nil {
 		t.Fatal(err)
@@ -200,6 +202,7 @@ func TestStartWithCampaignEntersReviewing(t *testing.T) {
 	pi := fakePiPath(t)
 
 	dir := t.TempDir()
+	gitWorktree(t, dir, "https://github.com/Belphemur/flambette.git") // ADR-0023: the review target comes from the worktree remote
 	brief := filepath.Join(dir, "brief.md")
 	if err := os.WriteFile(brief, []byte("TEST_SLOW SECS=1"), 0o644); err != nil {
 		t.Fatal(err)
@@ -266,6 +269,7 @@ func TestFinishSpendsCampaignButStopDoesNot(t *testing.T) {
 	pi := fakePiPath(t)
 
 	dir := t.TempDir()
+	gitWorktree(t, dir, "https://github.com/Belphemur/flambette.git") // ADR-0023: the review target comes from the worktree remote
 	brief := filepath.Join(dir, "brief.md")
 	if err := os.WriteFile(brief, []byte("TEST_SLOW SECS=1"), 0o644); err != nil {
 		t.Fatal(err)

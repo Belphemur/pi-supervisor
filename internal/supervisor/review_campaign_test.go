@@ -172,20 +172,9 @@ func TestRemoteRepoFallsBackToNonOriginRemote(t *testing.T) {
 	}
 }
 
-// A scraped pr_url is authoritative: it is the PR the job actually opened, so
-// it outranks a manual --pr and the worktree remote.
-func TestReviewTargetPrefersScrapedURL(t *testing.T) {
-	o, rp, pr, ok := reviewTarget("", "https://github.com/Belphemur/sdk/pull/184", 0)
-	if !ok || o != "Belphemur" || rp != "sdk" || pr != 184 {
-		t.Fatalf("reviewTarget = %s/%s#%d ok=%v", o, rp, pr, ok)
-	}
-	// An explicit --pr overrides the NUMBER but not the repo.
-	o, rp, pr, ok = reviewTarget("", "https://github.com/Belphemur/sdk/pull/184", 200)
-	if !ok || pr != 200 || rp != "sdk" {
-		t.Fatalf("explicit --pr = %s/%s#%d ok=%v", o, rp, pr, ok)
-	}
-	// No URL and no worktree: nothing to derive.
-	if _, _, _, ok := reviewTarget("", "", 43); ok {
-		t.Fatal("reviewTarget invented a target with no URL and no worktree")
-	}
-}
+// reviewTarget's authority order is ADR-0023 now: the worktree's git remote
+// decides owner/repo, and a scraped URL donates only its NUMBER (and only
+// when it names the same repo). Those properties live in pr_url_gate_test.go
+// (TestReviewTargetRepoComesFromRemoteNotScrapedURL and friends); the old
+// "scraped URL is authoritative" test asserted the defect the chimera
+// campaign (addictedproxy-llm-seo2, nuxt/nuxt#3237) exposed.

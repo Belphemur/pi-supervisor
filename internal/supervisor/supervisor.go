@@ -1351,9 +1351,7 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 			}
 			sc := r.prScanner
 			r.mu.Unlock()
-			if u := sc.PRURL(); u != "" {
-				s.recordPR(r, u)
-			}
+			s.recordScrapedPR(r, sc)
 		}
 
 		// Model identity (ADR-0021): scanned whenever a session exists,
@@ -2748,7 +2746,7 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 	// on the round AFTER the one that opened it.
 	defer func() {
 		d.Poll() // final verdict is irrelevant; only the PR scrape matters
-		s.recordPR(r, d.PRURL())
+		s.recordScrapedPR(r, d)
 	}()
 	for {
 		select {
@@ -2758,7 +2756,7 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 			return
 		case <-t.C:
 			stalled, marker := d.Poll()
-			s.recordPR(r, d.PRURL())
+			s.recordScrapedPR(r, d)
 			if !stalled {
 				continue
 			}
@@ -2885,12 +2883,22 @@ func equalStrings(a, b []string) bool {
 }
 
 // recordPR stores the first pull-request URL seen in the round's transcript
-// on the runner (ADR-0006). Best-effort and eventually consistent: an empty
-// url means "not linked", never "no PR exists". Lock order stays s.mu -> r.mu:
-// this is called from the watcher goroutine with neither held.
-func (s *Supervisor) recordPR(r *runner, url string) {
+// on the runner (ADR-0006), GATED by ADR-0023: the URL is stored only when
+// its owner/repo matches one of the worktree's GitHub remotes. A transcript
+// link is untrusted — the agent may cite a PR it merely read — and a stored
+// foreign URL would arm a review campaign on the wrong repo (the
+// addictedproxy-llm-seo2 chimera: nuxt/nuxt#3237 from a scraped nuxt URL plus
+// a manual --pr 3237). A rejected URL changes nothing — no state, no log —
+// and the caller feeds it back to the scraper (SkipPRURL) so the scrape keeps
+// looking. Best-effort and eventually consistent: an empty url means "not
+// linked", never "no PR exists". Lock order stays s.mu -> r.mu: this is
+// called from the watcher goroutine with neither held.
+func (s *Supervisor) recordPR(r *runner, url string) bool {
 	if url == "" {
-		return
+		return false
+	}
+	if !acceptPRURL(url, r.job.Worktree) {
+		return false
 	}
 	r.mu.Lock()
 	fresh := r.state.PRURL != url
@@ -2901,6 +2909,24 @@ func (s *Supervisor) recordPR(r *runner, url string) {
 	r.mu.Unlock()
 	if fresh {
 		s.logf(name, "pull request: %s", url)
+	}
+	return true
+}
+
+// prScraper is either scrape mechanism (the stall Detector and the
+// PRURLScanner): it latches a PR URL and can be told to forget one the
+// ADR-0023 gate rejected, so the scrape keeps looking for a matching link.
+type prScraper interface {
+	PRURL() string
+	SkipPRURL(url string)
+}
+
+// recordScrapedPR funnels one scraped URL through the recordPR gate; on
+// rejection the scraper forgets the URL so a later matching link can latch.
+func (s *Supervisor) recordScrapedPR(r *runner, sc prScraper) {
+	u := sc.PRURL()
+	if u != "" && !s.recordPR(r, u) {
+		sc.SkipPRURL(u)
 	}
 }
 

@@ -13,49 +13,77 @@ var scpLike = regexp.MustCompile(`^(?:[\w.-]+@)?([\w.-]+):(.+)$`)
 
 // reviewTarget resolves the GitHub owner/repo/PR a review campaign operates on.
 //
-// DRY: the PR's owner and repo are read out of the ALREADY-scraped pr_url
-// (ADR-0006) when the agent linked one, and only fall back to `git remote`
-// for a manual `review --pr N` on a job that never linked a URL. Two sources
-// for one fact would be a DRY violation; this is an ordered fallback, and the
-// scraped URL always wins because it is the PR the job actually opened.
-func reviewTarget(worktree, prURL string, pr int) (owner, repo string, number int, ok bool) {
+// ADR-0023: the worktree's git remote is the AUTHORITY for owner/repo — a
+// transcript link is untrusted (the agent may cite a PR it merely read; the
+// addictedproxy-llm-seo2 campaign armed nuxt/nuxt#3237 from a scraped nuxt
+// URL plus a manual --pr 3237). The scraped URL donates only its NUMBER, and
+// only when it names the same repo the remote decided; --pr overrides the
+// number. divergent reports "the URL named some other repo" so the caller can
+// log a note — the flag never changes the decision.
+func reviewTarget(worktree, prURL string, pr int) (owner, repo string, number int, ok bool, divergent bool) {
+	remotes := githubRemotes(worktree)
+	if len(remotes) == 0 {
+		return "", "", 0, false, false
+	}
+	owner, repo = remotes[0].owner, remotes[0].repo
 	if prURL != "" {
-		if o, rp, n, good := review.ParsePRURL(prURL); good {
-			if pr > 0 {
-				n = pr
+		if uo, ur, un, good := review.ParsePRURL(prURL); good {
+			if uo == owner && ur == repo {
+				number = un
+			} else {
+				// Defense-in-depth: the URL named some other repo (possibly
+				// another worktree remote). It must not donate its number to
+				// the primary repo — that is the chimera shape again, one
+				// remote over.
+				divergent = true
 			}
-			return o, rp, n, true
 		}
 	}
-	o, rp, good := remoteRepo(worktree)
-	if !good {
-		return "", "", 0, false
+	if pr > 0 {
+		number = pr
 	}
-	return o, rp, pr, pr > 0
+	return owner, repo, number, number > 0, divergent
 }
 
-// remoteRepo derives owner/repo from the worktree's git remotes — origin
-// first, then any other remote. A worktree may legitimately use a different
-// remote name (upstream, a fork remote, a deploy name); the review must work
-// for ANY repo the job happens to sit in (owner directive 2026-10-10), so a
-// non-origin name is never a dead end.
-func remoteRepo(worktree string) (owner, repo string, ok bool) {
+// acceptPRURL reports whether a scraped PR URL may be stored on state.PRURL
+// (ADR-0023): its owner/repo must match ONE of the worktree's GitHub remotes.
+// Local-only — `git remote`, no network, no gh — consistent with ADR-0006.
+func acceptPRURL(raw, worktree string) bool {
+	uo, ur, _, ok := review.ParsePRURL(raw)
+	if !ok {
+		return false
+	}
+	for _, rm := range githubRemotes(worktree) {
+		if rm.owner == uo && rm.repo == ur {
+			return true
+		}
+	}
+	return false
+}
+
+// githubRemotes lists the worktree's GitHub remotes as owner/repo pairs —
+// origin first, then any other remote. A worktree may legitimately use a
+// different remote name (upstream, a fork remote, a deploy name); the review
+// must work for ANY repo the job happens to sit in (owner directive
+// 2026-10-10), so a non-origin name is never a dead end.
+func githubRemotes(worktree string) []ghRemote {
 	if worktree == "" {
-		return "", "", false
+		return nil
 	}
 	run := func(args ...string) ([]byte, error) {
 		cmd := exec.Command("git", append([]string{"-C", worktree}, args...)...)
 		cmd.Env = envWithoutGitVars() // GIT_DIR from a hook env redirects -C at the wrong repo
 		return cmd.Output()
 	}
+	var remotes []ghRemote
 	if out, err := run("remote", "get-url", "origin"); err == nil {
 		if o, r, good := parseGitRemote(strings.TrimSpace(string(out))); good {
-			return o, r, true
+			remotes = append(remotes, ghRemote{o, r})
 		}
 	}
 	out, err := run("remote", "-v")
 	if err != nil {
-		return "", "", false
+		return remotes
 	}
 	seen := map[string]bool{}
 	for line := range strings.SplitSeq(string(out), "\n") {
@@ -70,10 +98,23 @@ func remoteRepo(worktree string) (owner, repo string, ok bool) {
 		}
 		seen[u] = true
 		if o, r, good := parseGitRemote(u); good {
-			return o, r, true
+			remotes = append(remotes, ghRemote{o, r})
 		}
 	}
-	return "", "", false
+	return remotes
+}
+
+// ghRemote is one parsed GitHub remote of the worktree.
+type ghRemote struct{ owner, repo string }
+
+// remoteRepo derives owner/repo from the worktree's git remotes — origin
+// first, then any other remote.
+func remoteRepo(worktree string) (owner, repo string, ok bool) {
+	remotes := githubRemotes(worktree)
+	if len(remotes) == 0 {
+		return "", "", false
+	}
+	return remotes[0].owner, remotes[0].repo, true
 }
 
 // parseGitRemote extracts owner/repo from any of the shapes git emits:

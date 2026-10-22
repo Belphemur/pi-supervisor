@@ -3,7 +3,6 @@ package stall
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -11,14 +10,21 @@ import (
 // production uses. The one-shot PRURLFrom they used to exercise is gone: the
 // gate keeps a scanner per job, so the one-shot form had no production caller.
 
+// writePRLines appends JSONL lines to p, mirroring how a live session
+// transcript grows under pi (append-only tail). Truncating would reset the
+// byte offsets these scanners tail on and hide already-written content from a
+// Detector created at EOF (see TestDetectorSkipsRejectedURLAndKeepsLooking).
 func writePRLines(t *testing.T, p string, lines ...string) {
 	t.Helper()
-	var b strings.Builder
-	for _, l := range lines {
-		b.WriteString(l + "\n")
-	}
-	if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
 		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, l := range lines {
+		if _, err := f.WriteString(l + "\n"); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

@@ -42,11 +42,16 @@ func (s *Supervisor) autoReviewHandoff(name string, r *runner) bool {
 			"auto review skipped: no GitHub PR was linked in the transcript")
 		return false
 	}
-	owner, repo, pr, ok := reviewTarget(worktree, prURL, 0)
+	owner, repo, pr, ok, divergent := reviewTarget(worktree, prURL, 0)
 	if !ok {
 		s.emit(name, "review_skipped", 0, 0, 0, "",
 			"auto review skipped: cannot parse a PR number out of %q", prURL)
 		return false
+	}
+	if divergent {
+		// ADR-0023 defense-in-depth: the stored URL names another repo; the
+		// worktree remote already decided owner/repo, the URL was ignored.
+		s.logf(name, "auto review: pr_url %q does not name %s/%s; the worktree remote is the authority (ADR-0023)", prURL, owner, repo)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
