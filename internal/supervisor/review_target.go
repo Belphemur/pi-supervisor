@@ -28,7 +28,7 @@ func reviewTarget(worktree, prURL string, pr int) (owner, repo string, number in
 	owner, repo = remotes[0].owner, remotes[0].repo
 	if prURL != "" {
 		if uo, ur, un, good := review.ParsePRURL(prURL); good {
-			if uo == owner && ur == repo {
+			if strings.EqualFold(uo, owner) && strings.EqualFold(ur, repo) {
 				number = un
 			} else {
 				// Defense-in-depth: the URL named some other repo (possibly
@@ -54,7 +54,7 @@ func acceptPRURL(raw, worktree string) bool {
 		return false
 	}
 	for _, rm := range githubRemotes(worktree) {
-		if rm.owner == uo && rm.repo == ur {
+		if strings.EqualFold(rm.owner, uo) && strings.EqualFold(rm.repo, ur) {
 			return true
 		}
 	}

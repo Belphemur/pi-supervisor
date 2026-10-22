@@ -95,3 +95,28 @@ func TestScannerSkippedURLDoesNotHideLaterLink(t *testing.T) {
 		t.Fatalf("PRURL = %q, want the non-skipped link", got)
 	}
 }
+
+// ADR-0023 scrape-side: when the newest latched URL is rejected, the Scanner
+// rewinds its read window and re-picks an earlier, non-skipped link from the
+// SAME read — a surviving link is not committed past by an incremental offset.
+// Without the rewind, SkipPRURL just clears the latch and the next PRURL()
+// short-circuits on the cached "" (no new bytes), so the earlier link is lost.
+func TestScannerRejectedNewestRewindsToEarlierLink(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "s.jsonl")
+	// #7 (matching) is written BEFORE nuxt/36542 (foreign); nuxt is newest, so
+	// the backward scan latches it first.
+	writePRLines(t, p, `{"content":"opened https://github.com/owner/project/pull/7 while reading https://github.com/nuxt/nuxt/pull/36542"}`)
+	s := NewPRURLScanner(p)
+
+	newest := "https://github.com/nuxt/nuxt/pull/36542"
+	if got := s.PRURL(); got != newest {
+		t.Fatalf("PRURL = %q, want the newest link %q", got, newest)
+	}
+
+	// Reject the newest; the rewind must surface the surviving earlier link.
+	s.SkipPRURL(newest)
+	if got := s.PRURL(); got != "https://github.com/owner/project/pull/7" {
+		t.Fatalf("PRURL after skip = %q, want the surviving earlier link", got)
+	}
+}

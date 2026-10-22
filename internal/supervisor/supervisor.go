@@ -2897,15 +2897,29 @@ func (s *Supervisor) recordPR(r *runner, url string) bool {
 	if url == "" {
 		return false
 	}
-	if !acceptPRURL(url, r.job.Worktree) {
+	// Short-circuit when the URL is already stored: the polled watchdog and the
+	// recordScrapedPR re-pull both hand us URLs every tick, so a stored PR URL
+	// would otherwise re-run acceptPRURL (a `git remote` fork) on every call.
+	// state.PRURL is only ever set to an ACCEPTED url, so an equal value is
+	// provably accepted and needs no re-validation (ADR-0023 perf).
+	r.mu.Lock()
+	if r.state.PRURL == url {
+		r.mu.Unlock()
+		return true
+	}
+	// r.job is replaced by Reload under r.mu; read fields here rather than past
+	// the acceptPRURL call so the git fork never races with a Reload write.
+	worktree := r.job.Worktree
+	name := r.job.Name
+	r.mu.Unlock()
+	if !acceptPRURL(url, worktree) {
 		return false
 	}
 	r.mu.Lock()
-	fresh := r.state.PRURL != url
+	fresh := r.state.PRURL != url // re-check: a concurrent caller may have stored it
 	if fresh {
 		r.state.PRURL = url
 	}
-	name := r.job.Name
 	r.mu.Unlock()
 	if fresh {
 		s.logf(name, "pull request: %s", url)
@@ -2922,10 +2936,24 @@ type prScraper interface {
 }
 
 // recordScrapedPR funnels one scraped URL through the recordPR gate; on
-// rejection the scraper forgets the URL so a later matching link can latch.
+// rejection the scraper forgets the URL so a surviving matching link can latch
+// instead. It re-pulls immediately after each rejection: the PRURLScanner is
+// one-shot per round-start call, and a matching link written before a rejected
+// one sits in already-read bytes — without a re-pull it would not be stored
+// until the next tick.
+//
+// The loop always terminates: recordPR short-circuits on a stored URL, and the
+// skipped set only grows (SkipPRURL rewinds the read window but never re-latches
+// a rejected URL), so PRURL() eventually returns "".
 func (s *Supervisor) recordScrapedPR(r *runner, sc prScraper) {
-	u := sc.PRURL()
-	if u != "" && !s.recordPR(r, u) {
+	for {
+		u := sc.PRURL()
+		if u == "" {
+			return
+		}
+		if s.recordPR(r, u) {
+			return
+		}
 		sc.SkipPRURL(u)
 	}
 }

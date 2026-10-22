@@ -330,6 +330,14 @@ func (s *PRURLScanner) PRURL() string {
 // SkipPRURL records a URL the supervisor's recordPR gate REJECTED (ADR-0023).
 // If it is the current latch it is dropped, so a later matching link can
 // replace it; the URL is never re-latched afterwards.
+//
+// The read offset is rewound by the overlap window so the next PRURL() re-covers
+// the byte region that produced the rejected latch. The backward scan
+// (slices.Backward, newest-first) then skips the rejected URL and picks a
+// surviving matching link written before it — one that a single incremental
+// read would otherwise commit past. Bounded by prOverlapBytes and clamped at 0,
+// so it re-reads at most one overlap window; the skipped set only grows, so
+// the scan always terminates on a non-skipped URL or an empty pull.
 func (s *PRURLScanner) SkipPRURL(url string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -339,6 +347,11 @@ func (s *PRURLScanner) SkipPRURL(url string) {
 	s.skipped[url] = true
 	if s.last == url {
 		s.last = ""
+	}
+	if s.offset > prOverlapBytes {
+		s.offset -= prOverlapBytes
+	} else {
+		s.offset = 0
 	}
 }
 

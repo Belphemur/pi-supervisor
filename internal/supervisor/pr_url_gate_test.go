@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"pi-supervisor/internal/job"
+	"pi-supervisor/internal/stall"
 )
 
 // gitWorktree turns dir into a git repo carrying the given GitHub remotes
@@ -196,5 +197,88 @@ func TestReviewTargetWithoutRemoteIsNotOK(t *testing.T) {
 	}
 	if _, _, _, ok, _ := reviewTarget("", "", 43); ok {
 		t.Fatal("reviewTarget invented a target with no URL and no worktree")
+	}
+}
+
+// run a git command against dir with GIT_* scrubbed so an inherited GIT_DIR
+// (this test can run under pre-push) cannot redirect it at the real repo.
+func gitDir(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = envWithoutGitVars()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// appendSession mirrors stall.writePRLines (append-only) from the supervisor
+// package, which cannot see the unexported helper.
+func appendSession(t *testing.T, path, line string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ADR-0023: GitHub owner/repo are case-insensitive. A remote cloned as
+// Belphemur/pi-supervisor must accept a scraped link citing belphemur/
+// pi-supervisor (and vice-versa) — the two casings of one URL must not be
+// dropped as a "chimera" of a different repo.
+func TestRecordPRAcceptsCaseInsensitiveRemoteMatch(t *testing.T) {
+	s, r := prGateFixture(t, "https://github.com/Belphemur/pi-supervisor.git")
+	url := "https://github.com/belphemur/pi-supervisor/pull/7"
+	if !s.recordPR(r, url) {
+		t.Fatal("recordPR rejected a case-insensitive remote match (ADR-0023)")
+	}
+	r.mu.Lock()
+	got := r.state.PRURL
+	r.mu.Unlock()
+	if got != url {
+		t.Fatalf("PRURL = %q, want %q", got, url)
+	}
+}
+
+// recordPR short-circuits on a URL already stored, so the polled watchdog
+// (which rescrapes every tick) does NOT fork `git remote` on every round trip.
+// Proved by breaking the worktree's remote after the first call: a
+// non-short-circuited call would now fail acceptPRURL, but the store must still
+// return true without running git.
+func TestRecordPRShortCircuitsStoredURL(t *testing.T) {
+	s, r := prGateFixture(t, "https://github.com/owner/project.git")
+	url := "https://github.com/owner/project/pull/7"
+	if !s.recordPR(r, url) {
+		t.Fatal("first recordPR rejected a matching URL")
+	}
+	gitDir(t, r.job.Worktree, "remote", "remove", "origin") // worktree now has no remote
+	if !s.recordPR(r, url) {
+		t.Fatal("recordPR re-ran git on a stored URL instead of short-circuiting")
+	}
+}
+
+// ADR-0023 threads: a NEWER foreign link must not mask an earlier matching one
+// in the same read. recordScrapedPR re-pulls after a rejection, and the Scanner
+// rewinds its read window on skip, so the surviving link latches within the same
+// gate pass — not on the next tick.
+func TestRecordScrapedPRLoopsToSurvivingLink(t *testing.T) {
+	s, r := prGateFixture(t, "https://github.com/owner/project.git")
+	// #7 (matching) precedes nuxt/36542 (foreign); the backward scan latches the
+	// newest (nuxt) first, the gate rejects it, the rewind recovers #7.
+	const line = `{"content":"opened https://github.com/owner/project/pull/7 while reading https://github.com/nuxt/nuxt/pull/36542"}`
+	appendSession(t, r.job.SessionPath, line)
+
+	sc := stall.NewPRURLScanner(r.job.SessionPath)
+	s.recordScrapedPR(r, sc)
+
+	r.mu.Lock()
+	got := r.state.PRURL
+	r.mu.Unlock()
+	want := "https://github.com/owner/project/pull/7"
+	if got != want {
+		t.Fatalf("recordScrapedPR lost the surviving link: state.PRURL = %q, want %q", got, want)
 	}
 }

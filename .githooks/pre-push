@@ -93,7 +93,7 @@ fi
 
 step "shell syntax"
 bash -n install/install.sh || fail=1
-bash -n doc/skill/pi_supervisor_review/_pi-supervisor-review || fail=1
+bash -n doc/skill/pi-supervisor-review/_pi-supervisor-review || fail=1
 bash -n .githooks/pre-push || fail=1
 
 step "test -race"
