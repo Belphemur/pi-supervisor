@@ -165,6 +165,97 @@ def test_status_non_json_stdout_is_an_error(results_dir, monkeypatch):
     assert "single JSON document" in payload["error"]
 
 
+# --------------------------------------------------------------------------
+# pi_job (ADR-0024) — typed job-def surface; the invented-key class cannot
+# be constructed through it.
+# --------------------------------------------------------------------------
+
+def test_job_create_builds_typed_argv(results_dir, monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **_kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(
+            argv, 0, "job def written: /x/demo.json\nnext: pi-supervisor reload", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    payload = json.loads(plugin._pi_job({
+        "verb": "create", "name": "demo",
+        "brief": "/tmp/b.md", "cont": "/tmp/c.txt", "marker": "M_DONE",
+        "worktree": "/tmp/wt", "skills": "skillA, skillB",
+        "max_rounds": 6, "final_report": "/tmp/r.md",
+    }))
+    assert seen["argv"] == [
+        plugin.CLI, "job", "create", "demo",
+        "--brief", "/tmp/b.md", "--cont", "/tmp/c.txt",
+        "--marker", "M_DONE", "--worktree", "/tmp/wt",
+        "--final-report", "/tmp/r.md",
+        "--skills", "skillA, skillB",
+        "--max-rounds", "6",
+    ]
+    assert payload["ok"] is True
+    assert "pi_start" in payload["next"]
+
+
+def test_job_create_omits_unset_optionals(results_dir, monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **_kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    plugin._pi_job({
+        "verb": "create", "name": "demo",
+        "brief": "/b", "cont": "/c", "marker": "M", "worktree": "/w",
+    })
+    argv = seen["argv"]
+    assert "--force" not in argv
+    assert "--max-rounds" not in argv  # the CLI's flag default applies
+    assert "--provider" not in argv
+
+
+def test_job_create_missing_required_never_runs_cli(results_dir, monkeypatch):
+    def fake_run(argv, **_kw):
+        raise AssertionError("CLI must not run for a usage error")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    payload = json.loads(plugin._pi_job({"verb": "create", "name": "demo"}))
+    assert payload["ok"] is False
+    assert payload["usage_error"] is True
+    assert "--brief" in payload["error"] and "--marker" in payload["error"]
+
+
+def test_job_create_rejects_path_separators(results_dir, monkeypatch):
+    def fake_run(argv, **_kw):
+        raise AssertionError("CLI must not run for a usage error")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    payload = json.loads(plugin._pi_job({
+        "verb": "create", "name": "a/b", "brief": "/b", "cont": "/c",
+        "marker": "M", "worktree": "/w",
+    }))
+    assert payload["ok"] is False and payload["usage_error"] is True
+
+
+def test_job_list_and_show_reach_the_cli(results_dir, monkeypatch):
+    seen = []
+
+    def fake_run(argv, **_kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "JOBS", "")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    assert json.loads(plugin._pi_job({"verb": "list"}))["ok"] is True
+    assert json.loads(plugin._pi_job({"verb": "show", "job": "j"}))["ok"] is True
+    assert seen == [[plugin.CLI, "job", "list"], [plugin.CLI, "job", "show", "j"]]
+
+
+def test_job_unknown_verb_is_usage_error(results_dir, monkeypatch):
+    payload = json.loads(plugin._pi_job({"verb": "teleport"}))
+    assert payload["ok"] is False and payload["usage_error"] is True
+
+
 def test_steer_flag_order_and_message(results_dir, monkeypatch):
     seen = {}
 
@@ -586,8 +677,8 @@ def test_register_registers_all_tools_and_command():
 
     plugin.register(RegCtx())
     assert registered["tools"] == [
-        "pi_status", "pi_steer", "pi_logs", "pi_start", "pi_review",
-        "pi_ack", "pi_watch", "pi_watch_probe",
+        "pi_status", "pi_steer", "pi_logs", "pi_start", "pi_job",
+        "pi_review", "pi_ack", "pi_watch", "pi_watch_probe",
     ]
     assert registered["commands"] == ["piwatch"]
     assert set(registered["toolsets"]) == {"pi_supervisor"}

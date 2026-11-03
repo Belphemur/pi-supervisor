@@ -312,6 +312,85 @@ def _pi_start(args, **_kw):
     return _dump(payload)
 
 
+def _pi_job(args, **_kw):
+    """pi_job(verb='list'|'show'|'create', ...) -> `pi-supervisor job ...` (ADR-0024).
+
+    create takes the job-def fields as TYPED arguments — the canonical key
+    names are the flag names, so the invented-key class that silently dropped
+    `brief_path`/`report` (mem-claims-analysis, 2026-11-03) cannot be
+    constructed through this tool. The CLI re-validates: required fields,
+    prompt files on disk, --force for overwrite. After a successful create,
+    the def is registered by `pi_start(job, reload=true)` — the daemon loads
+    job definitions ONLY on reload.
+    """
+    a = args or {}
+    verb = (a.get("verb") or "list").lower()
+    if verb == "list":
+        payload, _ = run_cli(["job", "list"])
+        return _dump(payload)
+    if verb == "show":
+        job = a.get("job") or ""
+        err = _job(job)
+        if err:
+            return _dump({"ok": False, "usage_error": True, "error": err})
+        payload, _ = run_cli(["job", "show", job])
+        return _dump(payload)
+    if verb != "create":
+        return _dump({
+            "ok": False, "usage_error": True,
+            "error": "verb must be list, show or create",
+        })
+
+    name = a.get("name") or ""
+    if not name or re.search(r"[/\\]", name) or name in (".", ".."):
+        return _dump({
+            "ok": False, "usage_error": True,
+            "error": "create needs a plain job name (no path separators)",
+        })
+    required = {
+        "brief": a.get("brief"), "cont": a.get("cont"),
+        "marker": a.get("marker"), "worktree": a.get("worktree"),
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        return _dump({
+            "ok": False, "usage_error": True,
+            "error": "create requires " + ", ".join("--" + m for m in missing),
+        })
+    argv = [
+        "job", "create", name,
+        "--brief", required["brief"], "--cont", required["cont"],
+        "--marker", required["marker"], "--worktree", required["worktree"],
+    ]
+    # Only pass what the caller set: the CLI's flag defaults (max-rounds 200,
+    # timeout-s 1800, backoff-scale 1.0) are the documented zeros.
+    optional = (
+        ("final-report", a.get("final_report")),
+        ("session-name", a.get("session_name")),
+        ("skills", a.get("skills")),
+        ("pi-bin", a.get("pi_bin")),
+        ("provider", a.get("provider")),
+        ("model", a.get("model")),
+        ("review-brief", a.get("review_brief")),
+        ("max-rounds", a.get("max_rounds")),
+        ("timeout-s", a.get("timeout_s")),
+        ("ci-stall-cap", a.get("ci_stall_cap")),
+        ("ci-stall-idle-s", a.get("ci_stall_idle_s")),
+        ("empty-turn-idle-s", a.get("empty_turn_idle_s")),
+        ("backoff-scale", a.get("backoff_scale")),
+    )
+    for flag, value in optional:
+        if value is None or value == "":
+            continue
+        argv += ["--" + flag, str(value)]
+    if a.get("force"):
+        argv.append("--force")
+    payload, _ = run_cli(argv)
+    if payload.get("ok"):
+        payload["next"] = "pi_start(job=%r, reload=true)" % name
+    return _dump(payload)
+
+
 def _pi_ack(args, **_kw):
     """pi_ack(job, event_id) -> `pi-supervisor ack <job> --event <id>`.
 
@@ -620,6 +699,47 @@ def register(ctx):
             "required": ["job"],
         },
         handler=_pi_start,
+    )
+    ctx.register_tool(
+        name="pi_job",
+        toolset=TOOLSET,
+        schema={
+            **_TOOL_SCHEMA_BASE,
+            "description": (
+                "Manage job definitions WITHOUT hand-writing JSON (ADR-0024): "
+                "verb=create writes <name>.json from typed fields (brief, "
+                "cont, marker, worktree required; the CLI validates prompt "
+                "files and refuses to overwrite without force) — canonical "
+                "key names only, invented keys cannot be constructed; "
+                "verb=list lists defs (INVALID ones named with the reason); "
+                "verb=show prints one def as normalized JSON. Register a "
+                "freshly created def with pi_start(job, reload=true)."
+            ),
+            "properties": {
+                "verb": {"type": "string", "enum": ["list", "show", "create"]},
+                "name": {"type": "string", "description": "job name (create/show)"},
+                "brief": {"type": "string", "description": "entry prompt file path (create, required)"},
+                "cont": {"type": "string", "description": "continuation prompt file path (create, required)"},
+                "marker": {"type": "string", "description": "completion marker (create, required)"},
+                "worktree": {"type": "string", "description": "worktree path (create, required)"},
+                "final_report": {"type": "string"},
+                "session_name": {"type": "string"},
+                "skills": {"type": "string", "description": "comma-separated skill list"},
+                "pi_bin": {"type": "string"},
+                "provider": {"type": "string"},
+                "model": {"type": "string"},
+                "review_brief": {"type": "string", "description": "review-campaign entry prompt (ADR-0018)"},
+                "max_rounds": {"type": "integer"},
+                "timeout_s": {"type": "integer"},
+                "ci_stall_cap": {"type": "integer"},
+                "ci_stall_idle_s": {"type": "integer"},
+                "empty_turn_idle_s": {"type": "integer"},
+                "backoff_scale": {"type": "number"},
+                "force": {"type": "boolean", "description": "overwrite an existing def"},
+            },
+            "required": [],
+        },
+        handler=_pi_job,
     )
     ctx.register_tool(
         name="pi_review",
