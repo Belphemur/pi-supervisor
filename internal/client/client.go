@@ -140,6 +140,9 @@ func Run(o Options) Result {
 	if cmd.Dir == "" {
 		cmd.Dir = "."
 	}
+	// DIAG: make spawn-time failures visible (2026-11-03 mem-claims instant
+	// rc=1 with an empty runlog and no pi invocation).
+	fmt.Fprintf(o.Diag, "[diag] spawn bin=%q dir=%q argv=%v\n", o.PiBin, cmd.Dir, rpcArgs(o))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fail(start, res, fmt.Sprintf("stdin pipe: %v", err))

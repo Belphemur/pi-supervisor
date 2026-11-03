@@ -2313,6 +2313,9 @@ func (s *Supervisor) round(r *runner, round int, stopCh chan struct{}) (rc int, 
 
 	out, err := os.OpenFile(runlog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
+		// 2026-11-03: this return was silent — an unwritable runlog path
+		// looked exactly like a pi spawn failure (rc=1, 0s, empty runlog).
+		s.logf(j.Name, "round %d: cannot open runlog %s: %v", round, runlog, err)
 		return 1, 0, 0
 	}
 	// The budget's "did this round produce anything" signal must describe

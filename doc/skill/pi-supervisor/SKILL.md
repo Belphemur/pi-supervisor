@@ -346,7 +346,7 @@ Behavior:
 |---|---|
 | job ends `fatal` with "round cap reached without marker" but the work is visibly finished and a PR exists | **pre-ADR-0020 diagnosis.** On an ADR-0020 daemon the fatal names the marker's non-text surfaces (thinking blocks, toolCall args) when they exist, and a report-complete run closes done at the boundary — upgrade. Verify on the old daemon with the `pi-supervisor-forensics` marker-surface classifier before touching code |
 | `status` shows `marker_found: true` but the job is not `done` | the marker was seen but `final_report` does not exist yet. ADR-0020: the daemon asks twice (`report_requested` events, `report_steers` in status) and then fatals — check `report_steers`; if it is still 0 with rounds lasting seconds, the steer window is too short (known design limit for sub-second rounds; real rounds are minutes) |
-| job state `fatal`, diag "3 consecutive instant exits" | session context wall — start a fresh session (new job or clear state) or trim the session |
+| job state `fatal`, diag "3 consecutive instant exits" | TWO causes — discriminate by `session_bytes` BEFORE acting. (a) **Context wall**: resumed rounds append nothing (`session_bytes` frozen across rounds); the model call errors instantly → `pi-supervisor restart <job> --fresh`. (b) **Per-call abort**: earlier rounds grew the session, then ONE long foreground command (~8 min: a firmware build, a long suite) is killed mid-run — session tail shows a `Command aborted` toolResult with `stopReason:error` and zero token usage, and the retry loop burns the 3 strikes. `--fresh` alone repeats it; fix the BRIEF's call discipline first (see the long-command pitfall below), then restart fresh |
 | `status` says fatal but the armed watch never reported it | the watch was a one-shot (no `-t`): it exits after its FIRST event (`round_done`/`backoff`) and must be re-armed — the fatal after that had no listener. Arm `watch -t` (background+notify). If the stream was live across a daemon restart, the client now reconnects and the missed terminal arrives as the precheck (ADR-0015); only a connection that never answered fails at once. |
 | the arm looked correct (`-t`, background+notify) but the terminal event still reached nobody | **First: if the session has the pi-supervisor plugin tools, arm with `pi_watch(job=…)` (ADR-0022) — the flags are set in code and the arm is verified, so this failure class cannot occur.** Otherwise the arm went out SILENT because the tool call lost its parameters: the arming model can OMIT trailing optional params (`notify`, even `background`) while the arguments JSON stays valid (`finish=tool_calls`) — flash-tier models under reasoning load, proven 2026-10-12 by direct OpenRouter repro (0 reasoning tokens → 3/3 params; 117+ → 2/3). The executor applies defaults, so the run is background-silent or foreground. VERIFY every arm: the tool result must say "Background process started" AND `~/.hermes/logs/process-results/<proc>.json` must record `notify_on_complete: true` and the `persist_on_release` flag — if not, re-arm with minimal reasoning (or switch model) before walking away. A foregrounded arm dies at the 600s cap mid-wait. |
 | job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |
@@ -368,6 +368,7 @@ Behavior:
 | `status` shows an empty `pr_url` but a PR is open on GitHub | the daemon scrapes the PR URL from the round's transcript as it tails it (ADR-0006); it only sees URLs the agent *linked* in its messages. A PR opened without the agent writing the `pull/<number>` link — e.g. a toolResult that truncated the URL, or a PR filed by CI/a hook — is not surfaced. An empty field means "not linked in the transcript", not "no PR exists"; link the PR in your next round to have it appear. |
 | `pr_url` empty although `pull/N` IS in the transcript, and auto-review skipped with "no GitHub PR was linked" | the scrape rides on the CI/empty-turn STALL watchers, which are only armed once a transcript path exists (`sess != ""`). On a fresh LAUNCH round the watcher has no path yet, so a URL written during THAT round is missed. Link the PR in a LATER round, or pass `--pr <N>` explicitly rather than relying on `--auto`. |
 | `pr_url` in events/watch names a CLOSED or superseded PR while `review.pr` names the right one | the scrape reads the transcript, which carries every PR link the session ever wrote — stale history leaks into the payload. Trust `review.pr` as the campaign's truth; the SESSION however follows whatever it finds in its own context, so steer the live round to name the intended PR and its head explicitly, or it triages the closed PR's threads instead. |
+| campaign report claims "0 open threads / threads resolved", but GitHub still shows N open | the reviewer's `resolveThread` mutations targeted the scrape's PR URL (often a stale/closed one), so the real PR's threads are untouched. **Always verify on the real repo**: `gh api graphql -f query='query{repository(owner:"<real-owner>",name:"<real-repo>"){pullRequest(number:<N>){reviewThreads(last:100){totalCount}}}}'` — a non-zero count despite a "0 open" report is proof of this. Fix in-band: while a round is LIVE, `steer <job> 'The PR is Belphemur/AddictedProxy#<N> at head <sha> — resolve threads against THAT repo only.'`, then let it re-poll. The campaign's own thread ops are scoped to what the session believes the PR is, so a wrong belief is silently destructive. For a fresh guarantee, re-arm on a NEW job name (clean def load) and `--pr <N>` together with the steer. |
 | review campaign reviewed a STALE branch tip (fixes landed nowhere / on the wrong branch) | the daemon never checks the job's worktree. Before arming `review <job> --pr N`, verify the worktree the session edits is AT the PR head: `git -C <worktree> fetch origin && git log --oneline -1` against the PR's head SHA (mind worktree checkout locks — a branch checked out elsewhere needs `--detach <sha>`). A campaign on an old tip reviews old code and commits to the wrong branch. |
 | `pi-supervisor stop` mid-round and the round's work seems "lost" | stop only SIGTERMs the client group; the round's edits survive as UNCOMMITTED changes in whatever worktree the session was editing. `git status --short` there before concluding the fix vanished — then commit by explicit path. |
 | `empty_turn` fired while the agent was demonstrably working | the detector reads TRANSCRIPT GROWTH, which stops while pi blocks on a child process (`go test -race`, a CI poll, a detached e2e run it launched). It cannot distinguish "model streaming prose" from "agent waiting on a subprocess". Raise the window per job — `empty_turn_idle_s`, default 60s, is tight for build/test work; 300s suits a job that waits on children. Known design limit, not a misfire. |
@@ -379,9 +380,46 @@ Behavior:
 
 ## Pitfalls (from the bash era, still true)
 
+- **Job-def key names are the Job struct's JSON tags** (`internal/job/job.go`):
+  `name`, `brief`, `cont`, `final_report`, `marker`, `worktree`, `max_rounds`,
+  `timeout_s`, `skills`, `pi_bin`, `backoff_scale`. Keys like `job`,
+  `brief_path`, `cont_path`, `report` are SILENTLY DROPPED and the daemon's
+  Save normalizes the file with empty strings — the job then fatal's round 1
+  with `prompt unreadable: empty prompt` before pi ever spawns (live:
+  mem-claims-analysis, 2026-11-03). Mirror an existing working def instead of
+  inventing keys.
+- **Two log sinks, check BOTH**: `s.logf` writes the ORCHESTRATOR log
+  (`/tmp/pi_<job>_orchestrator.log` — round lifecycle, LAUNCH/RESUME lines,
+  client errors, fatal reasons); the RUNLOG (`/tmp/pi_<job>_run.log`) holds
+  pi's stdout frames only and is truncated every round. A fatal with an EMPTY
+  runlog means the round died before pi spawned — the reason is in the
+  orchestrator log, not the journal and not the runlog.
 - Never run the RPC client in a foreground tool call — the timeout kills it
   mid-turn. The daemon exists to make this moot.
 - One steer = one coherent directive block; never re-send the whole brief.
+- **A round's bash tool aborts any single command near the 8-minute mark**
+  (`Command aborted` toolResult, `stopReason:error`, zero token usage), and the
+  instant-exit strikes then fatal the job. Briefs must mandate backgrounding
+  every gate that can exceed it — run to a log file
+  (`(pio run -e x4pro > /tmp/pio.log 2>&1 &)`) and poll with short calls
+  (`sleep 45; tail -3 /tmp/pio.log`) until SUCCESS/ERROR; never accept a gate
+  as green without the SUCCESS line in that log file. Also: commit pending
+  work BEFORE the first long gate — an aborted or stopped round leaves edits
+  uncommitted in the worktree.
+
+### Autonomous-commit-banned repositories (AGENTS.md supersession)
+
+When a repo's AGENTS.md forbids autonomous commits or PR creation, the brief MUST
+open with an explicit owner pre-approval supersession clause that authorizes
+the specific permitted actions against specific targets: `git commit -S -F` on
+named files, `git push --force-with-lease` to a single named branch, and
+`gh pr create` against a named base with a named title, written as a direct
+human instruction overruling the specific forbid clause. Without that clause
+the agent treats the AGENTS.md forbid as binding and stalls before arming — the
+run never starts. Phrase it as approval, not bypass: name the branch and PR
+title so the agent cannot drift scope, and cite the exact clause being
+overridden so the override is auditable. A brief that only implies permission,
+or that leaves commit/PR out of scope, will not clear this gate.
 
 ### Live real-pi validation pitfalls
 
