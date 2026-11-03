@@ -223,7 +223,7 @@ func TestShortSHA(t *testing.T) {
 // unreadable worktree must yield "" rather than failing a re-check.
 func TestHeadSHADegradesGracefully(t *testing.T) {
 	testEnv(t)
-	j := job.Job{Name: "h", Worktree: "/definitely/not/a/repo"}
+	j := job.Job{Name: "h", Brief: "/tmp/x.md", Cont: "/tmp/c.txt", Marker: "ALL_DONE", Worktree: "/definitely/not/a/repo"}
 	writeJob(t, j)
 	s := New()
 	if err := s.LoadJobs(); err != nil {

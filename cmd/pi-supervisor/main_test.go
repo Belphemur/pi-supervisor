@@ -464,7 +464,8 @@ func TestRunDaemonLifecycle(t *testing.T) {
 	if err := os.MkdirAll(jobsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := `{"name":"probe","brief":"/tmp/b.md","worktree":"/tmp","max_rounds":1}`
+	// A complete def: ADR-0024 validation refuses cont/marker-less defs.
+	body := `{"name":"probe","brief":"/tmp/b.md","cont":"/tmp/c.txt","marker":"PROBE_DONE","worktree":"/tmp","max_rounds":1}`
 	if err := os.WriteFile(filepath.Join(jobsDir, "probe.json"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}

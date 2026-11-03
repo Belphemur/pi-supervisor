@@ -223,7 +223,8 @@ func TestWatchMarkerLatchesMidRound(t *testing.T) {
 	}
 
 	j := job.Job{Name: "wm", SessionPath: sess, SessionName: "wm", Worktree: dir,
-		Marker: "ALL_DONE", FinalReport: report, MaxRounds: 1, TimeoutS: 20}
+		Brief: "/tmp/x.md", Cont: "/tmp/c.txt", Marker: "ALL_DONE",
+		FinalReport: report, MaxRounds: 1, TimeoutS: 20}
 	writeJob(t, j)
 	s := newTestSupervisor(t)
 	r := &runner{job: j, state: job.State{Round: 1, State: "running"}, stopCh: make(chan struct{})}
@@ -269,7 +270,8 @@ func TestWatchMarkerNoMarkerConfigured(t *testing.T) {
 	if err := os.WriteFile(sess, []byte(assistantRecord("ALL_DONE")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	j := job.Job{Name: "nm", SessionPath: sess, SessionName: "nm", Worktree: dir, MaxRounds: 1}
+	j := job.Job{Name: "nm", SessionPath: sess, SessionName: "nm", Worktree: dir,
+		Brief: "/tmp/x.md", Cont: "/tmp/c.txt", Marker: "ALL_DONE", MaxRounds: 1}
 	writeJob(t, j)
 	s := newTestSupervisor(t)
 	r := &runner{job: j, state: job.State{Round: 1}, stopCh: make(chan struct{})}

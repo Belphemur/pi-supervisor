@@ -79,44 +79,33 @@ func TestStartRefusesFinishedJob(t *testing.T) {
 	}
 }
 
-// An empty marker must NOT be able to close a run: strings.Contains(x, "")
-// is true, so a stale final report alone used to end the job.
-func TestEmptyMarkerCannotFinishJob(t *testing.T) {
+// An empty marker used to be loadable and would livelock to max_rounds: the
+// completion gate could never match it. ADR-0024 refuses the def at load;
+// the gate-level invariant (an empty marker never completes) is pinned by
+// TestGateEmptyMarkerNeverCompletes.
+func TestEmptyMarkerDefIsRefused(t *testing.T) {
 	testEnv(t)
-	pi := fakePiPath(t)
 	dir := t.TempDir()
 	report := filepath.Join(dir, "final.md")
 	if err := os.WriteFile(report, []byte("stale report from a previous run"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	brief := filepath.Join(dir, "brief.md")
-	if err := os.WriteFile(brief, []byte("TEST_STREAM"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// Deliberately no marker, saved verbatim (bypassing writeJob's fixture
+	// defaults): the empty marker IS the defect under test.
 	j := job.Job{
-		Name: "nomarker", Brief: brief, Worktree: t.TempDir(), SessionName: "nomarker",
-		FinalReport: report, Marker: "", // deliberately unset
-		MaxRounds: 1, TimeoutS: 20, PiBin: pi, BackoffScale: 0.02,
+		Name: "nomarker", Brief: "/tmp/b.md", Cont: "/tmp/c.txt", Worktree: dir,
+		FinalReport: report, Marker: "", MaxRounds: 1, TimeoutS: 20,
 	}
-	pinSession(t, &j, brief)
-	writeJob(t, j)
-
-	s := newTestSupervisor(t)
-	if err := s.Start("nomarker"); err != nil {
+	if err := job.Save(j); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 60*time.Second, func() bool {
-		st, _ := s.Status("nomarker")
-		s, ok := st.(job.Status)
-		return ok && s.State == "fatal" // round cap, not done
-	})
-	st, _ := s.Status("nomarker")
-	sj, ok := st.(job.Status)
-	if !ok {
-		t.Fatalf("status = %#v, want a job.Status", st)
+	s := New()
+	err := s.LoadJobs()
+	if err == nil || !strings.Contains(err.Error(), "marker is empty") {
+		t.Fatalf("LoadJobs = %v, want a refusal naming the empty marker", err)
 	}
-	if got := sj.State; got != "fatal" {
-		t.Fatalf("state = %q, want fatal (an empty marker must not finish a run)", got)
+	if _, ok := s.jobs["nomarker"]; ok {
+		t.Fatal("a refused def must not be registered")
 	}
 }
 
@@ -256,7 +245,8 @@ func TestReloadWhileRunningIsRaceFree(t *testing.T) {
 }
 
 // A job file removed from the jobs dir disappears from the next reload;
-// a corrupt file is skipped without taking the daemon down.
+// a corrupt file is skipped (the daemon keeps the valid defs) but FAILS the
+// reload loudly naming the file, per ADR-0024.
 func TestReloadDropsAndSkipsJobs(t *testing.T) {
 	testEnv(t)
 	writeJob(t, job.Job{Name: "keep", Brief: "/tmp/x", Worktree: t.TempDir(), MaxRounds: 1})
@@ -272,8 +262,15 @@ func TestReloadDropsAndSkipsJobs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(job.JobsDir(), "broken.json"), []byte("{oops"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Reload(); err != nil {
-		t.Fatalf("a corrupt job file must not fail the reload: %v", err)
+	// ADR-0024: a corrupt def now FAILS the reload loudly (the error names the
+	// file) instead of being a silent skip — the silent-skip class was the
+	// mem-claims-analysis outage. The valid def still loaded.
+	reloadErr := s.Reload()
+	if reloadErr == nil || !strings.Contains(reloadErr.Error(), "broken.json") {
+		t.Fatalf("reload = %v, want an error naming broken.json", reloadErr)
+	}
+	if err := os.Remove(filepath.Join(job.JobsDir(), "broken.json")); err != nil {
+		t.Fatal(err)
 	}
 	all, ok := s.StatusAll().([]job.Status)
 	if !ok {

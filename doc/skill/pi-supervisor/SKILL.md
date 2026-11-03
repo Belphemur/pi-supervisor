@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.10.0
+version: 1.11.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -40,8 +40,15 @@ into that doc folder, so edit it there).
 # Install (builds, installs unit, symlinks this skill, enables service)
 /home/balor/workspace/pi-supervisor/install/install.sh
 
-# Define a job: ~/.pi/supervisor/jobs/<name>.json (see AGENTS.md template)
-pi-supervisor reload
+# Define a job WITHOUT hand-writing JSON (ADR-0024): typed flags, validated
+# before anything lands on disk; the file format (jobs/<name>.json) is in
+# AGENTS.md for reference
+pi-supervisor job create <name> \
+  --brief /tmp/pi_<task>_brief.md --cont /tmp/pi_<task>_cont.txt \
+  --marker <MARKER> --worktree <worktree> \
+  --final-report /tmp/pi_<task>_final_report.md \
+  --max-rounds 6 --timeout-s 1800 --skills /path/skill1,/path/skill2
+pi-supervisor reload             # a bad def fails HERE, naming the key/file
 pi-supervisor start <name>       # round 1 LAUNCHes, later rounds RESUME
 
 # Operate
@@ -382,12 +389,15 @@ Behavior:
 
 - **Job-def key names are the Job struct's JSON tags** (`internal/job/job.go`):
   `name`, `brief`, `cont`, `final_report`, `marker`, `worktree`, `max_rounds`,
-  `timeout_s`, `skills`, `pi_bin`, `backoff_scale`. Keys like `job`,
-  `brief_path`, `cont_path`, `report` are SILENTLY DROPPED and the daemon's
-  Save normalizes the file with empty strings — the job then fatal's round 1
-  with `prompt unreadable: empty prompt` before pi ever spawns (live:
-  mem-claims-analysis, 2026-11-03). Mirror an existing working def instead of
-  inventing keys.
+  `timeout_s`, `skills`, `pi_bin`, `backoff_scale`. Since ADR-0024 the daemon
+  REJECTS unknown keys and incomplete defs at reload (exit 1 naming the file
+  and the key) — but only at reload. Use `pi-supervisor job create` so the
+  def is correct at write time; the historical silent-drop shape
+  (`job`/`brief_path`/`cont_path`/`report` normalized to empty strings, every
+  round dying with `prompt unreadable: empty prompt`, live:
+  mem-claims-analysis 2026-11-03) is what pre-ADR-0024 daemons did and what
+  the validation now exists to prevent. Mirror an existing working def when
+  hand-editing anyway.
 - **Two log sinks, check BOTH**: `s.logf` writes the ORCHESTRATOR log
   (`/tmp/pi_<job>_orchestrator.log` — round lifecycle, LAUNCH/RESUME lines,
   client errors, fatal reasons); the RUNLOG (`/tmp/pi_<job>_run.log`) holds

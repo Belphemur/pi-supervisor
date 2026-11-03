@@ -9,6 +9,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -312,14 +315,52 @@ type TaskProgress struct {
 }
 
 // Load parses a job JSON file, applying defaults.
+//
+// Decoding is STRICT (ADR-0024): an unknown key is an ERROR, never a silent
+// drop. The old `json.Unmarshal` silently ignored invented keys (live:
+// mem-claims-analysis wrote `job`/`brief_path`/`cont_path`/`report`; the
+// daemon normalized the file to empty strings and every round died with
+// "prompt unreadable: empty prompt" before pi ever spawned). A typo'd def now
+// fails at reload with the offending key named — and, when the key is a known
+// synonym, the canonical one suggested.
 func Load(path string) (Job, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Job{}, err
 	}
 	var j Job
-	if err := json.Unmarshal(data, &j); err != nil {
-		return Job{}, err
+	// ADR-0024: name EVERY unknown key, not just the first one the stdlib
+	// decoder stumbles over — the live outage def carried four invented keys
+	// (`job`, `brief_path`, `cont_path`, `report`) and a one-key-at-a-time
+	// error would have cost four fix cycles.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return Job{}, err // malformed JSON, not an unknown-key problem
+	}
+	var unknown []string
+	for k := range raw {
+		if !isJobTag(k) {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		var b strings.Builder
+		b.WriteString("job def has unknown key(s):")
+		for _, k := range unknown {
+			if canonical, ok := synonymFor(k); ok {
+				fmt.Fprintf(&b, " %q (did you mean %q?)", k, canonical)
+			} else {
+				fmt.Fprintf(&b, " %q", k)
+			}
+		}
+		b.WriteString(" — unknown keys are rejected, never silently dropped; see the Job struct's json tags in internal/job/job.go")
+		return Job{}, errors.New(b.String())
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&j); err != nil {
+		return Job{}, friendlyDecodeError(err)
 	}
 	if j.Name == "" {
 		j.Name = strings.TrimSuffix(filepath.Base(path), ".json")
@@ -337,6 +378,131 @@ func Load(path string) (Job, error) {
 		j.BackoffScale = 1.0
 	}
 	return j, nil
+}
+
+// knownSynonyms maps the job-def key names operators (and agents) have
+// actually invented in the field to the canonical JSON tag. The live case was
+// mem-claims-analysis (2026-11-03): `job`, `brief_path`, `cont_path`, `report`.
+var knownSynonyms = map[string]string{
+	"job":              "name",
+	"brief_path":       "brief",
+	"brieffile":        "brief",
+	"cont_path":        "cont",
+	"continuation":     "cont",
+	"report":           "final_report",
+	"report_path":      "final_report",
+	"finalreport":      "final_report",
+	"maxrounds":        "max_rounds",
+	"max_round":        "max_rounds",
+	"timeout":          "timeout_s",
+	"session":          "session_name",
+	"worktree_path":    "worktree",
+	"skill":            "skills",
+	"session_file":     "session_path",
+	"reviewbrief":      "review_brief",
+	"cistallcap":       "ci_stall_cap",
+	"emptyturnidles":   "empty_turn_idle_s",
+	"empty_turn_idles": "empty_turn_idle_s",
+	"backoffscale":     "backoff_scale",
+	"pi_binary":        "pi_bin",
+}
+
+// isJobTag reports whether k is a real Job JSON tag, computed from the
+// struct itself so the gate can never drift from the model.
+func isJobTag(k string) bool {
+	t := reflect.TypeFor[Job]()
+	for field := range t.Fields() {
+		if tag := field.Tag.Get("json"); tag != "" {
+			if name, _, _ := strings.Cut(tag, ","); name == k {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// synonymFor returns the canonical key a dropped field was probably meant to
+// be, when the field matches a known invented spelling.
+func synonymFor(field string) (string, bool) {
+	canonical, ok := knownSynonyms[strings.ToLower(field)]
+	return canonical, ok
+}
+
+// friendlyDecodeError turns the stdlib's strict-decode failures into an error
+// that names the offending key and, for known synonyms, the canonical one.
+func friendlyDecodeError(err error) error {
+	msg := err.Error()
+	// encoding/json reports unknown fields as: json: unknown field "job"
+	const prefix = `json: unknown field "`
+	if strings.HasPrefix(msg, prefix) {
+		quoted := msg[len(prefix):]
+		if strings.HasSuffix(quoted, `"`) {
+			if field, uerr := strconv.Unquote(`"` + quoted); uerr == nil {
+				if canonical, ok := synonymFor(field); ok {
+					return fmt.Errorf("job def has unknown key %q — did you mean %q? (unknown keys are rejected, never silently dropped)", field, canonical)
+				}
+				return fmt.Errorf("job def has unknown key %q (unknown keys are rejected, never silently dropped; see the Job struct's json tags in internal/job/job.go)", field)
+			}
+		}
+	}
+	return err
+}
+
+// Validate reports every structural defect that would make the job's rounds
+// fail before pi ever spawns. Enforced at load time (LoadJobs refuses the
+// def) and by `pi-supervisor job create` (ADR-0024). An empty brief or cont
+// produced the live "prompt unreadable: empty prompt" instant-exit death; an
+// empty marker can never match, so the completion gate could never close the
+// job and it livelocks to max_rounds.
+func Validate(j Job) error {
+	var probs []string
+	if j.Name == "" {
+		probs = append(probs, "name is empty")
+	}
+	if j.Brief == "" {
+		probs = append(probs, `brief is empty (round 1 would die with "prompt unreadable: empty prompt")`)
+	}
+	if j.Cont == "" {
+		probs = append(probs, `cont is empty (every resume round would die with "prompt unreadable: empty prompt")`)
+	}
+	if j.Marker == "" {
+		probs = append(probs, "marker is empty (an empty marker matches nothing, so the completion gate could never close the job)")
+	}
+	if j.MaxRounds <= 0 {
+		probs = append(probs, "max_rounds must be > 0")
+	}
+	if j.TimeoutS <= 0 {
+		probs = append(probs, "timeout_s must be > 0")
+	}
+	if j.Worktree == "" {
+		probs = append(probs, "worktree is empty (pi would spawn in the daemon's cwd and the session would never be discoverable)")
+	}
+	if len(probs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("invalid job def %q: %s", j.Name, strings.Join(probs, "; "))
+}
+
+// MissingPromptFiles returns the prompt files referenced by the def that do
+// not exist on disk. final_report is deliberately NOT checked: the agent
+// writes it during the run. review_brief is checked only when set.
+func MissingPromptFiles(j Job) []string {
+	var missing []string
+	for _, p := range []struct {
+		label, path string
+	}{
+		{"brief", j.Brief},
+		{"cont", j.Cont},
+		{"review_brief", j.ReviewBrief}, // "" must not exist-check: Exists("") is false
+	} {
+		if p.path == "" {
+			continue
+		}
+		if !Exists(p.path) {
+			missing = append(missing, fmt.Sprintf("%s=%s", p.label, p.path))
+		}
+	}
+	return missing
 }
 
 // writeAtomic writes data to path via a temp file + fsync + rename, so a crash

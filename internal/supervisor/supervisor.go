@@ -200,13 +200,23 @@ func (s *Supervisor) LoadJobs() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seen := map[string]bool{}
+	// ADR-0024: a def that fails to parse or validate is reported LOUDLY and
+	// collected into the returned error, so `pi-supervisor reload` exits 1
+	// naming the file — an operator (or agent) can no longer discover the
+	// defect from a fatal round three hours later. Valid defs still load.
+	var bad []error
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
 		j, err := job.Load(filepath.Join(job.JobsDir(), e.Name()))
+		if err == nil {
+			err = job.Validate(j)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "bad job %s: %v\n", e.Name(), err)
+			journal.L().Warn("job_def_invalid", "file", e.Name(), "reason", err.Error())
+			bad = append(bad, fmt.Errorf("bad job %s: %w", e.Name(), err))
 			continue
 		}
 		seen[j.Name] = true
@@ -230,7 +240,7 @@ func (s *Supervisor) LoadJobs() error {
 			delete(s.jobs, name)
 		}
 	}
-	return nil
+	return errors.Join(bad...)
 }
 
 // persistState snapshots the state under r.mu and writes it to disk.

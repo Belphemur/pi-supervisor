@@ -55,6 +55,15 @@ func pinSession(t *testing.T, j *job.Job, promptFile string) {
 
 func writeJob(t *testing.T, j job.Job) {
 	t.Helper()
+	// ADR-0024: defs are validated at load. Fixtures that don't exercise the
+	// completion gate get canonical cont/marker defaults so the call sites
+	// stay minimal; a test that NEEDS a defective def sets the field itself.
+	if j.Cont == "" {
+		j.Cont = "/tmp/cont.txt"
+	}
+	if j.Marker == "" {
+		j.Marker = "TEST_MARKER_DONE"
+	}
 	if err := job.Save(j); err != nil {
 		t.Fatal(err)
 	}
