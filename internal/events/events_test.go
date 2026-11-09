@@ -150,7 +150,7 @@ func TestFanOutToAllSubscribers(t *testing.T) {
 // Terminal classification drives the watch's exit logic.
 func TestTerminalClassification(t *testing.T) {
 	for ev, want := range map[string]bool{
-		"done": true, "fatal": true, "stopped": true,
+		"done": true, "fatal": true, "stopped": true, "job_archived": true,
 		"round_done": false, "backoff": false, "job_started": false,
 		"instant_exit": false,
 	} {

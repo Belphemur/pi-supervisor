@@ -72,8 +72,9 @@ func readArchivedBytes(t *testing.T, name string) []byte {
 }
 
 // Every persisted terminal state archives; stopped and a young terminal job
-// survive the same sweep (ADR-0025 §2). The in-memory runner is dropped from
-// the map by the post-batch LoadJobs.
+// survive the same sweep (ADR-0025 §2). The in-memory runner is dropped by
+// the per-candidate targeted removal in the archival critical section —
+// never by a bulk reload (qodo #9).
 func TestJanitorArchivesTerminalStates(t *testing.T) {
 	testEnv(t)
 	old := time.Now().Add(-8 * 24 * time.Hour)
@@ -207,6 +208,9 @@ func TestJanitorDefCollisionSuffix(t *testing.T) {
 	if second := readArchivedBytes(t, "dupe"); string(first) != string(second) {
 		t.Fatal("_archive/dupe.json was overwritten")
 	}
+	if _, err := os.Stat(filepath.Join(job.StateDir(), "dupe.json")); !os.IsNotExist(err) {
+		t.Fatal("archived job's own state file must move with it (qodo #3)")
+	}
 	entries, err := os.ReadDir(archivedPaths())
 	if err != nil {
 		t.Fatal(err)
@@ -283,9 +287,10 @@ func TestJanitorSessionQuarantine(t *testing.T) {
 }
 
 // job_archived flows through the emit funnel with the state=/def=/session=
-// Info contract — and is NOT terminal, so events.Terminal and the watch
-// exit list stay untouched (invariant 22).
-func TestJanitorEmitsNonTerminalEvent(t *testing.T) {
+// Info contract — and IS terminal now (ADR-0025 §6, qodo #7): the run of an
+// archived job is over with the archive, so events.Terminal and the watch
+// exit list BOTH name it (invariant 22's sync rule: same commit).
+func TestJanitorEmitsTerminalEvent(t *testing.T) {
 	testEnv(t)
 	old := time.Now().Add(-8 * 24 * time.Hour)
 	sess := filepath.Join(t.TempDir(), "archived.jsonl")
@@ -328,8 +333,13 @@ func TestJanitorEmitsNonTerminalEvent(t *testing.T) {
 			if strings.Contains(e.Info, "session=none") {
 				t.Fatalf("a quarantined session must be named, Info=%q", e.Info)
 			}
-			if (events.Event{Event: "job_archived"}).Terminal() {
-				t.Fatal("job_archived must NOT be terminal (invariant 22)")
+			if !(events.Event{Event: "job_archived"}).Terminal() {
+				t.Fatal("job_archived must be terminal (ADR-0025 §6) — a watcher must end with the archive")
+			}
+			// The envelope context survives the map drop: the funnel context is
+			// carried explicitly, so worktree (from the def) is still filled.
+			if e.Worktree == "" {
+				t.Fatal("job_archived must keep its envelope worktree context")
 			}
 			_ = subID
 			return
@@ -374,16 +384,38 @@ func TestJanitorPerCandidateErrorContinues(t *testing.T) {
 	defer cancel()
 
 	s := janitorSweepSupervisor(t, 24*time.Hour)
-	// Defeat "broken" at the rename: its def file vanishes between
-	// LoadJobs and the sweep, so the runner stays a candidate but the move
-	// fails (ENOENT).
-	if err := os.Remove(filepath.Join(job.JobsDir(), "broken.json")); err != nil {
+	// Defeat "broken" at the FIRST operation the archive performs: the
+	// session quarantine (move ordering per qodo #2 — session before def).
+	// A session dir that cannot create _archived-stale/ makes Quarantine
+	// fail before the def ever moves, so the job stays fully intact and re-
+	// candidateable for the next sweep.
+	brokenDir := t.TempDir()
+	brokenSess := filepath.Join(brokenDir, "broken.jsonl")
+	if err := os.WriteFile(brokenSess, []byte("{}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(brokenDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(brokenDir, 0o755) })
+	s.mu.Lock()
+	rB := s.jobs["broken"]
+	rB.mu.Lock()
+	rB.job.SessionPath = brokenSess
+	rB.mu.Unlock()
+	s.mu.Unlock()
 	s.janitorSweep()
 
 	if _, err := os.Stat(filepath.Join(archivedPaths(), "healthy.json")); err != nil {
 		t.Fatalf("sweep must continue past a failed candidate: %v", err)
+	}
+	// "broken" got no job_archived event; "healthy" got exactly one. No part
+	// of "broken" moved — quarantine-first failing strands nothing.
+	if _, err := os.Stat(filepath.Join(job.JobsDir(), "broken.json")); err != nil {
+		t.Fatalf("a failed candidate's def must stay: %v", err)
+	}
+	if _, err := os.Stat(brokenSess); err != nil {
+		t.Fatal("a failed candidate's session must stay adoptable")
 	}
 	// "broken" got no job_archived event; "healthy" got exactly one.
 	archivedFor := map[string]int{}
@@ -405,6 +437,73 @@ func TestJanitorPerCandidateErrorContinues(t *testing.T) {
 			}
 			if e.Event == "job_archived" {
 				archivedFor[e.Job]++
+			}
+		}
+	}
+}
+
+// A def that already left jobs/ before the sweep (a hand-mv archive while
+// the daemon runs, or an earlier sweep's half-failure) recovers instead of
+// warn-looping forever: the runner is cleaned, the session quarantined and
+// the event emitted with def=already-moved. Nothing is overwritten.
+func TestJanitorDefAlreadyGoneRecovers(t *testing.T) {
+	testEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	janitorFixture(t, "halffeat", "done", old, time.Time{})
+	sess := filepath.Join(t.TempDir(), "half.jsonl")
+	if err := os.WriteFile(sess, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := janitorSweepSupervisor(t, 24*time.Hour)
+	s.mu.Lock()
+	r := s.jobs["halffeat"]
+	r.mu.Lock()
+	r.job.SessionPath = sess
+	r.mu.Unlock()
+	s.mu.Unlock()
+	if err := os.Remove(filepath.Join(job.JobsDir(), "halffeat.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	subID, sub, cancel := events.Subscribe()
+	defer cancel()
+	s.janitorSweep()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("no recuperated archive event within 5s")
+		case e, ok := <-sub:
+			if !ok {
+				t.Fatal("subscription closed without the event")
+			}
+			if e.Event != "job_archived" || e.Job != "halffeat" {
+				continue
+			}
+			if !strings.Contains(e.Info, "def=already-moved") {
+				t.Fatalf("Info must name the pre-moved def, got %q", e.Info)
+			}
+			if _, err := os.Stat(sess); !os.IsNotExist(err) {
+				t.Fatal("the session must still be quarantined on the recovery path")
+			}
+			s.mu.Lock()
+			_, live := s.jobs["halffeat"]
+			s.mu.Unlock()
+			if live {
+				t.Fatal("recovered archive must drop the runner")
+			}
+			// Exit the loop only after exactly ONE event arrived; a SECOND
+			// job_archived would mean the sweep re-emits.
+			select {
+			case e2, ok2 := <-sub:
+				if ok2 && e2.Event == "job_archived" {
+					t.Fatal("recovery path must emit exactly one event")
+				}
+				_ = subID
+				return
+			case <-time.After(200 * time.Millisecond):
+				return // no further events within a short window
 			}
 		}
 	}
@@ -432,9 +531,323 @@ func TestJanitorDefBytesPreserved(t *testing.T) {
 	}
 }
 
+// A watch that arrives AFTER the archive gets the terminal precheck instead
+// of a subscription to something that will never emit again (qodo #7).
+func TestWatchPrechecksArchivedJob(t *testing.T) {
+	testEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	janitorFixture(t, "archivedw", "done", old, time.Time{})
+	s := janitorSweepSupervisor(t, 24*time.Hour)
+	s.janitorSweep()
+	if _, err := os.Stat(filepath.Join(archivedPaths(), "archivedw.json")); err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel, pre := s.Watch("archivedw")
+	defer cancel()
+	if ch != nil {
+		t.Fatal("an archived job must answer with the precheck, not a live channel")
+	}
+	if pre == nil || pre.Event != "job_archived" || pre.Job != "archivedw" {
+		t.Fatalf("pre = %+v, want a job_archived precheck", pre)
+	}
+	// And the reporter the control server consults.
+	if !s.Archived("archivedw") {
+		t.Fatal("Archived must report the archived def")
+	}
+	if s.Archived("archivedw2") || s.Archived("../x") {
+		t.Fatal("a def not in _archive (or an invalid name) must not report archived")
+	}
+}
+
 func janitorFixtureState(t *testing.T, name string, old time.Time) {
 	t.Helper()
 	if err := job.SaveState(name, job.State{State: "done", EndedAt: old.UTC().Format(time.RFC3339)}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The archived job's OWN state file moves with it into _archive/ (qodo #3;
+// kody): state/<name>.json surviving made a re-used job name inherit the old
+// terminal state (done + the old EndedAt) and get archived at its next
+// sweep before running — or Start refusing with KindAlreadyDone. Numbers
+// stay move-only: the state file's bytes land in _archive/<name>.state.json.
+func TestJanitorStateFileMovesWithDef(t *testing.T) {
+	testEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	janitorFixture(t, "ownstate", "done", old, time.Time{})
+	orig, err := os.ReadFile(filepath.Join(job.StateDir(), "ownstate.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := janitorSweepSupervisor(t, 24*time.Hour)
+	s.janitorSweep()
+	if _, err := os.Stat(filepath.Join(job.StateDir(), "ownstate.json")); !os.IsNotExist(err) {
+		t.Fatalf("state file must leave state/: %v", err)
+	}
+	arch, err := os.ReadFile(filepath.Join(archivedPaths(), "ownstate.state.json"))
+	if err != nil {
+		t.Fatalf("state file must land in _archive/: %v", err)
+	}
+	if string(orig) != string(arch) {
+		t.Fatalf("archived state bytes drift:\n orig=%s\n arch=%s", orig, arch)
+	}
+}
+
+// A terminal job whose state still carries a review baseline is NOT a
+// candidate (qodo #6): the baseline is what re-checks (explicit and
+// post-push) read to notice new threads on that PR — archiving severs the
+// only channel that reports them.
+func TestJanitorSkipsReviewBaseline(t *testing.T) {
+	testEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	janitorFixture(t, "tracked", "done", old, time.Time{})
+	s := janitorSweepSupervisor(t, 24*time.Hour)
+	s.mu.Lock()
+	s.jobs["tracked"].mu.Lock()
+	s.jobs["tracked"].state.ReviewBaseline = &job.ReviewBaseline{
+		Owner: "o", Repo: "r", PR: 1, Head: "abc", ClosedAt: "2026-01-01T00:00:00Z",
+	}
+	s.jobs["tracked"].mu.Unlock()
+	s.mu.Unlock()
+	s.janitorSweep()
+	if _, err := os.Stat(filepath.Join(job.JobsDir(), "tracked.json")); err != nil {
+		t.Fatalf("baseline-tracked terminal job must survive the sweep: %v", err)
+	}
+	s.mu.Lock()
+	_, live := s.jobs["tracked"]
+	s.mu.Unlock()
+	if !live {
+		t.Fatal("baseline-tracked terminal job must stay in the map")
+	}
+}
+
+// The no-replace emergency valve (qodo #8): an existing destination — file
+// or dangling symlink, which os.Stat-based existence checks both pass or
+// miss — advances the collision suffix; os.Link refuses EEXIST, nothing is
+// ever replaced.
+func TestJanitorMoveNeverOverwrites(t *testing.T) {
+	testEnv(t)
+	archiveDir := archivedPaths()
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A live def whose bytes would collide with an existing archive entry.
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "victim.json")
+	if err := os.WriteFile(src, []byte("the-move\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 1: plain file at the base name.
+	taken := filepath.Join(archiveDir, "victim.json")
+	if err := os.WriteFile(taken, []byte("KEEP-ME\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 2: a dangling symlink at the first colliding name the mover computes —
+	// os.Stat says absent; the pre-fix os.Rename would have replaced it.
+	ts := time.Now().Format("2006-01-02T15-04-05")
+	if err := os.Symlink(filepath.Join(srcDir, "does-not-matter"), filepath.Join(archiveDir, "victim_"+ts+".json")); err != nil {
+		t.Fatal(err)
+	}
+	final, err := archiveMove(src, archiveDir, "victim.json")
+	if err != nil {
+		t.Fatalf("archiveMove: %v", err)
+	}
+	if keep, rerr := os.ReadFile(taken); rerr != nil || string(keep) != "KEEP-ME\n" {
+		t.Fatalf("existing destination was replaced: %v %q", rerr, keep)
+	}
+	link, err := os.Lstat(filepath.Join(archiveDir, "victim_"+ts+".json"))
+	if err != nil || link.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("dangling symlink must stay untouched: stat=%v err=%v", link, err)
+	}
+	base := filepath.Base(final)
+	if !strings.HasPrefix(base, "victim_") {
+		t.Fatalf("the mover must advance past the taken base name: %q", base)
+	}
+	// The chosen destination must not be one of the occupied names — the
+	// suffix walk advances, never replaces.
+	if base == "victim.json" || base == "victim_"+ts+".json" {
+		t.Fatalf("collision walk landed on an occupied name: %q", base)
+	}
+	moved, err := os.ReadFile(final)
+	if err != nil || string(moved) != "the-move\n" {
+		t.Fatalf("moved bytes: %v %q", err, moved)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatalf("source must leave after the move: %v", err)
+	}
+}
+
+// A def name that breaks path composition is refused by Validate (ADR-0024)
+// and the janitor never touches one, even if a hand-built runner manages to
+// carry one (qodo #4 defense in depth).
+func TestJanitorTraversalNameSkipped(t *testing.T) {
+	testEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	// Only reachable via a hand-built runner: job.Validate refuses the name,
+	// so LoadJobs would bounce the def loudly.
+	const evil = "../escape"
+	if err := job.SaveState(evil, job.State{State: "done", EndedAt: old.UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
+	}
+	escapePath := filepath.Join(job.StateDir(), evil+".json")
+	orig, err := os.ReadFile(escapePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := janitorSweepSupervisor(t, 24*time.Hour)
+	s.mu.Lock()
+	s.jobs[evil] = &runner{job: job.Job{Name: evil, Brief: "/tmp/x.md", Worktree: t.TempDir(), SessionName: evil}}
+	rEvil := s.jobs[evil]
+	rEvil.mu.Lock()
+	rEvil.state = job.State{State: "done", EndedAt: old.UTC().Format(time.RFC3339)}
+	rEvil.mu.Unlock()
+	s.mu.Unlock()
+	s.janitorSweep()
+	if got, rerr := os.ReadFile(escapePath); rerr != nil || string(got) != string(orig) {
+		t.Fatalf("traversal state file must be untouched: err=%v byte-shift=%v", rerr, rerr == nil)
+	}
+	s.mu.Lock()
+	_, still := s.jobs[evil]
+	s.mu.Unlock()
+	if !still {
+		t.Fatal("an invalid-name runner must stay in the map, never archived")
+	}
+	// And the validator itself refuses every separator shape.
+	for _, bad := range []string{"../escape", "sub/x", ".", "..", "a/../b", ""} {
+		if job.ValidJobName(bad) {
+			t.Fatalf("ValidJobName(%q) must be false", bad)
+		}
+		if err := job.Validate(job.Job{Name: bad}); err == nil {
+			t.Fatalf("Validate must refuse name %q", bad)
+		}
+	}
+	for _, fine := range []string{"mealime-tooltip", "aル_b.bin-2"} {
+		if !job.ValidJobName(fine) {
+			t.Fatalf("ValidJobName(%q) must be true", fine)
+		}
+	}
+}
+
+// Re-validation closes the TOCTOU (qodo #1, #5; kody): janitorArchive
+// re-checks active/state/armed/baseline in the SAME critical section that
+// moves and drops — anything changed between the sweep snapshot and the
+// archive is refused and NOTHING moves.
+func TestJanitorRevalidationSkipsRacedStart(t *testing.T) {
+	testEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	janitorFixture(t, "raced", "done", old, time.Time{})
+	s := janitorSweepSupervisor(t, 24*time.Hour)
+	c := janitorCandidate{name: "raced", state: "done"}
+	// Simulate Start() landing in the gap: the runner is active by the time
+	// the archive locks.
+	s.mu.Lock()
+	r := s.jobs["raced"]
+	r.mu.Lock()
+	r.active = true
+	r.mu.Unlock()
+	s.mu.Unlock()
+	if err := s.janitorArchive(c); err == nil {
+		t.Fatal("an activated candidate must be refused")
+	}
+	if _, err := os.Stat(filepath.Join(job.JobsDir(), "raced.json")); err != nil {
+		t.Fatalf("refused candidate's def must stay in jobs/: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(job.StateDir(), "raced.json")); err != nil {
+		t.Fatalf("refused candidate's state must stay in state/: %v", err)
+	}
+	s.mu.Lock()
+	_, live := s.jobs["raced"]
+	s.mu.Unlock()
+	if !live {
+		t.Fatal("refused candidate's runner must stay in the map")
+	}
+
+	// And a runner that vanished mid-sweep is refused the same way.
+	janitorFixture(t, "gone", "done", old, time.Time{})
+	s2 := janitorSweepSupervisor(t, 24*time.Hour)
+	c2 := janitorCandidate{name: "gone", state: "done"}
+	s2.mu.Lock()
+	delete(s2.jobs, "gone")
+	s2.mu.Unlock()
+	if err := s2.janitorArchive(c2); err == nil {
+		t.Fatal("a vanished runner must be refused, not acted on")
+	}
+	if _, err := os.Stat(filepath.Join(job.JobsDir(), "gone.json")); err != nil {
+		t.Fatalf("vanished candidate's def must stay: %v", err)
+	}
+}
+
+// The post-batch bulk reload is gone (kody / qodo #9): a live runner whose
+// def on disk transiently fails to parse stays in the map — the janitor's
+// removal is per successfully archived job only.
+func TestJanitorTargetedRemovalKeepsLiveRunner(t *testing.T) {
+	testEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	janitorFixture(t, "toarchive", "done", old, time.Time{})
+	janitorFixture(t, "liver", "done", old, time.Time{})
+	s := janitorSweepSupervisor(t, 24*time.Hour)
+	s.mu.Lock()
+	rLive := s.jobs["liver"]
+	rLive.mu.Lock()
+	rLive.active = true
+	rLive.mu.Unlock()
+	s.mu.Unlock()
+	// Corrupt the live job's def ON DISK after the load: the old LoadJobs()
+	// post-batch would then drop the live runner (its def fails to parse).
+	if err := os.WriteFile(filepath.Join(job.JobsDir(), "liver.json"), []byte("{invalid"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.janitorSweep()
+	if _, err := os.Stat(filepath.Join(archivedPaths(), "toarchive.json")); err != nil {
+		t.Fatalf("the archivable candidate must archive: %v", err)
+	}
+	s.mu.Lock()
+	_, liveKept := s.jobs["liver"]
+	_, liveArchived := s.jobs["toarchive"]
+	s.mu.Unlock()
+	if !liveKept {
+		t.Fatal("a live runner must never be dropped by the sweep — removal is per archived job")
+	}
+	if liveArchived {
+		t.Fatal("the archived runner must be dropped from the map")
+	}
+	// The corrupted def stays where it is: LoadJobs' own loud ADR-0024
+	// reporting remains the failing surface for it, at the next reload.
+	if _, err := os.Stat(filepath.Join(job.JobsDir(), "liver.json")); err != nil {
+		t.Fatal("the sweep must not touch unrelated def files")
+	}
+}
+
+// The clamp before NewTicker (kody): a unitless PI_SUPERVISOR_JANITOR_
+// INTERVAL=2 arrives as 2ns and must not reach time.NewTicker.
+func TestJanitorIntervalClamp(t *testing.T) {
+	for d, want := range map[time.Duration]time.Duration{
+		0:                   janitorIntervalDefault,
+		-5 * time.Minute:    janitorIntervalDefault,
+		2 * time.Nanosecond: janitorIntervalFloor,
+		time.Second:         janitorIntervalFloor,
+		time.Minute:         time.Minute,
+		2 * time.Hour:       2 * time.Hour,
+	} {
+		if got := janitorInterval(d); got != want {
+			t.Fatalf("janitorInterval(%v) = %v, want %v", d, got, want)
+		}
+	}
+	// The clamp runs before the ticker: a goroutine Janitor with a unitless
+	// config must survive (pre-fix: 2ns ticker) and exit cleanly on stop.
+	testEnv(t)
+	s := newTestSupervisor(t)
+	s.SetJanitorConfig(true, 2, 24*time.Hour)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		s.Janitor(stop)
+		close(done)
+	}()
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("janitor must exit promptly on stop")
 	}
 }

@@ -466,6 +466,10 @@ func Validate(j Job) error {
 	if j.Name == "" {
 		probs = append(probs, "name is empty")
 	}
+	if j.Name != "" && !ValidJobName(j.Name) {
+		probs = append(probs, "name must be one filesystem path component (no separators, no . or ..) — "+
+			"every per-job path (/tmp files, state/<name>.json, the janitor's archive targets) is keyed by it")
+	}
 	if j.Brief == "" {
 		probs = append(probs, `brief is empty (round 1 would die with "prompt unreadable: empty prompt")`)
 	}
@@ -488,6 +492,17 @@ func Validate(j Job) error {
 		return nil
 	}
 	return fmt.Errorf("invalid job def %q: %s", j.Name, strings.Join(probs, "; "))
+}
+
+// ValidJobName reports whether name is safe to interpolate into per-job
+// paths. It must be exactly one filesystem path component: Paths(),
+// SaveState(), quarantines and the janitor's archive targets (ADR-0025 §5)
+// all join it verbatim, so a name carrying a separator would build paths
+// outside the directory it is supposed to stay in. A def carrying one is
+// rejected by Validate (ADR-0024), so reaching the janitor with such a name
+// is possible only for a hand-built runner — refused the same way anyway.
+func ValidJobName(name string) bool {
+	return name != "" && filepath.Base(name) == name && name != "." && name != ".."
 }
 
 // MissingPromptFiles returns the prompt files referenced by the def that do

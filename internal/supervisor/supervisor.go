@@ -3036,9 +3036,6 @@ func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text
 // journal line, publish ONE event. Both lifecycle emits and task-watch emits
 // (ADR-0014) reach the audit/broker through exactly this path, so the log
 // cannot drift from the stream no matter who calls.
-//
-// The journal line carries identifiers/outcome only — callers must not put
-// task descriptions or payloads into info.
 func (s *Supervisor) emitEnvelope(jobName string, e *events.Event, format string, args ...any) {
 	info := format
 	if len(args) > 0 {
@@ -3054,6 +3051,17 @@ func (s *Supervisor) emitEnvelope(jobName string, e *events.Event, format string
 		r.mu.Unlock()
 	}
 	s.mu.Unlock()
+	s.emitPrepared(jobName, e, wt, sess, pr, info)
+}
+
+// emitPrepared publishes ONE event through the same journal+audit+broker
+// path as emitEnvelope, with the envelope context passed IN instead of
+// looked up. The janitor needs this (ADR-0025 §6): its job_archived event
+// fires AFTER the runner has already been dropped from the map in the same
+// critical section that performed the moves, so there is nothing left to
+// look up — handing the context in explicitly keeps ONE funnel (the journal
+// line and the stream cannot drift apart about context).
+func (s *Supervisor) emitPrepared(jobName string, e *events.Event, wt, sess, pr, info string) {
 	e.Job = jobName
 	e.Info = info
 	e.Worktree = wt
@@ -3104,15 +3112,34 @@ func logEventName(event string) string {
 }
 
 // Watch subscribes the caller to a job's lifecycle events ("" = all jobs).
-// If the requested job is already terminal (done|fatal|stopped) it returns a
-// non-nil precheck Event instead of a channel: the server sends it and closes
-// rather than blocking on a finished run (ADR-0003, requirement 4).
+// If the requested job is already terminal (done|fatal|stopped) or already
+// janitor-archived (ADR-0025) it returns a non-nil precheck Event instead of
+// a channel: the server sends it and closes rather than blocking on a
+// finished run (ADR-0003, requirement 4).
 func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events.Event) {
 	id, ch, cancel := events.Subscribe()
 	if jobName != "" {
 		s.mu.Lock()
 		r, ok := s.jobs[jobName]
 		s.mu.Unlock()
+		if !ok {
+			// Not in the map. If the janitor archived it, its run IS over —
+			// answer with the terminal precheck instead of subscribing a
+			// watcher to a job that will never emit again (qodo #7).
+			if s.Archived(jobName) {
+				cancel()
+				ev := events.Event{
+					TS: time.Now().UTC().Format(time.RFC3339), Job: jobName,
+					Event: "job_archived",
+					Info: "run already archived by the janitor (ADR-0025) — restore: mv " +
+						"~/.pi/supervisor/jobs/_archive/<name>.json ~/.pi/supervisor/jobs/ && pi-supervisor reload",
+				}
+				return nil, func() {}, &ev
+			}
+			// A never-known job falls through to the all-jobs subscribe; the
+			// control server's unknown-job guard refuses named unknown jobs
+			// before Watch is reached, so this is a direct-caller path only.
+		}
 		if ok {
 			snap := r.snapshot()
 			switch snap.State {
@@ -3189,6 +3216,17 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 	}
 	_ = id
 	return ch, cancel, nil
+}
+
+// Archived reports whether name is a janitor-archived job (ADR-0025): its
+// def lives in jobs/_archive/. Used by the control server to let a watch on
+// an archived job reach Watch's archived precheck (the job is no longer in
+// the map, so the ordinary unknown-job refusal would otherwise fire first).
+func (s *Supervisor) Archived(name string) bool {
+	if !job.ValidJobName(name) {
+		return false
+	}
+	return job.Exists(filepath.Join(job.JobsDir(), "_archive", name+".json"))
 }
 
 // RunningCount reports how many jobs are currently in a running round. Fed

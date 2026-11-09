@@ -38,6 +38,16 @@ type Watcher interface {
 	Watch(job string) (<-chan events.Event, func(), *events.Event)
 }
 
+// ArchiveReporter is the optional janitor-awareness extension (ADR-0025):
+// reports whether a named job has been archived. When a watch targets an
+// archived job, the ordinary unknown-job refusal would fire first (the job
+// is no longer registered); instead the request still reaches Watch, whose
+// precheck answers job_archived — terminal — and closes: the correct
+// the correct "nothing more is coming" answer, not an error.
+type ArchiveReporter interface {
+	Archived(name string) bool
+}
+
 // Reviewer is the optional review surface (ADR-0012): the daemon-owned
 // GitHub review loop pi drives through the `_pi-supervisor-review` shim.
 // Implemented by Supervisor. Kept separate from Handler so the control
@@ -224,13 +234,22 @@ func serveWatch(c net.Conn, h Handler, w Watcher, req Request) {
 	if label == "" {
 		label = "*"
 	}
-	// Unknown-job guard: error out and close instead of blocking forever.
+	// Unknown-job guard: error out and close instead of blocking forever —
+	// unless the job was janitor-archived (ADR-0025), in which case Watch's
+	// precheck answers job_archived below (terminal — the run is over with
+	// the archive).
 	if req.Job != "" {
 		if _, err := h.Status(req.Job); err != nil {
-			resp := Response{OK: false, Error: err.Error(), Reason: string(fault.KindOf(err))}
-			logResponse("watch", req.Job, resp)
-			writeOne(c, resp)
-			return
+			archived := false
+			if ar, ok := w.(ArchiveReporter); ok && ar.Archived(req.Job) {
+				archived = true
+			}
+			if !archived {
+				resp := Response{OK: false, Error: err.Error(), Reason: string(fault.KindOf(err))}
+				logResponse("watch", req.Job, resp)
+				writeOne(c, resp)
+				return
+			}
 		}
 	}
 	ch, cancel, pre := w.Watch(req.Job)

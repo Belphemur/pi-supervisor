@@ -453,6 +453,64 @@ func TestServeWatchPrecheckAnswersImmediately(t *testing.T) {
 	}
 }
 
+// A janitor-archived job (ADR-0025) is no longer unknown, its run is done:
+// the archive-aware relaxation looks past the unknown-job refusal and Watch's
+// archived precondition answers job_archived — terminal — and close Opcode:
+// the run ended when it archived, not an error.
+type archiveWatchHandler struct {
+	*watchHandler
+}
+
+func (f *archiveWatchHandler) Archived(name string) bool { return name == "archivedjob" }
+
+func TestServeWatchArchivedJobAnswersArchivePrecheck(t *testing.T) {
+	h := &archiveWatchHandler{watchHandler: &watchHandler{fakeHandler: newFakeHandler()}}
+	h.pre = &events.Event{Job: "archivedjob", Event: "job_archived"}
+	// the job is no longer in the map, so Status would refuse: the reporter
+	// presence is what lets the precheck through.
+	h.failOn["status:archivedjob"] = errors.New("unknown job \"archivedjob\"")
+	sock, stop := startServer(t, h)
+	defer close(stop)
+
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.Write([]byte(`{"cmd":"watch","job":"archivedjob"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReader(c)
+	var resp Response
+	if err := json.Unmarshal(mustLine(t, r), &resp); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := resp.Data.(map[string]any)
+	if !resp.OK || d["event"] != "job_archived" {
+		t.Fatalf("archived watch = %+v, want the job_archived precheck (streams closed)", resp)
+	}
+	if line, err := r.ReadBytes('\n'); err == nil {
+		t.Fatalf("archived precheck kept the stream open: %q", string(line))
+	}
+}
+
+// A genuinely unknown job is still refused, not parked on a subscription
+// that would never emit.
+func TestServeWatchUnknownJobRefused(t *testing.T) {
+	h := &watchHandler{fakeHandler: newFakeHandler()}
+	h.failOn["status:undefined"] = errors.New(`unknown job "undefined"`)
+	sock, stop := startServer(t, h)
+	defer close(stop)
+
+	resp := ask(t, sock, `{"cmd":"watch","job":"undefined"}`)
+	if resp.OK || !strings.Contains(resp.Error, "unknown job") {
+		t.Fatalf("unknown watch = %+v, want refusal", resp)
+	}
+}
+
 // A disconnect cancels the subscription: the broker must not keep delivering
 // to a dead watch (serveWatch's deferred cancel).
 func TestServeWatchCancelsOnDisconnect(t *testing.T) {

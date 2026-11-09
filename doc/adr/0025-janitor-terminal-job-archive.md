@@ -9,6 +9,14 @@ configurable with 1h as the default, implemented as a daemon goroutine.
 Two judgment calls this ADR adds beyond that directive are flagged in §4 and
 can be vetoed before the implementation lands.
 
+Reconciled 2026-11-09 (review round, 14 threads accepted, none rebutted):
+session-quarantine-before-def-move, the archival critical section
+(revalidation + targeted runner removal under held locks), the archived
+job's own `state/<name>.json` moving with it, link-then-remove no-replace
+moves, review-baseline exclusion, `job_archived` made terminal, the anchor
+stat moved out of the locks, and the interval floor. Each is folded into
+the section it amends below.
+
 ## Context
 
 A job def is a JSON file in `~/.pi/supervisor/jobs/` and `LoadJobs`
@@ -44,13 +52,18 @@ on a ticker.
    | Key | Default | Meaning |
    |---|---|---|
    | `janitor_enabled` | `true` | false = goroutine exits after nothing |
-   | `janitor_interval` | `1h` | `viper.GetDuration` sweep cadence |
+   | `janitor_interval` | `1h` | `viper.GetDuration` sweep cadence, floored at 1m |
    | `janitor_archive_after` | `168h` | terminal age before archival |
 
    Defaults are registered with `viper.SetDefault` in `initConfig`; the
    values are read in `runDaemon` the way `socketPath()` reads `socket` and
    stored on the Supervisor (the `reviewAckTimeoutDur` field pattern), so the
-   goroutine never touches viper directly.
+   goroutine never touches viper directly. Interval floor (reconciled
+   2026-11-09): `viper.GetDuration`/`cast.ToDuration` maps a unitless
+   numeric (`PI_SUPERVISOR_JANITOR_INTERVAL=2`) to 2ns, which would spin the
+   sweep into a hot loop; the supervisor resolves `<=0` to the registered
+   default and clamps anything under one minute up to one minute
+   (`janitorInterval`) BEFORE `time.NewTicker`.
 
 2. **Eligibility — terminal states only.** A candidate is a job whose
    persisted state is one of the states from which no build round can ever
@@ -68,7 +81,12 @@ on a ticker.
    `review_*` name (that is what `events.Event.Terminal`'s synchrony is
    about). The two review verbs stay in the janitor's match set for parity
    with the event vocabulary, so a future path persisting them directly is
-   already archiveable.
+   already archiveable. One exclusion on top (reconciled 2026-11-09): a
+   terminal job whose `State.ReviewBaseline` is still set is NOT a candidate
+   — the baseline is the only channel a post-campaign re-check (explicit or
+   push-triggered) reads to notice NEW threads on that PR; archiving would
+   sever it. The job re-enters eligibility when that audience state is
+   cleared, the same way it does after a campaign re-entry.
 
 3. **Skip live or armed jobs.** Even a `done` job may be legally re-entered
    by an armed review campaign (ADR-0016: `review --pr N` + start). A
@@ -93,6 +111,10 @@ on a ticker.
      janitor falls back to the state file's mtime, which for a terminal job
      is its last terminal write. The explicit field is preferred because the
      archive decision is machine-readable evidence, not filesystem inference.
+     The anchor's stat runs OUTSIDE the supervisor's mutexes (reconciled
+     2026-11-09, kody): the sweep captures the stamp as a string under the
+     locks and resolves the mtime per candidate afterwards; losing the race
+     on a stamp change costs one sweep, never a control-op stall.
    - **4.2 The session JSONL is archived together with the def.** The def
      moving to `_archive/` already makes the job unrecoverable by the daemon;
      quarantining its session through the existing `job.Quarantine`
@@ -100,35 +122,76 @@ on a ticker.
      also removes the transcript from every future adoption scan. A session
      that no longer exists is a no-op, as `Quarantine` already guarantees.
 
-5. **Archive action per candidate — move-only, bytes preserved:**
+5. **Archive action per candidate — move-only, bytes preserved.** The
+   whole sequence for ONE candidate runs inside one critical section
+   holding `s.mu` then `r.mu` (reconciled 2026-11-09): the candidate is
+   re-validated in the SAME critical section that performs the moves and
+   drops the runner, so a `Start`/`Restart`/review re-entry either lands
+   before the lock (and the re-validation skip fires) or waits and then
+   finds an unknown job — the snapshot-to-move gap is closed, and the job
+   cannot be archived under a live run (qodo; kody).
 
+   - Session FIRST: `job.Quarantine(j.SessionPath)` per §4.2 (re-ordered
+     reconciled 2026-11-09: quarantine before the def move so a quarantine
+     failure strands nothing — the def stays in `jobs/` and the next sweep
+     re-candidates the job identically).
    - Def: `jobs/<name>.json` → `jobs/_archive/<name>.json`. The `_archive`
      subdirectory is skipped by `LoadJobs`'s dir-only skip; restoring is
      `mv` back + `pi-supervisor reload`, unchanged from the manual
      convention. A name collision in `_archive/` (a job name re-used after
-     an earlier archive) gains the same `_<timestamp>` suffix
-     `job.Quarantine` uses, plus a counter guard on same-second collision —
-     never an overwrite.
-   - Session: `job.Quarantine(j.SessionPath)` per §4.2.
-   - Map sync: after the batch, one `s.LoadJobs()` call reuses the tested
-     reload path to drop the archived runners from the in-memory map — the
-     janitor does not hand-mutate `s.jobs`.
-   - Per-candidate errors (rename failure, missing dir) are logged and skip
-     that candidate; the sweep continues. An archival that fails halfway
-     (def moved, quarantine failed) leaves the job on disk in a consistent
-     state: def archived, session still in place, map still holding the
-     runner — retried by the next sweep (the def is gone from `jobs/`, so
-     the candidate simply no longer parses out of the dir; the session
-     quarantine is then inert). No partial-state cleanup logic is added.
+     an earlier archive) advances the collision suffix — `_<timestamp>`
+     first, then a counter on same-second collision — via
+     link-then-remove (`os.Link` fails `EEXIST` on ANY existing
+     destination, including a dangling symlink, then `os.Remove`; a failed
+     `Remove` after a successful `Link` leaves BOTH files and is reported:
+     never an overwrite, never a silent byte loss; reconciled 2026-11-09,
+     qodo).
+   - State: `state/<name>.json` → `jobs/_archive/<name>.state.json` (same
+     collision scheme; reconciled 2026-11-09, qodo/kody): a surviving state
+     file made a re-used job name inherit the OLD terminal state — `done`
+     plus the old `EndedAt` — and get archived (or refused by `Start` with
+     `KindAlreadyDone`) before its next run could begin. This is the
+     archived job's OWN file moving with it, distinct from the non-goal's
+     orphaned-state sweep below: orphaned state whose def is long gone
+     stays untouched.
+   - Map sync: the janitor never hands the map to `LoadJobs` (reconciled
+     2026-11-09, kody/qodo: a post-batch `LoadJobs()` dropped ANY runner
+     whose def transiently failed to parse/validate — a live job could
+     vanish from `status`/`stop` for an hour). Instead the successfully
+     archived runner is deleted from `s.jobs` in the same critical section
+     as the moves (`delete(s.jobs, name)`) — targeted removal only.
+   - Per-candidate errors are logged and skip that candidate; the sweep
+     continues. A quarantine failure strands nothing (the def never
+     moves). A def that proves absent at move time (an earlier sweep
+     tripped after moving it, or a hand `mv` mid-run) RECOVERS: the
+     remaining state move + session quarantine + runner drop + event
+     complete the archival instead of warn-looping every sweep, and the
+     event honestly names the destination as `already-moved` (the archived
+     def's collision-suffixed location is unknowable from here). A
+     pathological state file that cannot move (e.g. a directory wedged
+     into its name) fails loudly on every sweep until repaired — visible
+     by design, never silent.
 
 6. **Observability — one event per archived job** through the single
    `emit` funnel: `job_archived`, with `Info` carrying `state=<terminal
-   state> def=<archive path> session=<quarantine path|none>`. It flows to
-   the journal, the per-job audit JSONL, and the event broker. **It is NOT
-   terminal**: nothing is added to `events.Event.Terminal` or the watch
-   exit list (invariant 22's sync rule). A watcher on a job being archived
-   hears the event and keeps streaming; the job it watched simply ceases to
-   exist in `status` afterward.
+   state> def=<archive path|already-moved> session=<quarantine path|none>`,
+   and the event envelope carrying the worktree/PR context explicitly (the
+   runner is already out of the map when it emits — `emitPrepared`, the
+   same journal+audit+broker path as `emitEnvelope`). It flows to the
+   journal, the per-job audit JSONL, and the event broker.
+
+   **It IS terminal** (reconciled 2026-11-09, superseding this ADR's own
+   earlier "NOT terminal" text): when the archive happens the archived
+   job's run is over and its future held nothing — a watcher left hanging
+   on it is not a grace period, it is a deadlock. `events.Event.Terminal`
+   and the `watch` CLI exit list name `job_archived` in the SAME commit
+   (invariant 22's sync rule — the two lists moved together). A `watch`
+   that CONNECTS after the archive is answered by the same terminal
+   precheck: the control server consults `Supervisor.Archived`, so the
+   relaxation looks past the unknown-job refusal ONLY for names whose def
+   really lives in `_archive/` — never-known job names stay refused
+   exactly as before. Restoring the job remains the manual convention:
+   `mv` the def back into `jobs/` and reload.
 
 ## Consequences
 
@@ -152,7 +215,9 @@ on a ticker.
 - No deletion, compaction, or remote upload of anything — move-only, both
   layers, always.
 - No sweep of orphaned state files (a `state/<name>.json` whose def is
-  already gone is harmless dead weight and stays).
+  already gone is harmless dead weight and stays). The archived job's own
+  state file is not an orphan — it moves to `_archive/<name>.state.json`
+  with its def (§5).
 - No `/tmp/pi_*` artifact cleanup. `/tmp` is ephemeral and external tooling
   greps those names (invariant 5).
 - No per-job opt-out. The retention knob is global; a job that must survive

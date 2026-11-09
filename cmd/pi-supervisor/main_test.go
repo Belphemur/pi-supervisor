@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/spf13/viper"
 )
 
 // buildCLI compiles the daemon/ctl binary once per run and returns its path.
@@ -592,4 +594,31 @@ func captureStdout(t *testing.T, fn func()) string {
 	out := <-done
 	_ = r.Close()
 	return out
+}
+
+// The janitor interval crosses env → viper → SetJanitorConfig → the clamp
+// helper upstream of time.NewTicker (ADR-0025 §1, kody): a unitless
+// PI_SUPERVISOR_JANITOR_INTERVAL=2 must arrive as 2ns (viper/cast semantics,
+// which is precisely the hazard) so the daemon's floor clamp is what keeps
+// the ticker sane. The CLI's own tests drive the real binary; this one is
+// in-process because it checks initConfig's binding.
+func TestJanitorIntervalEnvChain(t *testing.T) {
+	viper.Reset()
+	defer viper.Reset()
+	t.Setenv("PI_SUPERVISOR_JANITOR_INTERVAL", "2")
+	initConfig()
+	if d := viper.GetDuration("janitor_interval"); d != 2 {
+		t.Fatalf("unitless env janitor_interval = %v, want 2ns (the cast hazard the clamp exists for)", d)
+	}
+	if enabled := viper.GetBool("janitor_enabled"); !enabled {
+		t.Fatal("janitor_enabled default flipped: false")
+	}
+	// A Go-duration env value still binds verbatim; the floor clamp is the
+	// supervisor's, tested in internal/supervisor.
+	viper.Reset()
+	t.Setenv("PI_SUPERVISOR_JANITOR_INTERVAL", "90m")
+	initConfig()
+	if d := viper.GetDuration("janitor_interval"); d != 90*time.Minute {
+		t.Fatalf("unitful env janitor_interval = %v, want 90m", d)
+	}
 }

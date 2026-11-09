@@ -25,7 +25,7 @@ func TestCampaignEndEventsAreTerminal(t *testing.T) {
 		}
 	}
 	// The pre-existing terminals must stay terminal.
-	for _, ev := range []string{"done", "fatal", "stopped"} {
+	for _, ev := range []string{"done", "fatal", "stopped", "job_archived"} {
 		if !(Event{Event: ev}).Terminal() {
 			t.Errorf("%q regressed: must stay terminal", ev)
 		}
