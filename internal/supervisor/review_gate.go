@@ -97,6 +97,11 @@ func (s *Supervisor) reviewGate(r *runner, round int) bool {
 		r.mu.Lock()
 		r.state.State, r.active = "done", false
 		r.state.LastDiag = "review campaign clean: 0 open threads, CI passing"
+		// ADR-0025 §4.1: the review gate's clean close is a direct loop
+		// terminal write — the PERSISTED state lands as `done` while the
+		// review_done EVENT carries the verdict — so stamp the run's end
+		// for the janitor's age anchor.
+		r.state.EndedAt = time.Now().UTC().Format(time.RFC3339)
 		// The campaign is spent. Leaving it armed would let a later `start`
 		// re-enter `reviewing` with a stale budget (ADR-0016): the terminal
 		// state must be reachable as done again.

@@ -531,6 +531,10 @@ func (s *Supervisor) Restart(name string) error {
 	r.state.MarkerSeen = false
 	r.state.ReportSteers = 0
 	r.state.StartedAt = ""
+	// The end-of-run stamp (ADR-0025 §4.1) is run-scoped like StartedAt: a
+	// fresh run has not ended yet, so its janitor clock must start at zero
+	// (an empty EndedAt means mtime fallback, i.e. not yet end-anchored).
+	r.state.EndedAt = ""
 	// Model usage is run-scoped evidence (ADR-0021): a fresh run's models
 	// must not be mixed with the previous run's list.
 	r.state.ModelsUsed = nil
@@ -1471,6 +1475,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				r.review.round = r.state.Round
 			} else {
 				r.state.State, r.active = "done", false
+				// ADR-0025 §4.1: this is one of the loop's direct terminal
+				// writes — stamp the run's end for the janitor's age anchor.
+				r.state.EndedAt = time.Now().UTC().Format(time.RFC3339)
 				// Done AND inactive: the only point the post-completion
 				// re-check can actually run (ADR-0012 follow-up). Started as a
 				// goroutine AFTER the lock is released below, since
@@ -1996,6 +2003,11 @@ func (r *runner) live() bool {
 func (r *runner) finish(state, diag string) {
 	r.mu.Lock()
 	r.state.State, r.state.LastDiag, r.active = state, diag, false
+	// ADR-0025 §4.1: every terminal write done by the loop-as-actor stamps
+	// the end of the run — it is the janitor's age anchor. finish() is the
+	// terminal funnel (its callers pass only terminal states); the
+	// done-gate/review-gate direct writes stamp via stampEnded().
+	r.state.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	// A terminal state spends the campaign (ADR-0016): a later start must not
 	// re-enter `reviewing` with a stale budget. Operator stops do NOT go
 	// through finish (Stop writes its state directly), so a stopped campaign
@@ -2808,6 +2820,8 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 			r.mu.Lock()
 			r.state.State, r.state.LastDiag, r.active = "fatal",
 				"CI review retry cap exceeded — review loop did not finish"+delivered, false
+			// ADR-0025 §4.1: direct loop terminal write — stamp the run's end.
+			r.state.EndedAt = time.Now().UTC().Format(time.RFC3339)
 			r.mu.Unlock()
 			r.persistState()
 			s.logf(name, "FATAL: CI review retry cap %d exceeded%s", capN, delivered)

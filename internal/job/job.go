@@ -155,7 +155,14 @@ type State struct {
 	InstantExits int    `json:"instant_exits"`
 	LastDiag     string `json:"last_diag"`
 	StartedAt    string `json:"started_at"`
-	CIStalls     int    `json:"ci_stalls"` // parks on the CI/review loop, cumulative
+	// EndedAt is when the run reached a terminal state (ADR-0025 §4.1),
+	// RFC3339 UTC. Stamped by the terminal-write sites (finish() and the
+	// direct loop writes); Stop()'s "stopped" is deliberately never stamped
+	// because a stopped job is never a janitor candidate. Empty means "the
+	// run has not ended, or ended before this field existed" — the janitor
+	// then falls back to the state file's mtime.
+	EndedAt  string `json:"ended_at,omitempty"`
+	CIStalls int    `json:"ci_stalls"` // parks on the CI/review loop, cumulative
 	// MarkerSeen latches true once the completion marker has been seen in the
 	// session transcript (ADR-0011). Sticky by design: the run log is truncated
 	// at the start of every round, so a marker seen in ANY round must survive
