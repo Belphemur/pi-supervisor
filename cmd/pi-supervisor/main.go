@@ -71,6 +71,10 @@ func socketPath() string {
 func initConfig() {
 	viper.SetDefault("socket", "")
 	viper.SetDefault("version", "dev") // overridden by -ldflags -X at release build
+	// Janitor knobs (ADR-0025 §1): flat keys, daemon-level, no CLI flags.
+	viper.SetDefault("janitor_enabled", true)
+	viper.SetDefault("janitor_interval", time.Hour)
+	viper.SetDefault("janitor_archive_after", 168*time.Hour)
 	if v := os.Getenv("PI_SUPERVISOR_SOCKET"); v != "" {
 		viper.SetDefault("socket", v)
 	}
@@ -82,6 +86,7 @@ func initConfig() {
 		viper.SetConfigName("config")
 		viper.SetConfigType("yaml")
 	}
+	viper.SetEnvPrefix("PI_SUPERVISOR") // ADR-0008: env > config > default
 	viper.AutomaticEnv()
 	_ = viper.ReadInConfig() // absent config is fine
 }
@@ -92,6 +97,13 @@ func runDaemon() {
 	_ = os.MkdirAll(job.StateDir(), 0o755)
 
 	sup := supervisor.New()
+	// Janitor knobs are daemon-level (ADR-0025): resolved here, handed to the
+	// supervisor once — the goroutine never reads viper directly.
+	sup.SetJanitorConfig(
+		viper.GetBool("janitor_enabled"),
+		viper.GetDuration("janitor_interval"),
+		viper.GetDuration("janitor_archive_after"),
+	)
 	if err := sup.LoadJobs(); err != nil {
 		fmt.Fprintf(os.Stderr, "load jobs: %v\n", err)
 		journal.L().Error("jobs_load_failed", "err", err.Error())
@@ -104,6 +116,9 @@ func runDaemon() {
 	// Sweep unacked bulk_resolve requests: an unattended campaign must never
 	// wedge on a gate nobody will visit (ADR-0012 §2.3).
 	go sup.ExpireAcks(stop)
+	// Terminal jobs self-archive (ADR-0025): sweep #1 fires inside the
+	// goroutine, right after the jobs load above.
+	go sup.Janitor(stop)
 	// One sd_notify beat carries both the watchdog ping and STATUS=<n>
 	// parallel pi session(s) running, visible in `systemctl status`. The
 	// second return value appends the fatal-job note to that same line.
@@ -323,6 +338,11 @@ func watchFooter(ev map[string]any) {
 		fmt.Printf("REVIEW BUDGET EXHAUSTED — %s: %s\n", name, info)
 		fmt.Printf("LLM: threads are still open. Check the shim's list_threads for what is left,\n")
 		fmt.Printf("then re-arm with more budget: pi-supervisor review %s --pr N --rounds N\n", name)
+	case "job_archived":
+		fmt.Printf("ARCHIVED — %s: %s\n", name, info)
+		fmt.Printf("The janitor moved the def to jobs/_archive/ and quarantined the session\n")
+		fmt.Printf("(ADR-0025, move-only: nothing deleted). Restore: mv " +
+			"~/.pi/supervisor/jobs/_archive/<name>.json ~/.pi/supervisor/jobs/ && pi-supervisor reload\n")
 	case "review_threads_appeared":
 		// NOT terminal: the job is long finished, but the PR just gained
 		// findings that nothing will answer, because every review verb needs a
@@ -545,6 +565,10 @@ func watchCtl(req control.Request, terminal bool) {
 			watchFooter(ev)
 			switch kind {
 			case "done", "fatal", "stopped", "review_done", "review_exhausted",
+				// ADR-0025: the janitor removed the job — its run is over and
+				// everything it said was said. Terminal (invariant 22's sync
+				// rule: written here together with events.Terminal).
+				"job_archived",
 				// ADR-0014 (owner decision): a task completion RELEASES the
 				// watch even under -t — the LLM wakes, trust-but-verifies the
 				// task, and re-arms while the job continues in the background.

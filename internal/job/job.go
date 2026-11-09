@@ -155,7 +155,14 @@ type State struct {
 	InstantExits int    `json:"instant_exits"`
 	LastDiag     string `json:"last_diag"`
 	StartedAt    string `json:"started_at"`
-	CIStalls     int    `json:"ci_stalls"` // parks on the CI/review loop, cumulative
+	// EndedAt is when the run reached a terminal state (ADR-0025 §4.1),
+	// RFC3339 UTC. Stamped by the terminal-write sites (finish() and the
+	// direct loop writes); Stop()'s "stopped" is deliberately never stamped
+	// because a stopped job is never a janitor candidate. Empty means "the
+	// run has not ended, or ended before this field existed" — the janitor
+	// then falls back to the state file's mtime.
+	EndedAt  string `json:"ended_at,omitempty"`
+	CIStalls int    `json:"ci_stalls"` // parks on the CI/review loop, cumulative
 	// MarkerSeen latches true once the completion marker has been seen in the
 	// session transcript (ADR-0011). Sticky by design: the run log is truncated
 	// at the start of every round, so a marker seen in ANY round must survive
@@ -459,6 +466,10 @@ func Validate(j Job) error {
 	if j.Name == "" {
 		probs = append(probs, "name is empty")
 	}
+	if j.Name != "" && !ValidJobName(j.Name) {
+		probs = append(probs, "name must be one filesystem path component (no separators, no . or ..) — "+
+			"every per-job path (/tmp files, state/<name>.json, the janitor's archive targets) is keyed by it")
+	}
 	if j.Brief == "" {
 		probs = append(probs, `brief is empty (round 1 would die with "prompt unreadable: empty prompt")`)
 	}
@@ -481,6 +492,17 @@ func Validate(j Job) error {
 		return nil
 	}
 	return fmt.Errorf("invalid job def %q: %s", j.Name, strings.Join(probs, "; "))
+}
+
+// ValidJobName reports whether name is safe to interpolate into per-job
+// paths. It must be exactly one filesystem path component: Paths(),
+// SaveState(), quarantines and the janitor's archive targets (ADR-0025 §5)
+// all join it verbatim, so a name carrying a separator would build paths
+// outside the directory it is supposed to stay in. A def carrying one is
+// rejected by Validate (ADR-0024), so reaching the janitor with such a name
+// is possible only for a hand-built runner — refused the same way anyway.
+func ValidJobName(name string) bool {
+	return name != "" && filepath.Base(name) == name && name != "." && name != ".."
 }
 
 // MissingPromptFiles returns the prompt files referenced by the def that do

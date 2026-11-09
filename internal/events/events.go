@@ -63,9 +63,15 @@ type Event struct {
 // done but the review campaign still owns the round loop, so treating it as
 // terminal would stop the watch mid-campaign. `review_done` and
 // `review_exhausted` ARE terminal — they are how a campaign ends.
+// `job_archived` is terminal too (ADR-0025 §6): the janitor removed the
+// job, so everything its run had to say was said by EARLIER events and a
+// watcher must end when the job does; a replacement watcher that connects
+// after the archive gets the same terminal answer (Watch's archived
+// precheck).
 func (e Event) Terminal() bool {
 	switch e.Event {
-	case "done", "fatal", "stopped", "review_done", "review_exhausted":
+	case "done", "fatal", "stopped", "review_done", "review_exhausted",
+		"job_archived":
 		return true
 	}
 	return false
@@ -104,7 +110,7 @@ func Subscribe() (id int64, ch <-chan Event, cancel func()) {
 }
 
 // releaseKind reports whether event e releases a watch client: the terminal
-// set (done|fatal|stopped|review_done|review_exhausted) plus task_completed
+// set (done|fatal|stopped|review_done|review_exhausted|job_archived) plus task_completed
 // and task_lookup_failed, which release a `watch -t` client per ADR-0014.
 func releaseKind(e Event) bool {
 	if e.Terminal() {

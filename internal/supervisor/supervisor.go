@@ -96,6 +96,12 @@ type Supervisor struct {
 	// reviewWarmupDur is how long the auto-trigger waits for CodeRabbit to
 	// produce threads before counting; 0 = 5m.
 	reviewWarmupDur time.Duration
+	// Janitor config (ADR-0025): set from runDaemon's viper reads via
+	// SetJanitorConfig; the goroutine itself never touches viper. Zero
+	// values mean "unset" and the janitor substitutes its defaults.
+	janitorEnabled      bool
+	janitorInterval     time.Duration
+	janitorArchiveAfter time.Duration
 }
 
 // steerGapWaitDefault bounds the between-rounds steer wait. The loop's
@@ -531,6 +537,10 @@ func (s *Supervisor) Restart(name string) error {
 	r.state.MarkerSeen = false
 	r.state.ReportSteers = 0
 	r.state.StartedAt = ""
+	// The end-of-run stamp (ADR-0025 §4.1) is run-scoped like StartedAt: a
+	// fresh run has not ended yet, so its janitor clock must start at zero
+	// (an empty EndedAt means mtime fallback, i.e. not yet end-anchored).
+	r.state.EndedAt = ""
 	// Model usage is run-scoped evidence (ADR-0021): a fresh run's models
 	// must not be mixed with the previous run's list.
 	r.state.ModelsUsed = nil
@@ -1471,6 +1481,9 @@ func (s *Supervisor) loop(r *runner, stopCh chan struct{}) {
 				r.review.round = r.state.Round
 			} else {
 				r.state.State, r.active = "done", false
+				// ADR-0025 §4.1: this is one of the loop's direct terminal
+				// writes — stamp the run's end for the janitor's age anchor.
+				r.state.EndedAt = time.Now().UTC().Format(time.RFC3339)
 				// Done AND inactive: the only point the post-completion
 				// re-check can actually run (ADR-0012 follow-up). Started as a
 				// goroutine AFTER the lock is released below, since
@@ -1996,6 +2009,11 @@ func (r *runner) live() bool {
 func (r *runner) finish(state, diag string) {
 	r.mu.Lock()
 	r.state.State, r.state.LastDiag, r.active = state, diag, false
+	// ADR-0025 §4.1: every terminal write done by the loop-as-actor stamps
+	// the end of the run — it is the janitor's age anchor. finish() is the
+	// terminal funnel (its callers pass only terminal states); the
+	// done-gate/review-gate direct writes stamp via stampEnded().
+	r.state.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	// A terminal state spends the campaign (ADR-0016): a later start must not
 	// re-enter `reviewing` with a stale budget. Operator stops do NOT go
 	// through finish (Stop writes its state directly), so a stopped campaign
@@ -2808,6 +2826,8 @@ func (s *Supervisor) watchCIStalls(r *runner, sess string, round int, watchStop,
 			r.mu.Lock()
 			r.state.State, r.state.LastDiag, r.active = "fatal",
 				"CI review retry cap exceeded — review loop did not finish"+delivered, false
+			// ADR-0025 §4.1: direct loop terminal write — stamp the run's end.
+			r.state.EndedAt = time.Now().UTC().Format(time.RFC3339)
 			r.mu.Unlock()
 			r.persistState()
 			s.logf(name, "FATAL: CI review retry cap %d exceeded%s", capN, delivered)
@@ -3016,9 +3036,6 @@ func (s *Supervisor) emit(jobName, event string, round, rc int, durS int64, text
 // journal line, publish ONE event. Both lifecycle emits and task-watch emits
 // (ADR-0014) reach the audit/broker through exactly this path, so the log
 // cannot drift from the stream no matter who calls.
-//
-// The journal line carries identifiers/outcome only — callers must not put
-// task descriptions or payloads into info.
 func (s *Supervisor) emitEnvelope(jobName string, e *events.Event, format string, args ...any) {
 	info := format
 	if len(args) > 0 {
@@ -3034,6 +3051,17 @@ func (s *Supervisor) emitEnvelope(jobName string, e *events.Event, format string
 		r.mu.Unlock()
 	}
 	s.mu.Unlock()
+	s.emitPrepared(jobName, e, wt, sess, pr, info)
+}
+
+// emitPrepared publishes ONE event through the same journal+audit+broker
+// path as emitEnvelope, with the envelope context passed IN instead of
+// looked up. The janitor needs this (ADR-0025 §6): its job_archived event
+// fires AFTER the runner has already been dropped from the map in the same
+// critical section that performed the moves, so there is nothing left to
+// look up — handing the context in explicitly keeps ONE funnel (the journal
+// line and the stream cannot drift apart about context).
+func (s *Supervisor) emitPrepared(jobName string, e *events.Event, wt, sess, pr, info string) {
 	e.Job = jobName
 	e.Info = info
 	e.Worktree = wt
@@ -3084,15 +3112,34 @@ func logEventName(event string) string {
 }
 
 // Watch subscribes the caller to a job's lifecycle events ("" = all jobs).
-// If the requested job is already terminal (done|fatal|stopped) it returns a
-// non-nil precheck Event instead of a channel: the server sends it and closes
-// rather than blocking on a finished run (ADR-0003, requirement 4).
+// If the requested job is already terminal (done|fatal|stopped) or already
+// janitor-archived (ADR-0025) it returns a non-nil precheck Event instead of
+// a channel: the server sends it and closes rather than blocking on a
+// finished run (ADR-0003, requirement 4).
 func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events.Event) {
 	id, ch, cancel := events.Subscribe()
 	if jobName != "" {
 		s.mu.Lock()
 		r, ok := s.jobs[jobName]
 		s.mu.Unlock()
+		if !ok {
+			// Not in the map. If the janitor archived it, its run IS over —
+			// answer with the terminal precheck instead of subscribing a
+			// watcher to a job that will never emit again (qodo #7).
+			if s.Archived(jobName) {
+				cancel()
+				ev := events.Event{
+					TS: time.Now().UTC().Format(time.RFC3339), Job: jobName,
+					Event: "job_archived",
+					Info: "run already archived by the janitor (ADR-0025) — restore: mv " +
+						"~/.pi/supervisor/jobs/_archive/<name>.json ~/.pi/supervisor/jobs/ && pi-supervisor reload",
+				}
+				return nil, func() {}, &ev
+			}
+			// A never-known job falls through to the all-jobs subscribe; the
+			// control server's unknown-job guard refuses named unknown jobs
+			// before Watch is reached, so this is a direct-caller path only.
+		}
 		if ok {
 			snap := r.snapshot()
 			switch snap.State {
@@ -3169,6 +3216,17 @@ func (s *Supervisor) Watch(jobName string) (<-chan events.Event, func(), *events
 	}
 	_ = id
 	return ch, cancel, nil
+}
+
+// Archived reports whether name is a janitor-archived job (ADR-0025): its
+// def lives in jobs/_archive/. Used by the control server to let a watch on
+// an archived job reach Watch's archived precheck (the job is no longer in
+// the map, so the ordinary unknown-job refusal would otherwise fire first).
+func (s *Supervisor) Archived(name string) bool {
+	if !job.ValidJobName(name) {
+		return false
+	}
+	return job.Exists(filepath.Join(job.JobsDir(), "_archive", name+".json"))
 }
 
 // RunningCount reports how many jobs are currently in a running round. Fed
