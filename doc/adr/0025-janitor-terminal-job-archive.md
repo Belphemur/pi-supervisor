@@ -62,7 +62,13 @@ on a ticker.
    Age must exceed `janitor_archive_after`, anchored on the state's
    end-of-run timestamp (§4.1). `running`/`reviewing` are ineligible by
    construction (they are not terminal) — the janitor never races a live
-   round.
+   round. Reconciliation note (2026-11-09): today no path persists
+   `review_done`/`review_exhausted` onto a state file — a review campaign
+   lands its terminal verdict as `done`/`fatal` and the EVENT carries the
+   `review_*` name (that is what `events.Event.Terminal`'s synchrony is
+   about). The two review verbs stay in the janitor's match set for parity
+   with the event vocabulary, so a future path persisting them directly is
+   already archiveable.
 
 3. **Skip live or armed jobs.** Even a `done` job may be legally re-entered
    by an armed review campaign (ADR-0016: `review --pr N` + start). A
@@ -74,11 +80,16 @@ on a ticker.
 4. **Judgment calls made here (owner-vetoable).**
 
    - **4.1 Age anchor = new `State.EndedAt` field, mtime fallback.** Every
-     terminal transition stamps `State.EndedAt` (RFC3339) in
-     `runner.finish()` and in the done-gate branch that closes the job
-     without `finish` — the two places terminal state is written while the
-     loop is the actor. `Stop()` is deliberately NOT stamped (stopped is
-     ineligible). For states persisted before this field existed, the
+     terminal transition stamps `State.EndedAt` (RFC3339) — in
+     `runner.finish()` and in the loop's direct state writes. Grep for
+     `state.State` assignments (reconciled 2026-11-09 with the shipped
+     code): the terminal-writing sites are `finish()` (the fatal funnel,
+     including the review-exhausted path, which persists `fatal`), the
+     build done-gate's `closedJob` branch, the review gate's clean close
+     (persisted as `done` while the `review_done` EVENT carries the
+     verdict), and the CI-stall-cap fatal write. `Stop()` is deliberately
+     NOT stamped (stopped is ineligible), and neither is `Shutdown`'s
+     `stopped` write. For states persisted before this field existed, the
      janitor falls back to the state file's mtime, which for a terminal job
      is its last terminal write. The explicit field is preferred because the
      archive decision is machine-readable evidence, not filesystem inference.

@@ -106,6 +106,16 @@ Precedence: **explicit flag > environment > config file > built-in default.**
 |---|---|---|
 | socket | `PI_SUPERVISOR_SOCK`, `PI_SUPERVISOR_SOCKET` | `$XDG_RUNTIME_DIR/pi-supervisor.sock` |
 | config file | `PI_SUPERVISOR_CONFIG` | `~/.config/pi-supervisor/config.yaml` |
+| janitor_enabled | `PI_SUPERVISOR_JANITOR_ENABLED` | `true` |
+| janitor_interval | `PI_SUPERVISOR_JANITOR_INTERVAL` (Go duration) | `1h` |
+| janitor_archive_after | `PI_SUPERVISOR_JANITOR_ARCHIVE_AFTER` (Go duration) | `168h` |
+
+The janitor keys are daemon-level only (ADR-0025): a job that ended
+`done`/`fatal` is swept one `janitor_archive_after` after its end stamp —
+moved (never deleted) to `jobs/_archive/`, with its session JSONL
+quarantined into `_archived-stale/`; `mv` back into `jobs/` plus `reload`
+restores it. Every daemon-level key is bound to `PI_SUPERVISOR_<KEY>` via
+viper's env prefix; multi-word keys are snake_case in the config file.
 
 A missing config file is not an error — every value has an env or default
 fallback, so the daemon runs with no config at all.
