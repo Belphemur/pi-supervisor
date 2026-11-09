@@ -96,6 +96,12 @@ type Supervisor struct {
 	// reviewWarmupDur is how long the auto-trigger waits for CodeRabbit to
 	// produce threads before counting; 0 = 5m.
 	reviewWarmupDur time.Duration
+	// Janitor config (ADR-0025): set from runDaemon's viper reads via
+	// SetJanitorConfig; the goroutine itself never touches viper. Zero
+	// values mean "unset" and the janitor substitutes its defaults.
+	janitorEnabled      bool
+	janitorInterval     time.Duration
+	janitorArchiveAfter time.Duration
 }
 
 // steerGapWaitDefault bounds the between-rounds steer wait. The loop's

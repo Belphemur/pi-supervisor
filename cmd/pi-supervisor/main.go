@@ -71,6 +71,10 @@ func socketPath() string {
 func initConfig() {
 	viper.SetDefault("socket", "")
 	viper.SetDefault("version", "dev") // overridden by -ldflags -X at release build
+	// Janitor knobs (ADR-0025 §1): flat keys, daemon-level, no CLI flags.
+	viper.SetDefault("janitor_enabled", true)
+	viper.SetDefault("janitor_interval", time.Hour)
+	viper.SetDefault("janitor_archive_after", 168*time.Hour)
 	if v := os.Getenv("PI_SUPERVISOR_SOCKET"); v != "" {
 		viper.SetDefault("socket", v)
 	}
@@ -82,6 +86,7 @@ func initConfig() {
 		viper.SetConfigName("config")
 		viper.SetConfigType("yaml")
 	}
+	viper.SetEnvPrefix("PI_SUPERVISOR") // ADR-0008: env > config > default
 	viper.AutomaticEnv()
 	_ = viper.ReadInConfig() // absent config is fine
 }
@@ -92,6 +97,13 @@ func runDaemon() {
 	_ = os.MkdirAll(job.StateDir(), 0o755)
 
 	sup := supervisor.New()
+	// Janitor knobs are daemon-level (ADR-0025): resolved here, handed to the
+	// supervisor once — the goroutine never reads viper directly.
+	sup.SetJanitorConfig(
+		viper.GetBool("janitor_enabled"),
+		viper.GetDuration("janitor_interval"),
+		viper.GetDuration("janitor_archive_after"),
+	)
 	if err := sup.LoadJobs(); err != nil {
 		fmt.Fprintf(os.Stderr, "load jobs: %v\n", err)
 		journal.L().Error("jobs_load_failed", "err", err.Error())
@@ -104,6 +116,9 @@ func runDaemon() {
 	// Sweep unacked bulk_resolve requests: an unattended campaign must never
 	// wedge on a gate nobody will visit (ADR-0012 §2.3).
 	go sup.ExpireAcks(stop)
+	// Terminal jobs self-archive (ADR-0025): sweep #1 fires inside the
+	// goroutine, right after the jobs load above.
+	go sup.Janitor(stop)
 	// One sd_notify beat carries both the watchdog ping and STATUS=<n>
 	// parallel pi session(s) running, visible in `systemctl status`. The
 	// second return value appends the fatal-job note to that same line.
