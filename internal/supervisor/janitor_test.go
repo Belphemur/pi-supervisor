@@ -138,7 +138,10 @@ func TestJanitorMtimeFallback(t *testing.T) {
 	// treat "no anchor" as "ancient").
 	testEnv(t)
 	janitorFixture(t, "freshmtime", "done", time.Time{}, time.Now())
-	os.Chtimes(filepath.Join(job.StateDir(), "freshmtime.json"), time.Now(), time.Now())
+	// Chtimes already ran through janitorFixture's mtime path; re-pinning it
+	// explicitly is belt-and-braces for the fresh mtime the assertion needs,
+	// and a failure here would show up as a wrong archive outcome below.
+	_ = os.Chtimes(filepath.Join(job.StateDir(), "freshmtime.json"), time.Now(), time.Now())
 	s2 := janitorSweepSupervisor(t, 24*time.Hour)
 	s2.janitorSweep()
 	if _, err := os.Stat(filepath.Join(job.JobsDir(), "freshmtime.json")); err != nil {
