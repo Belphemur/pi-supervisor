@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-version: 1.11.0
+version: 1.12.0
 author: Antoine Aflalo (Belphemur), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -373,6 +373,7 @@ Behavior:
 | the arm looked correct (`-t`, background+notify) but the terminal event still reached nobody | **First: if the session has the pi-supervisor plugin tools, arm with `pi_watch(job=…)` (ADR-0022) — the flags are set in code and the arm is verified, so this failure class cannot occur.** Otherwise the arm went out SILENT because the tool call lost its parameters: the arming model can OMIT trailing optional params (`notify`, even `background`) while the arguments JSON stays valid (`finish=tool_calls`) — flash-tier models under reasoning load, proven 2026-10-12 by direct OpenRouter repro (0 reasoning tokens → 3/3 params; 117+ → 2/3). The executor applies defaults, so the run is background-silent or foreground. VERIFY every arm: the tool result must say "Background process started" AND `~/.hermes/logs/process-results/<proc>.json` must record `notify_on_complete: true` and the `persist_on_release` flag — if not, re-arm with minimal reasoning (or switch model) before walking away. A foregrounded arm dies at the 600s cap mid-wait. |
 | job keeps re-validating superseded work, or a round sits at 0 transcript bytes with pi alive | poisoned or wedged session — `pi-supervisor restart <job> --fresh` quarantines the transcript, resets the round counter, relaunches clean (ADR-0010). Do NOT hand-move the JSONL; the daemon sequence has no re-adoption window. |
 || job ends `fatal` with "round cap reached without marker" but the code is committed + pushed and a PR exists | **The marker WAS emitted but the gate could not latch it.** Verify before concluding anything is wrong: `grep -c '<MARKER>' <session_path>` and, decisively, `grep '<MARKER>' <session_path> | grep -c '"role":"assistant"'` — a non-zero count in an ASSISTANT message proves the agent finished (per ADR-0011 only assistant text counts). Then check whether the FINAL REPORT exists; pi often finishes the work, emits the marker, and dies before writing the report. In that case the supervisor cannot be trusted to have recorded the outcome — re-derive it yourself from the commits (`git log <base>..HEAD`, `git diff --stat`) and RE-RUN the gates rather than trusting the run log, then write the missing report. Re-running the gates is not optional: a run log claiming "CI 8/8 green, all shipped" is a self-report. |
+| `start` after a fatal round-cap state exits rc=0 and changes nothing, and plain `restart` refuses with "not running" — both are silent no-ops on a fatal job | the round counter in state has consumed max_rounds; nothing re-spawns until the budget is raised. Edit `max_rounds` in `jobs/<name>.json` (allowed while no runner is live), `pi-supervisor reload`, then `start`, and VERIFY `status` shows `state: running` — rc=0 from `start` alone proves nothing. Same for the 0-token model-flap class: a fresh session may draw the same rate-limited model again, so pushing through with a raised cap (work happens between the 0-token error turns) beats repeated restarts |
 | `start` says `unknown job` right after you wrote `jobs/<name>.json` | the daemon loads job DEFINITIONS from disk only on `pi-supervisor reload` — writing the JSON does not register it. Reload, then start. |
 | `start` says "already done" | marker+report were reached; clear `~/.pi/supervisor/state/<name>.json` to rerun |
 | rounds die in seconds: round 1 `exit=0` with an EMPTY assistant message, resume round `exit=1` with `prompt unreadable: empty prompt` | the configured model is returning empty completions (or its fallback rotation landed on one that does) — a provider/model fault, not a context wall. Check the session JSONL for `model_change` entries naming the failing model, pin a known-good model as `defaultModel` in `~/.pi/agent/settings.json`, then `restart <job> --fresh`. Do not retry the same model: the empty-reply shape repeats every time. |
@@ -520,6 +521,20 @@ plus a machine-readable `reason` from a closed enum.
    re-verifying old work (seen live: 5 rounds, ~40s each, zero threads,
    `review_exhausted`). Set `review_brief` on every job that will run
    campaigns; the daemon warns when it is missing.
+   **If the build def was created WITHOUT `review_brief`** (the common case),
+   set it BEFORE arming: add the `review_brief` key to
+   `~/.pi/supervisor/jobs/<name>.json` and run `pi-supervisor reload`. On a
+   DONE job this works — `LoadJobs` refreshes a definition whenever no runner
+   is live; the "edit never takes effect" pitfall bites only while a round is
+   running. Arming without it silently degenerates as above.
+   **What a review_brief must carry** (beyond repo/branch/worktree/PR): the
+   owner pre-approval supersession clause scoped to this campaign
+   (commit/push/replies on the named branch + PR only, never merge); the
+   design's BINDING constraints with citations, so a finding contradicting an
+   owner decision is rebutted instead of applied; a stale-finding rule — bots
+   review the head they see, so findings about code the pushed head already
+   changed are answered against current content, not re-fixed; and the gate
+   list with CI's exact invocations for any fix commit.
 4. **Campaign rounds** — each round fixes, triages and answers threads
    through the shim's six verbs; the daemon polls threads/CI and decides
    "one more round?" within `--rounds`. MID-ROUND, the daemon also steers
