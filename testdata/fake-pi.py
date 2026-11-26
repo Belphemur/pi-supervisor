@@ -125,6 +125,14 @@ def emit_replay(prompt):
     out({"type": "agent_end"})
 
 
+def agent_settled():
+    """Real pi emits agent_settled once per run, after the settle boundary
+    (where the model-fallback extension switches providers). The client ends
+    the round on it (ADR-0026); a bare agent_end is held open for retryGrace
+    in case a retry follows."""
+    out({"type": "agent_settled"})
+
+
 def emit(prompt):
     if "TEST_FRAMELOG" in prompt:
         # Deliberately silent and never agent_end: the round stays live so a
@@ -132,9 +140,11 @@ def emit(prompt):
         return
     if "TEST_REPLAY" in prompt:
         emit_replay(prompt)
+        agent_settled()
         return
     if "TEST_TASKWATCH" in prompt:
         emit_taskwatch(prompt)
+        agent_settled()
         return
     if "TEST_EMPTY" in prompt:
         # Provider-flake shape (flambette#65 campaign rounds 5-6): the
@@ -152,6 +162,7 @@ def emit(prompt):
             fh.write('{"type":"session","id":"fake-empty"}\n')
         time.sleep(0.2)
         out({"type": "agent_end"})
+        agent_settled()
         return
     if "TEST_MKSESSION" in prompt:
         # cwd-keyed sessions dir: $HOME/.pi/agent/sessions/--<munged>--,
@@ -172,6 +183,7 @@ def emit(prompt):
             delta(w)
             time.sleep(0.05)
         out({"type": "agent_end"})
+        agent_settled()
     elif "TEST_STREAM" in prompt:
         # Echo any MARKER_ token so the supervisor's marker gate can see it
         # in the run log, exactly like a real agent would print the token.
@@ -182,6 +194,7 @@ def emit(prompt):
             delta(w)
             time.sleep(0.05)
         out({"type": "agent_end"})
+        agent_settled()
     elif "TEST_ERROR" in prompt:
         out({"type": "response", "success": False, "error": "synthetic failure"})
     elif "TEST_NOEND" in prompt:
@@ -199,9 +212,26 @@ def emit(prompt):
         time.sleep(secs)
         delta("slow done")
         out({"type": "agent_end"})
+        agent_settled()
+    elif "TEST_RETRY" in prompt:
+        # ADR-0026 regression fixture: pi emits agent_end after EVERY
+        # auto-retry attempt. Two failing attempts (agent_end +
+        # auto_retry_start each), then a third attempt that answers and
+        # settles. The client must keep the round open across the retry
+        # boundaries and end rc=0 with the final text.
+        for attempt in range(2):
+            delta("attempt %d failed " % attempt)
+            out({"type": "agent_end"})
+            out({"type": "auto_retry_start", "attempt": attempt + 1,
+                 "maxAttempts": 3, "delayMs": 200})
+            time.sleep(0.3)
+        delta("recovered ")
+        out({"type": "agent_end"})
+        agent_settled()
     else:
         delta("default")
         out({"type": "agent_end"})
+        agent_settled()
 
 
 def main():

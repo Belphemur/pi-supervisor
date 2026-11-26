@@ -4,8 +4,18 @@
 //
 // It replaces pi_rpc_client.py (see doc/adr/0002-daemon-native-client-and-status.md)
 // with identical semantics so the supervisor's exit classification and
-// backoff logic see the same signals: rc 0 on agent_end, rc 1 on error or
-// timeout.
+// backoff logic see the same signals: rc 0 on a settled round, rc 1 on error
+// or timeout.
+//
+// Round-end semantics (ADR-0026): pi emits agent_end after EVERY auto-retry
+// attempt, not only at the end of the run. The round must therefore end on
+// agent_settled — the frame that follows the settle boundary, where the
+// model-fallback extension switches providers — and not at the first
+// agent_end. Ending the round there killed pi mid-backoff, so a
+// rate-limited round burned exactly one 429 attempt and the fallback chain
+// never advanced (xerif-sync-resolve 2026-11-25: six rounds, six 429s, zero
+// model switches). A final agent_end with no retry still ends the round,
+// bounded by retryGrace, so pi builds without agent_settled keep working.
 package client
 
 import (
@@ -110,6 +120,13 @@ type Identity struct {
 // PollInterval is how often the control file is checked for new frames.
 // `steer`'s ack wait is bounded by it (plus a margin), so it is exported.
 const PollInterval = 5 * time.Second
+
+// retryGrace (ADR-0026) is how long an agent_end is held pending before it
+// is treated as the run's final end. pi emits auto_retry_start immediately
+// after a retry-boundary agent_end (same event-loop turn), so a grace far
+// above that (but far below a retry backoff) cannot misread a retry as the
+// end, and a final agent_end costs the round at most this much latency.
+const retryGrace = 5 * time.Second
 
 // Run executes one RPC round to completion.
 //
@@ -353,13 +370,18 @@ type stream struct {
 	// round's verdict (see the success:false handler below).
 	steerErr string
 	sawEnd   bool
-	holdEnd  bool // an abort is in flight: the next agent_end is the aborted turn
-	drain    bool // hold further control frames until the aborted turn ends
-	turnEnd  bool // reader flagged the aborted turn's agent_end
-	busy     bool // a turn is in flight: prompt forwarded, agent_end not yet seen
-	held     []any
-	out      *bufio.Writer
-	diagf    func(string, ...any)
+	// retryPending (ADR-0026): an agent_end was just seen and the round is
+	// within retryGrace of it; the round only ends when the grace expires
+	// or agent_settled arrives. Set by the agent_end handler, cleared by
+	// auto_retry_start.
+	retryPending bool
+	holdEnd      bool // an abort is in flight: the next agent_end is the aborted turn
+	drain        bool // hold further control frames until the aborted turn ends
+	turnEnd      bool // reader flagged the aborted turn's agent_end
+	busy         bool // a turn is in flight: prompt forwarded, agent_end not yet seen
+	held         []any
+	out          *bufio.Writer
+	diagf        func(string, ...any)
 	// taskwatch state (ADR-0014): pending completions keyed by toolCallId,
 	// plus the identity/observation handoffs. All guarded by mu; sends are
 	// non-blocking so the reader never stalls on a slow consumer.
@@ -371,95 +393,171 @@ type stream struct {
 }
 
 func (s *stream) read(r io.Reader) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(strings.TrimSpace(string(line))) == 0 {
-			continue
+	// Pump the JSONL stream through a channel so the consumer can select it
+	// against the pending-end grace timer (ADR-0026).
+	frames := make(chan []byte, 64)
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		defer close(frames)
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for sc.Scan() {
+			b := make([]byte, len(sc.Bytes()))
+			copy(b, sc.Bytes())
+			frames <- b
 		}
-		var e struct {
-			Type                  string `json:"type"`
-			AssistantMessageEvent struct {
-				Type  string `json:"type"`
-				Delta string `json:"delta"`
-			} `json:"assistantMessageEvent"`
-			Success *bool  `json:"success"`
-			Error   string `json:"error"`
+	}()
+
+	// ADR-0026: the round ends on agent_settled, never mid auto-retry. pi
+	// emits agent_end after EVERY retry attempt, so an agent_end is only
+	// treated as final once a full retryGrace has passed with no
+	// auto_retry_start and no agent_settled after it. pi 1.5.2+ always
+	// emits agent_settled, so in practice the round closes there; the
+	// grace bounds the wait for builds that never would.
+	var pendingEnd time.Time
+	grace := time.NewTimer(0)
+	grace.Stop()
+	for {
+		var graceC <-chan time.Time
+		if !pendingEnd.IsZero() {
+			graceC = grace.C
 		}
-		if err := json.Unmarshal(line, &e); err != nil {
-			continue // non-JSON noise: ignore, matching the Python reader
-		}
-		switch e.Type {
-		case "message_update":
-			if e.AssistantMessageEvent.Type == "text_delta" {
-				s.mu.Lock()
-				s.buf.WriteString(e.AssistantMessageEvent.Delta)
-				if s.out != nil {
-					// Run-log mirroring is best-effort: the authoritative
-					// text is s.buf (returned as Result.Text), so a failed
-					// mirror cannot change the round's classification.
-					_, _ = s.out.WriteString(e.AssistantMessageEvent.Delta)
-				}
-				s.mu.Unlock()
-			}
-		case "agent_end":
-			s.mu.Lock()
-			s.busy = false // the turn ended; a plain prompt is deliverable again
-			if s.holdEnd {
-				// This agent_end closes the ABORTED turn, not our job.
-				s.turnEnd = true
-				s.mu.Unlock()
-				s.diagf("[control] aborted turn ended — delivering interrupt message")
-				continue
-			}
-			s.sawEnd = true
-			s.mu.Unlock()
+		select {
+		case <-graceC:
+			// A full grace passed after agent_end with no retry frame: it
+			// was the run's final agent_end. The round is over.
+			s.diagf("[read] final agent_end after %v with no retry — round over", retryGrace)
 			return
-		case "tool_execution_start", "tool_execution_end", "response":
-			// Decoded once for the correlation (and get_state); the same line
-			// feeds the round's error path below.
-			tf, _ := decodeToolExec(line)
-			switch e.Type {
-			case "tool_execution_start":
-				s.recordStart(tf)
-			case "tool_execution_end":
-				s.recordEnd(tf)
-			case "response":
-				s.recordResponse(tf)
+		case line, ok := <-frames:
+			if !ok {
+				return // stdout closed: the caller classifies rc 2 via sawEnd
 			}
-			if e.Success != nil && !*e.Success {
-				msg := e.Error
-				if msg == "" {
-					msg = "command failed"
-				}
-				s.mu.Lock()
-				// Correlate the refusal to the frame that caused it (kody
-				// PR#9 round 6): the round's own prompt is id "r1"; every
-				// control-file steer carries its own id. A refusal of a
-				// steer — "Agent is already processing", a stale id, a
-				// transient provider hiccup — is not the round's verdict:
-				// the round's prompt ran and the turn may be healthy.
-				// Failing the round on a steer refusal is what let one bad
-				// reminder kill a whole campaign round (flambette#65
-				// rounds 7-8). The id — not a turn-state flag — is the
-				// discriminator, because busy is momentarily false in the
-				// abort-drain window between the aborted turn's agent_end
-				// and the held prompt's re-send.
-				if tf.ID != "" && tf.ID != "r1" && s.steerErr == "" && strings.Contains(msg, "already processing") {
-					s.steerErr = msg
-					s.mu.Unlock()
-					s.diagf("[control] steer %s refused by pi (%s); the steer is dropped, the round continues", tf.ID, msg)
-					continue
-				}
-				if s.errMsg == "" {
-					s.errMsg = msg
-				}
-				s.mu.Unlock()
+			if !pendingEnd.IsZero() {
+				// A frame arrived during the grace window; it decides
+				// whether this was a retry boundary (auto_retry_start
+				// re-opens the round) or the end.
+				pendingEnd = time.Time{}
+				grace.Stop()
+			}
+			if !s.handleFrame(line) {
 				return
+			}
+			if s.retryPending {
+				// agent_end was just seen: arm the grace and keep reading.
+				pendingEnd = time.Now()
+				grace.Reset(retryGrace)
+				s.retryPending = false
 			}
 		}
 	}
+}
+
+// handleFrame processes one JSONL frame. Returns false when the round is
+// over (agent_settled, or a failed response frame).
+func (s *stream) handleFrame(line []byte) bool {
+	if len(strings.TrimSpace(string(line))) == 0 {
+		return true
+	}
+	var e struct {
+		Type                  string `json:"type"`
+		AssistantMessageEvent struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+		} `json:"assistantMessageEvent"`
+		Success *bool  `json:"success"`
+		Error   string `json:"error"`
+		Aborted bool   `json:"aborted"`
+	}
+	if err := json.Unmarshal(line, &e); err != nil {
+		return true // non-JSON noise: ignore, matching the Python reader
+	}
+	switch e.Type {
+	case "message_update":
+		if e.AssistantMessageEvent.Type == "text_delta" {
+			s.mu.Lock()
+			s.buf.WriteString(e.AssistantMessageEvent.Delta)
+			if s.out != nil {
+				// Run-log mirroring is best-effort: the authoritative
+				// text is s.buf (returned as Result.Text), so a failed
+				// mirror cannot change the round's classification.
+				_, _ = s.out.WriteString(e.AssistantMessageEvent.Delta)
+			}
+			s.mu.Unlock()
+		}
+	case "agent_end":
+		s.mu.Lock()
+		s.busy = false // the turn ended; a plain prompt is deliverable again
+		if s.holdEnd {
+			// This agent_end closes the ABORTED turn, not our job.
+			s.turnEnd = true
+			s.mu.Unlock()
+			s.diagf("[control] aborted turn ended — delivering interrupt message")
+			return true
+		}
+		s.sawEnd = true
+		s.retryPending = true
+		s.mu.Unlock()
+		// Hold the round open briefly: this may be a retry attempt's
+		// agent_end (auto_retry_start follows), not the run's end.
+	case "auto_retry_start":
+		// A retry attempt is starting: the round is NOT over, whatever
+		// the preceding agent_end suggested.
+		s.retryPending = false
+	case "agent_settled":
+		// The settle boundary has run (model-fallback included): the
+		// round is over on pi's own terms — unless the run was ABORTED
+		// (the abort-drain handshake: the held interrupt prompt starts a
+		// fresh run that must not be cut off by this frame) or a held
+		// steer is still waiting for its delivery window.
+		if e.Aborted || s.holdEnd || s.drain {
+			return true
+		}
+		return false
+	case "tool_execution_start", "tool_execution_end", "response":
+		// Decoded once for the correlation (and get_state); the same line
+		// feeds the round's error path below.
+		tf, _ := decodeToolExec(line)
+		switch e.Type {
+		case "tool_execution_start":
+			s.recordStart(tf)
+		case "tool_execution_end":
+			s.recordEnd(tf)
+		case "response":
+			s.recordResponse(tf)
+		}
+		if e.Success != nil && !*e.Success {
+			msg := e.Error
+			if msg == "" {
+				msg = "command failed"
+			}
+			s.mu.Lock()
+			// Correlate the refusal to the frame that caused it (kody
+			// PR#9 round 6): the round's own prompt is id "r1"; every
+			// control-file steer carries its own id. A refusal of a
+			// steer — "Agent is already processing", a stale id, a
+			// transient provider hiccup — is not the round's verdict:
+			// the round's prompt ran and the turn may be healthy.
+			// Failing the round on a steer refusal is what let one bad
+			// reminder kill a whole campaign round (flambette#65
+			// rounds 7-8). The id — not a turn-state flag — is the
+			// discriminator, because busy is momentarily false in the
+			// abort-drain window between the aborted turn's agent_end
+			// and the held prompt's re-send.
+			if tf.ID != "" && tf.ID != "r1" && s.steerErr == "" && strings.Contains(msg, "already processing") {
+				s.steerErr = msg
+				s.mu.Unlock()
+				s.diagf("[control] steer %s refused by pi (%s); the steer is dropped, the round continues", tf.ID, msg)
+				return true
+			}
+			if s.errMsg == "" {
+				s.errMsg = msg
+			}
+			s.mu.Unlock()
+			return false
+		}
+	}
+	return true
 }
 
 // toolExecFrame is the subset of tool_execution_start/end (and the get_state
